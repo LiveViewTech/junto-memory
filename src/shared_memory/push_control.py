@@ -44,6 +44,8 @@ DEFAULT_HARD_CEILING = 100         # per sender per rolling hour
 DEFAULT_RECOVERY_BEHAVIOR = "annotated"   # annotated | quarantine | leave_it
 DEFAULT_INCIDENT_PAD_MESSAGES = 12         # min(pad_msgs, pad_seconds)
 DEFAULT_INCIDENT_PAD_SECONDS = 300
+DEFAULT_WARN_FRACTION = 0.8        # budget_warn alert at this fraction of push_budget
+EMISSION_HISTORY_TTL_DAYS = 90     # hourly peak docs age out after this
 
 VALID_RECOVERY_BEHAVIORS = {"annotated", "quarantine", "leave_it"}
 
@@ -58,6 +60,7 @@ CONFIG_KEYS = {
     "incident_pad_seconds": int,
     "webhook_url": str,
     "webhook_token": str,
+    "warn_fraction": float,
 }
 
 # Default scope key — sentinel id for the server-level default in
@@ -144,6 +147,94 @@ def snapshot_emission_counters() -> List[Dict[str, Any]]:
     return out
 
 
+def record_emission_history(
+    db,
+    sender_instance: str,
+    sender_project: str,
+    count: int,
+    suppressed: bool,
+    cfg: Dict[str, Any],
+) -> None:
+    """Persist the sender's hourly peak + fire once-per-hour proximity alerts.
+
+    Limit-watch (design:limit-watch-v0): the in-process counters are wiped on
+    restart and remember only the current hour, so limit-tuning ("are 30/100
+    right?") has no data. This writes one emission_history doc per
+    (sender, hour) — $max peak_count, $inc sends/suppressed — and writes a
+    durable alert the FIRST time the sender crosses (a) warn_fraction of
+    push_budget ("budget_warn") and (b) push_budget itself
+    ("push_budget_breach", the moment silent soft-containment starts). Dedup
+    is durable: a flag on the history doc, flipped with a guarded update, so
+    each fires at most once per sender-hour even across server restarts.
+    Counts at/above hard_ceiling are handle_hard_trip's job — skipped here.
+    Best-effort: never raises, never blocks the send path. System senders
+    (count==0) are excluded, matching increment_emission.
+    """
+    if db is None or not sender_instance or sender_instance == "system" or count <= 0:
+        return
+    try:
+        project = normalize_project(sender_project) or ""
+        bucket = _current_hour_bucket()
+        hour_start = datetime.strptime(bucket, "%Y-%m-%dT%H").replace(
+            tzinfo=timezone.utc
+        )
+        key = {"instance": sender_instance, "project": project, "hour": bucket}
+        db.emission_history.update_one(
+            key,
+            {
+                "$max": {"peak_count": count},
+                "$inc": {"sends": 1, "suppressed": 1 if suppressed else 0},
+                "$setOnInsert": {"hour_start": hour_start},
+            },
+            upsert=True,
+        )
+
+        budget = int(cfg.get("push_budget", DEFAULT_PUSH_BUDGET))
+        ceiling = int(cfg.get("hard_ceiling", DEFAULT_HARD_CEILING))
+        try:
+            warn_fraction = float(cfg.get("warn_fraction", DEFAULT_WARN_FRACTION))
+        except (TypeError, ValueError):
+            warn_fraction = DEFAULT_WARN_FRACTION
+        warn_at = max(1, int(budget * warn_fraction))
+
+        trigger = None
+        if budget < count < ceiling:
+            flag, trigger = "breach_alerted", "push_budget_breach"
+            explainer = (
+                f"{sender_instance}@{project} crossed push_budget: {count} sends "
+                f"this hour vs budget {budget} (hard_ceiling {ceiling}). Pushes "
+                f"are now silently soft-suppressed. If this traffic is "
+                f"legitimate, the budget may need raising — see emission_history."
+            )
+        elif warn_at <= count <= budget:
+            flag, trigger = "warn_alerted", "budget_warn"
+            explainer = (
+                f"{sender_instance}@{project} at {count}/{budget} sends this "
+                f"hour ({int(warn_fraction * 100)}% warn threshold, hard_ceiling "
+                f"{ceiling}). Approaching soft suppression."
+            )
+        if trigger:
+            res = db.emission_history.update_one(
+                {**key, flag: {"$ne": True}}, {"$set": {flag: True}}
+            )
+            if getattr(res, "modified_count", 0) == 1:
+                write_alert(
+                    db,
+                    agent_instance=sender_instance,
+                    agent_project=project,
+                    trigger=trigger,
+                    prior_hour_message_count=count,
+                    window_start=hour_start,
+                    window_end=utc_now(),
+                    recipient_set=[],
+                    shape="proximity",
+                    shape_explainer=explainer,
+                    sample_messages=[],
+                )
+    except Exception as e:
+        log.error("push_control: record_emission_history failed: %s", e)
+
+
 # ──────────────────────────────────────────────────────────────────────────
 # Config storage (Mongo, owner-tier read/write through memory_admin)
 # ──────────────────────────────────────────────────────────────────────────
@@ -170,6 +261,17 @@ def init_push_control_indexes(db) -> None:
     # Trigger lookups for dashboards.
     alerts.create_index([("trigger", 1), ("created_at", -1)])
 
+    # Limit-watch hourly peaks (design:limit-watch-v0). One doc per
+    # (sender, hour); TTL ages them out so the collection stays bounded.
+    hist = db.emission_history
+    hist.create_index(
+        [("instance", 1), ("project", 1), ("hour", 1)], unique=True
+    )
+    hist.create_index(
+        "hour_start", expireAfterSeconds=EMISSION_HISTORY_TTL_DAYS * 24 * 3600
+    )
+    hist.create_index([("project", 1), ("hour_start", -1)])
+
 
 def _default_config_dict() -> Dict[str, Any]:
     return {
@@ -181,6 +283,7 @@ def _default_config_dict() -> Dict[str, Any]:
         "incident_pad_seconds": DEFAULT_INCIDENT_PAD_SECONDS,
         "webhook_url": None,
         "webhook_token": None,
+        "warn_fraction": DEFAULT_WARN_FRACTION,
     }
 
 
@@ -251,6 +354,9 @@ def set_config_value(db, project: Optional[str], key: str, value: Any, actor: st
                "incident_pad_messages", "incident_pad_seconds") and isinstance(value, int):
         if value < 1:
             return {"error": f"{key} must be >= 1"}
+    if key == "warn_fraction" and isinstance(value, float):
+        if not (0.0 < value < 1.0):
+            return {"error": "warn_fraction must be between 0 and 1 (exclusive)"}
     if key == "hard_ceiling" and isinstance(value, int):
         # Sanity: hard_ceiling should be >= push_budget. Read the would-be effective
         # push_budget after this write would land.

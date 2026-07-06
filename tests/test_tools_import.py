@@ -2,13 +2,16 @@
 
 
 def test_all_tools_register():
-    """All 56 tools are registered with the MCP server."""
+    """All 64 tools are registered with the MCP server.
+
+    (57 + 6 skill-registry tools + memory_ack_directive.)
+    """
     from shared_memory.app import create_app
 
     mcp = create_app()
     tools = mcp._tool_manager._tools
 
-    assert len(tools) == 56, f"Expected 56 tools, got {len(tools)}: {sorted(tools.keys())}"
+    assert len(tools) == 64, f"Expected 64 tools, got {len(tools)}: {sorted(tools.keys())}"
 
 
 def test_expected_tools_present():
@@ -23,10 +26,16 @@ def test_expected_tools_present():
         "memory_query", "memory_store", "memory_record_learning",
         "memory_lock_files", "memory_unlock_files", "memory_get_locks",
         "memory_send_message", "memory_get_messages",
+        # Stage 2 / CLAIMING (design:unified-messaging-v0)
+        "memory_claim_message",
         "memory_add_backlog_item", "memory_list_backlog",
         "memory_register_function", "memory_find_function",
         "memory_project", "memory_checklist", "memory_db",
         "memory_define_spec", "memory_list_agents", "memory_guidelines",
+        # Skill registry (design:skill-registry-v0, authoring layer)
+        "memory_register_skill", "memory_confirm_skill", "memory_get_skill",
+        "memory_list_skills", "memory_pin_skill", "memory_export_skills",
+        "memory_ack_directive",
         "memory_admin", "memory_standup",
         # Phase C1
         "memory_set_autopilot", "memory_pause_autopilot",

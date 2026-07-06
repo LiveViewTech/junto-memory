@@ -25,7 +25,11 @@ services:
     volumes:
       - chroma-data:/data
     ports:
-      - "${CHROMA_PORT:-8001}:8000"
+      # Bind to loopback only (design:auth-origin-trust-v0). Container-to-
+      # container access uses the compose network (CHROMA_HOST=chromadb), so
+      # this published port is host-side debugging only. Keeping it off 0.0.0.0
+      # closes the tailnet/OVH-wg exposure networking found 2026-06-06.
+      - "127.0.0.1:${CHROMA_PORT:-8001}:8000"
     healthcheck:
       # This image doesn't ship curl/wget. Use bash's /dev/tcp to check if
       # the HTTP port accepts connections (opens socket, immediately closes).
@@ -66,7 +70,11 @@ services:
       - mongo-data:/data/db
       - ./secrets/mongo-keyfile:/etc/mongo/keyfile:ro
     ports:
-      - "${MONGO_PORT:-27019}:27017"
+      # Loopback only (design:auth-origin-trust-v0). The MCP server reaches
+      # Mongo over the compose network (MONGO_HOST=mongodb); this published
+      # port is host-side debugging only (mongosh via localhost:27019). Never
+      # expose the database off-host.
+      - "127.0.0.1:${MONGO_PORT:-27019}:27017"
     environment:
       MONGO_INITDB_ROOT_USERNAME: ${MONGO_USER:-mcp_orch}
       MONGO_INITDB_ROOT_PASSWORD: ${MONGO_PASSWORD:-changeme}
@@ -104,8 +112,23 @@ services:
       # Per-tool latency logging (src/shared_memory/timing.py). Set to 1 for
       # diagnosis runs; unset/empty for normal operation (zero overhead).
       - JUNTO_TIMING_LOG=${JUNTO_TIMING_LOG:-}
+      # Keyless sessions arriving via the Cloudflare tunnel soft-fall to agent
+      # tier (design:auth-origin-trust-v0 flag, learning_0b5c97149eb58ec3).
+      # FALSE here because Cloudflare Access already does identity authn at
+      # the edge (401 before the request reaches this server) AND claude.ai
+      # connectors cannot send a Bearer key — true would hard-block every
+      # cloud connector (tom-assistant/advisor/research/DeeAnn). Flip to true
+      # ONLY if the CF Access app on mcp.lemmons.net is ever removed.
+      - JUNTO_TUNNEL_REQUIRES_KEY=${JUNTO_TUNNEL_REQUIRES_KEY:-false}
     ports:
-      - "8080:8080"
+      # Bind to loopback + the home LAN IP only — NOT 0.0.0.0 (design:auth-
+      # origin-trust-v0). cloudflared connects locally (127.0.0.1) so the public
+      # tunnel still works; LAN agents reach the LAN IP and stay keyless. This
+      # removes the tailnet (100.89.194.85) and OVH-wg (10.100.0.4) exposure.
+      # Adopters: override JUNTO_MCP_LAN_IP, or drop the second mapping for a
+      # loopback-only (tunnel-only) deployment.
+      - "127.0.0.1:8080:8080"
+      - "${JUNTO_MCP_LAN_IP:-192.168.15.240}:8080:8080"
     ulimits:
       nofile:
         soft: 65536

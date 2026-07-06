@@ -154,8 +154,81 @@ MESSAGE_PRIORITIES = ["urgent", "normal", "low"]
 # Message categories
 MESSAGE_CATEGORIES = ["contract", "task", "question", "info", "review", "blocker"]
 
-# Message statuses for full lifecycle tracking
+# Message statuses for full lifecycle tracking (DELIVERY track — orthogonal to
+# the obligation track below).
 MESSAGE_STATUSES = ["pending", "delivered", "received", "completed", "failed"]
+
+# ── Obligation track (design:unified-messaging-v0 Stage 3 / lanes-B) ──
+# A SECOND axis on a message, separate from the delivery status above. Only
+# ACTION-category messages carry an obligation; info carries none (unset). A
+# reply from the message's OWNER auto-advances it (see
+# _advance_parent_obligation_on_reply). Kept as its own field (NOT folded into
+# MESSAGE_STATUSES) because the 3 worklist filters gate on status=="pending" and
+# folding would make a responded task/blocker vanish from them — see
+# contract:message-lanes-v0:B-wireshape R1.
+#   ACTION_CATEGORIES         — get obligation="open" at send.
+#   OBLIGATION_RESOLVE_ON_REPLY — an owner's reply RESOLVES (an answer satisfies).
+#   OBLIGATION_RETAIN_ON_REPLY  — an owner's reply marks RESPONDED but the item
+#                                 stays in the action lane until an explicit done.
+OBLIGATION_STATES = ["open", "responded", "resolved"]
+ACTION_CATEGORIES = ["task", "question", "blocker", "contract", "review"]
+OBLIGATION_RESOLVE_ON_REPLY = ["question", "contract", "review"]
+OBLIGATION_RETAIN_ON_REPLY = ["task", "blocker"]
+
+
+def classify_lane(category, obligation):
+    """Derive (lane, tier) for a message from its category + obligation.
+
+    SINGLE source of truth for the category→lane map (design:unified-messaging-v0
+    Stage 3 / lanes-A; interface:lanes-a-server-wire-v0, coordinator-converged).
+    Computed fresh at serialize time and NEVER stored — so it cannot diverge from
+    the category/obligation in the same payload. Both consumers (the junto-inbox
+    badge and the control UI) read `lane`/`tier` instead of re-implementing this
+    map, which is why it's server-emitted rather than client-derived.
+
+      lane "action"  — an ACTION-category message not yet resolved (still owes work)
+      lane "cleared" — an ACTION-category message whose obligation is resolved
+                       (drops OUT of the action lane)
+      lane "fyi"     — info / non-action
+
+      tier 0 — obligation "open" (or a legacy action message with no obligation):
+               an un-engaged ask, top of the action lane
+      tier 1 — obligation "responded": engaged, deprioritized but still in-lane
+      tier None — fyi / cleared (no action-lane position)
+    """
+    if category in ACTION_CATEGORIES:
+        if obligation == "resolved":
+            return "cleared", None
+        # "open" or a legacy pre-lanes-B action message (obligation unset) → tier 0;
+        # only an explicit "responded" demotes to tier 1.
+        return "action", (1 if obligation == "responded" else 0)
+    return "fyi", None
+
+# ── Differential TTL (design:unified-messaging-v0 Stage 5 / lanes-C) ──
+# Replaces the old flat "all messages expire at created+7d" rule. TTL now rides
+# on a per-doc `expire_at` field (Mongo TTL index, expireAfterSeconds=0):
+#   info / non-action  → expire_at = created + MESSAGE_INFO_TTL_HOURS (FYI ages fast)
+#   ACTION, unacked     → expire_at = null  → NEVER ages (an open task/question must
+#                         not silently vanish — the load-bearing safety property)
+#   ACTION, acked/resolved → expire_at = created + MESSAGE_ACTION_TTL_DAYS
+# Existing pre-migration messages are backfilled to created + ACTION_TTL_DAYS
+# (preserves the old 7d behavior — no early deletion, no immortal docs).
+MESSAGE_INFO_TTL_HOURS = 48
+MESSAGE_ACTION_TTL_DAYS = 7
+
+# ── SSE notification-stream keepalive ──
+# The long-lived server→client SSE GET stream (Streamable HTTP) carries push
+# notifications. During quiet periods it has no traffic, so an idle-connection
+# reaper on the path (NAT/conntrack, Tailscale relay, proxy) silently drops it —
+# and nothing notices (transport.onclose doesn't fire on a half-open socket, and
+# the client heartbeat rides a SEPARATE POST channel). The server then "delivers"
+# into a dead socket. A periodic keepalive notification on the stream keeps it
+# warm so the path never idle-reaps it, and eventually surfaces a truly-dead
+# socket (the write blocks → times out → the session is pruned). Interval must be
+# shorter than the shortest idle-timeout on the path. See the half-open-SSE
+# incident (2026-06-15).
+SSE_KEEPALIVE_SECONDS = int(os.getenv("JUNTO_SSE_KEEPALIVE_SECONDS", "20"))
+SSE_KEEPALIVE_SEND_TIMEOUT = float(os.getenv("JUNTO_SSE_KEEPALIVE_TIMEOUT", "5"))
 
 # Auth roles (ordered by privilege)
 AUTH_ROLES = ["readonly", "agent", "admin", "owner"]

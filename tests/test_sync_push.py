@@ -922,7 +922,7 @@ def test_push_message_sent_fires_inbox_notify(monkeypatch):
 
     calls = []
 
-    async def _spy(to_project, to_instance):
+    async def _spy(to_project, to_instance, packet=None):
         calls.append((to_project, to_instance))
 
     monkeypatch.setattr(messaging_tool, "_notify_inbox_for_send", _spy)
@@ -945,7 +945,7 @@ def test_push_message_sent_respects_push_suppressed(monkeypatch):
 
     calls = []
 
-    async def _spy(to_project, to_instance):
+    async def _spy(to_project, to_instance, packet=None):
         calls.append((to_project, to_instance))
 
     monkeypatch.setattr(messaging_tool, "_notify_inbox_for_send", _spy)
@@ -969,7 +969,7 @@ def test_push_message_sent_skips_notify_on_duplicate(monkeypatch):
 
     calls = []
 
-    async def _spy(to_project, to_instance):
+    async def _spy(to_project, to_instance, packet=None):
         calls.append((to_project, to_instance))
 
     monkeypatch.setattr(messaging_tool, "_notify_inbox_for_send", _spy)
@@ -1001,7 +1001,7 @@ def test_push_message_sent_swallows_notify_errors(monkeypatch):
     """
     from shared_memory.tools import messaging as messaging_tool
 
-    async def _boom(to_project, to_instance):
+    async def _boom(to_project, to_instance, packet=None):
         raise RuntimeError("transport gone")
 
     monkeypatch.setattr(messaging_tool, "_notify_inbox_for_send", _boom)

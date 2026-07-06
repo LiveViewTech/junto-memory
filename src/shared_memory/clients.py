@@ -12,6 +12,7 @@ from pymongo.errors import ConnectionFailure
 from shared_memory.config import (
     CHROMA_HOST,
     CHROMA_PORT,
+    MESSAGE_ACTION_TTL_DAYS,
     MONGO_DB,
     MONGO_HOST,
     MONGO_PASSWORD,
@@ -100,12 +101,26 @@ async def app_lifespan(app):
         import logging
         logging.getLogger(__name__).error("lifespan: scheduler startup failed: %s", e)
 
+    # Start the SSE notification-stream keepalive (keeps long-lived push streams
+    # warm so idle network reapers don't silently half-open them).
+    try:
+        from shared_memory.tools.messaging import start_keepalive
+        start_keepalive()
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).error("lifespan: sse-keepalive startup failed: %s", e)
+
     yield {}
 
     # Shutdown cleanup.
     try:
         from shared_memory.tools.scheduler import stop_scheduler
         stop_scheduler()
+    except Exception:
+        pass
+    try:
+        from shared_memory.tools.messaging import stop_keepalive
+        stop_keepalive()
     except Exception:
         pass
     _chroma_client = None
@@ -117,6 +132,60 @@ async def app_lifespan(app):
 
 _mongo_client = None
 _mongo_db = None
+
+
+def _migrate_messages_ttl(messages):
+    """Differential-TTL migration for the messages collection (Stage 5 / lanes-C).
+
+    Idempotent — runs on every boot, does real work only the first time:
+
+    1. Drop the legacy flat TTL index (created_at + expireAfterSeconds=7d) if it
+       still exists. That index expired EVERY message at created+7d.
+    2. Backfill expire_at on any message that lacks it, to created + 7d — i.e.
+       EXACTLY the old behavior. This is the loss-safety property: existing
+       messages keep their current expiry (no early deletion), and none become
+       immortal (a missing TTL field would otherwise mean "never expires").
+       New sends set expire_at via the differential rule (info=+48h,
+       unacked-action=null/never, acked-action=+7d) in messaging.py.
+    3. Create the new per-doc TTL index on expire_at (expireAfterSeconds=0 =
+       "delete when expire_at <= now"; docs with expire_at unset never expire).
+    4. Re-create a PLAIN created_at index — the dropped TTL index used to be the
+       only index serving the recency-primary get_messages sort.
+
+    Best-effort: a failure here must not block server start (TTL is a cleanup
+    nicety, not a correctness requirement).
+    """
+    try:
+        existing = messages.index_information()
+    except Exception:
+        existing = {}
+
+    # 1. Drop legacy flat TTL index (named created_at_1 with expireAfterSeconds).
+    legacy = existing.get("created_at_1")
+    if legacy is not None and "expireAfterSeconds" in legacy:
+        try:
+            messages.drop_index("created_at_1")
+        except Exception:
+            pass
+
+    # 2. Backfill expire_at = created_at + 7d for docs missing it (old behavior).
+    #    Aggregation-pipeline update ($add date+ms); requires MongoDB 4.2+.
+    try:
+        messages.update_many(
+            {"expire_at": {"$exists": False}},
+            [{"$set": {"expire_at": {
+                "$add": ["$created_at", MESSAGE_ACTION_TTL_DAYS * 24 * 3600 * 1000]
+            }}}],
+        )
+    except Exception:
+        pass
+
+    # 3. New per-doc TTL index. expireAfterSeconds=0 → Mongo deletes when the
+    #    expire_at date is in the past; a null/absent expire_at never expires.
+    messages.create_index("expire_at", expireAfterSeconds=0)
+    # 4. Plain created_at index for the recency sort (the old TTL index did this).
+    messages.create_index("created_at")
+
 
 def get_mongo():
     """Get the MongoDB client and database (lazy initialization).
@@ -170,7 +239,12 @@ def get_mongo():
         messages.create_index("status")
         messages.create_index("priority")
         messages.create_index([("to_instance", 1), ("to_project", 1), ("status", 1)])
-        messages.create_index("created_at", expireAfterSeconds=86400 * 7)  # TTL: 7 days
+        # Differential TTL migration (design:unified-messaging-v0 Stage 5 / lanes-C).
+        # Was: a single TTL index on created_at expiring ALL messages at +7d. Now:
+        # TTL rides on a per-doc expire_at field so info ages in 48h, unacked
+        # actions never age, and acked actions keep the 7d window. Idempotent —
+        # safe to re-run every boot. See _migrate_messages_ttl.
+        _migrate_messages_ttl(messages)
 
         # Ensure indexes for agent_status collection
         agent_status = _mongo_db.agent_status
@@ -186,6 +260,11 @@ def get_mongo():
         agent_dir.create_index([("project", 1), ("instance", 1)], unique=True)
         agent_dir.create_index("project")
         agent_dir.create_index("last_seen")
+        # Component-peer lookup at session start (design:unified-messaging-v0
+        # Stage 1): find agents in project P subscribed to component C, recently
+        # active. Compound (project, subscribed_components) — multikey on the
+        # array field — serves the $in + last_seen-filtered query.
+        agent_dir.create_index([("project", 1), ("subscribed_components", 1)])
 
         # Ensure indexes for project registry (admin-controlled)
         projects_col = _mongo_db.projects
@@ -201,6 +280,21 @@ def get_mongo():
         guidelines_col = _mongo_db.guidelines
         guidelines_col.create_index("scope")
         guidelines_col.create_index("name", unique=True)
+
+        # Seed code-defined GLOBAL guidelines (scope="global") into the DB so a
+        # guidance change travels with the deploy to every server — incl. the
+        # isolated work box — without federating data. Idempotent: writes only
+        # rows whose content differs (a no-change boot does zero writes), and
+        # NEVER touches project-scoped rows. Best-effort: a seed failure must not
+        # block mongo init (agents would just keep the prior DB guidance).
+        try:
+            from shared_memory.global_guidelines import seed_global_guidelines
+            seed_global_guidelines(_mongo_db)
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).error(
+                "guidelines: global-guidance code-seed failed: %s", e
+            )
 
         # Ensure indexes for audit_log collection
         audit_col = _mongo_db.audit_log
@@ -241,6 +335,34 @@ def get_mongo():
         messages_col = _mongo_db.messages
         messages_col.create_index("chain_depth")
         messages_col.create_index("in_response_to")
+
+        # Skills registry (design:skill-registry-v0). Dedicated collection,
+        # Mongo-primary (lifecycle/owner/version/pin/confirm). Identity is
+        # (project, name); status is draft|active (confirm gate). See
+        # tools/skills.py.
+        skills_col = _mongo_db.skills
+        skills_col.create_index([("project", 1), ("name", 1)], unique=True)
+        skills_col.create_index("project")
+        skills_col.create_index([("project", 1), ("status", 1)])
+
+        # Fleet directives (cross-server "what you need to do" banners). Code-
+        # seeded like global_guidelines so the TEXT travels with the deploy to
+        # every server incl. the air-gapped work box; acks are per-server. See
+        # shared_memory.directives + tools/directives.py.
+        directives_col = _mongo_db.directives
+        directives_col.create_index("key", unique=True)
+        directives_col.create_index("active")
+        directive_acks_col = _mongo_db.directive_acks
+        directive_acks_col.create_index("key")
+        directive_acks_col.create_index([("project", 1), ("agent", 1)])
+        try:
+            from shared_memory.directives import seed_directives
+            seed_directives(_mongo_db)
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).error(
+                "directives: code-seed failed: %s", e
+            )
 
         # Op-log (Phase 1 foundation, design v0.3.0 §4.2). Collection +
         # indexes only — no writers yet. Phase 1 #2 instruments mutation

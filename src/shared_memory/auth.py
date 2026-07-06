@@ -78,6 +78,67 @@ def get_header_api_key() -> Optional[str]:
     or None if no Bearer header was present."""
     return _header_api_key.get()
 
+
+# ── Origin trust (design:auth-origin-trust-v0) ──
+# The same ASGI middleware flags whether a request arrived via the public
+# Cloudflare tunnel (Cloudflare sets the CF-Connecting-IP header on every
+# proxied request). The keyless soft-fallback then grants agent tier only for
+# LAN/local origins and rejects keyless tunnel traffic.
+#
+# Why trusting this header is safe HERE (it normally is not): the published
+# ports are bound to 127.0.0.1 + the LAN IP only, so the tunnel is the ONLY
+# off-LAN path that reaches the server. A client must already be on the trusted
+# LAN to hit the keyless port, and supplying the header only SELF-RESTRICTS
+# (forces the key requirement) — it can never elevate. Topology neutralises the
+# usual XFF/CF-Connecting-IP spoofing footgun.
+_request_via_tunnel: ContextVar[bool] = ContextVar(
+    "junto_request_via_tunnel", default=False
+)
+
+# Require a valid API key for connections that arrived over the public tunnel.
+TUNNEL_REQUIRES_KEY = os.getenv("JUNTO_TUNNEL_REQUIRES_KEY", "true").lower() in (
+    "true", "1", "yes",
+)
+
+# Require a valid API key for ALL connections, regardless of origin. Unlike
+# TUNNEL_REQUIRES_KEY (which only rejects keyless traffic detected as tunnel-origin
+# via CF-Connecting-IP), this rejects every keyless session — the correct posture
+# for a deployment where the transport (e.g. a Tailscale-only server) sets no
+# tunnel header, so origin-trust can't distinguish trusted-LAN from remote, AND
+# every legitimate client already holds a key. Default off preserves the
+# keyless-LAN soft-fallback. See design:auth-origin-trust-v0.
+REQUIRE_KEY = os.getenv("JUNTO_REQUIRE_KEY", "false").lower() in (
+    "true", "1", "yes",
+)
+
+
+def detect_tunnel_origin(headers) -> bool:
+    """True if the request carries Cloudflare's CF-Connecting-IP header, i.e.
+    it arrived via the cloudflared tunnel. `headers` is the ASGI scope's
+    headers: an iterable of (name, value) byte tuples. Pure function — no
+    contextvar side effects (testable)."""
+    for name, value in headers or ():
+        if name.lower() == b"cf-connecting-ip":
+            return True
+    return False
+
+
+def set_via_tunnel(flag: bool):
+    """Set the per-request tunnel-origin contextvar. Returns the reset token —
+    pass it to reset_via_tunnel in a finally block (ASGI task-locality)."""
+    return _request_via_tunnel.set(flag)
+
+
+def reset_via_tunnel(token) -> None:
+    """Reset the tunnel-origin contextvar using the token from set_via_tunnel."""
+    _request_via_tunnel.reset(token)
+
+
+def get_via_tunnel() -> bool:
+    """Read whether this request arrived via the public Cloudflare tunnel, as
+    flagged by the ASGI middleware. False for LAN/local origins."""
+    return _request_via_tunnel.get()
+
 # Roles ordered by privilege level (user sits between agent and admin —
 # broader cross-project read, can send messages, but no key/guideline management)
 ROLES = ["readonly", "agent", "user", "admin", "owner"]
@@ -93,6 +154,7 @@ PERMISSIONS: Dict[str, List[str]] = {
     "locking":          ["agent", "admin", "owner"],
     "functions":        ["agent", "admin", "owner"],
     "specs":            ["agent", "admin", "owner"],
+    "skills":           ["agent", "user", "admin", "owner"],
     "lifecycle":        ["agent", "admin", "owner"],
     "checklists":       ["agent", "user", "admin", "owner"],
     "database":         ["agent", "user", "admin", "owner"],

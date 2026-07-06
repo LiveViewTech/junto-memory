@@ -300,9 +300,12 @@ def main():
         import uvicorn
 
         from shared_memory.auth import (
+            detect_tunnel_origin,
             parse_bearer_token,
             reset_header_api_key,
+            reset_via_tunnel,
             set_header_api_key,
+            set_via_tunnel,
         )
         from shared_memory.tool_profiles import current_profile
 
@@ -331,18 +334,23 @@ def main():
         async def auth_header_middleware(scope, receive, send):
             """Parse 'Authorization: Bearer <key>' into the header_api_key
             contextvar so memory_start_session can fall back to it when no
-            per-tool api_key arg is given (design:header-auth-v0). Outermost
-            wrapper: sets/resets with the proven try/finally token pattern,
-            then delegates to discussion_route_middleware. No header → no-op."""
+            per-tool api_key arg is given (design:header-auth-v0), and flag
+            tunnel-origin requests via CF-Connecting-IP so keyless traffic over
+            the public tunnel can be rejected (design:auth-origin-trust-v0).
+            Outermost wrapper: sets/resets with the proven try/finally token
+            pattern, then delegates to discussion_route_middleware."""
             if scope["type"] in ("http", "websocket"):
                 key = parse_bearer_token(scope.get("headers"))
-                if key:
-                    token = set_header_api_key(key)
-                    try:
-                        await discussion_route_middleware(scope, receive, send)
-                    finally:
-                        reset_header_api_key(token)
-                    return
+                via_tunnel = detect_tunnel_origin(scope.get("headers"))
+                key_token = set_header_api_key(key) if key else None
+                tunnel_token = set_via_tunnel(via_tunnel)
+                try:
+                    await discussion_route_middleware(scope, receive, send)
+                finally:
+                    if key_token is not None:
+                        reset_header_api_key(key_token)
+                    reset_via_tunnel(tunnel_token)
+                return
             await discussion_route_middleware(scope, receive, send)
 
         config = uvicorn.Config(

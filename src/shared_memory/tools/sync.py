@@ -1066,9 +1066,11 @@ async def _apply_message_sent(db, chroma, op):
         to_project = payload.get("to_project")
         to_instance = payload.get("to_instance")
         if to_project and to_instance:
-            from shared_memory.tools.messaging import _notify_inbox_for_send
+            from shared_memory.tools.messaging import _build_announce_packet, _notify_inbox_for_send
             try:
-                await _notify_inbox_for_send(to_project, to_instance)
+                # Server-authoritative delivery §E: content-push the announce for
+                # a federated-replicated message too (None for badge-only/info).
+                await _notify_inbox_for_send(to_project, to_instance, _build_announce_packet(payload))
             except Exception as exc:  # pragma: no cover — defensive
                 # Notify is best-effort; apply success is the durability
                 # contract. Don't break replay on a push failure.

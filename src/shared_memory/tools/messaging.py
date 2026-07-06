@@ -1,5 +1,6 @@
 """Inter-agent messaging tools - send/receive messages, agent status, discovery."""
 
+import asyncio
 import json
 import logging
 import re
@@ -8,18 +9,32 @@ from datetime import timedelta
 from typing import Any, Dict, List, Set
 
 from mcp.server.fastmcp import Context
+from mcp.shared.message import SessionMessage
+from mcp.types import JSONRPCMessage, JSONRPCNotification
 from pydantic import AnyUrl
+from pymongo import ReturnDocument
 
 from shared_memory import push_control
 from shared_memory.app import mcp
 from shared_memory.audit import log_audit
 from shared_memory.clients import get_mongo
-from shared_memory.config import MESSAGE_CATEGORIES, MESSAGE_PRIORITIES, MESSAGE_STATUSES
+from shared_memory.config import (
+    ACTION_CATEGORIES,
+    MESSAGE_ACTION_TTL_DAYS,
+    MESSAGE_CATEGORIES,
+    MESSAGE_INFO_TTL_HOURS,
+    MESSAGE_PRIORITIES,
+    MESSAGE_STATUSES,
+    OBLIGATION_RESOLVE_ON_REPLY,
+    SSE_KEEPALIVE_SECONDS,
+    SSE_KEEPALIVE_SEND_TIMEOUT,
+    classify_lane,
+)
 from shared_memory.helpers import normalize_project, parse_timestamp, require_session, utc_now
 from shared_memory.intent import get_current_intent_id
 from shared_memory.op_log import with_op_log
 from shared_memory.state import active_sessions, mcp_session_to_app
-from shared_memory.tools.projects import _fuzzy_match_agent, _is_project_admin
+from shared_memory.tools.projects import _fuzzy_match_agent, _is_project_admin, resolve_agent_name
 
 log = logging.getLogger(__name__)
 
@@ -67,6 +82,74 @@ def _live_subscribers_count(to_project: str, to_instance: str) -> int:
         return len(union)
     uri_str = inbox_uri(to_project, to_instance)
     return len(inbox_subscriptions.get(uri_str, set()))
+
+
+def _recipient_idle_snapshot(db, to_project: str, to_instance: str):
+    """What's waiting for a recipient who has NO live subscriber, + how long
+    they've been idle — so the SENDER can decide to escalate (manually wake the
+    agent) instead of leaving a real ask blind. Read-side idle-queue visibility:
+    backlog_da56a6e0c46b, coordinator ask msg_5982f608ec7b.
+
+    Returns None (caller omits the field) for broadcasts, missing db, or missing
+    project — there's no single recipient to summarize. The counts MIRROR what the
+    recipient's own next get_messages would surface: same instance/project match,
+    same per-message-read + watermark-floor unread semantics (via
+    _compute_lane_counts), so the number the sender sees == the number the
+    recipient will actually find waiting.
+
+    `idle_hours` is derived from agent_directory.last_seen (bumped on start_session,
+    heartbeat, and human interaction). It is NOT a liveness proof — a parked agent
+    and a half-open-SSE agent can both look "idle"; pair it with live_subscribers=0,
+    which is the actual no-live-stream signal that triggers this snapshot.
+    """
+    if db is None or not to_project or not to_instance or to_instance == "*":
+        return None
+    proj = normalize_project(to_project)
+    # Mirror the recipient-side inbox match (see memory_get_messages): workers get
+    # direct-only; everyone else also matches broadcast (*). Project clause accepts
+    # the recipient's project plus legacy/empty-project broadcasts.
+    if to_instance.startswith("worker_"):
+        instance_match = {"to_instance": to_instance}
+    else:
+        instance_match = {"$or": [{"to_instance": to_instance}, {"to_instance": "*"}]}
+    project_match = {
+        "$or": [
+            {"to_project": proj},
+            {"to_project": {"$exists": False}},
+            {"to_project": ""},
+        ]
+    }
+    watermark = _get_messages_seen_through(db, proj, to_instance)
+    lane = _compute_lane_counts(
+        db, [instance_match, project_match], watermark=watermark, reader=to_instance
+    )
+
+    last_seen = None
+    try:
+        doc = db.agent_directory.find_one(
+            {"project": proj, "instance": to_instance}, {"last_seen": 1}
+        )
+        if doc:
+            last_seen = parse_timestamp(doc.get("last_seen"))
+    except Exception:
+        last_seen = None
+    idle_hours = None
+    if last_seen is not None:
+        try:
+            idle_hours = round((utc_now() - last_seen).total_seconds() / 3600.0, 1)
+        except TypeError:
+            idle_hours = None
+
+    return {
+        # Real asks waiting on this recipient — the number that drives an escalate
+        # decision. Open obligations ignore read state (a seen-but-unanswered ask
+        # still owes a reply); responded are tracked-but-discharged.
+        "queued_action_open": lane["pending_action_open"],
+        "queued_action_responded": lane["pending_action_responded"],
+        "queued_fyi_waiting": lane["pending_fyi_waiting"],
+        "last_seen": last_seen.isoformat() if last_seen else None,
+        "idle_hours": idle_hours,
+    }
 
 
 def _resolve_caller_identity():
@@ -175,15 +258,135 @@ def get_pending_messages_for_instance(instance_name: str, project: str = None) -
             "from_instance": doc.get("from_instance", doc.get("from", "?")),
             "from_project": doc.get("from_project", ""),
             "category": doc.get("category", "info"),
+            "subject": doc.get("subject"),
             "message": doc.get("message", ""),
             "priority": doc.get("priority", "normal"),
+            "obligation": doc.get("obligation"),
+            "component": doc.get("component"),
+            "owner": doc.get("owner"),
             "created": created_at,
         }
         if doc.get("reply_to"):
             entry["reply_to"] = doc["reply_to"]
+        _add_lane_fields(entry)
         messages.append(entry)
 
     return messages
+
+
+def _add_lane_fields(entry: Dict[str, Any]) -> None:
+    """Stamp lane/tier onto a serialized message entry in place.
+
+    The ONE place every message serializer reaches for the category→lane map
+    (interface:lanes-a-server-wire-v0). Used by all four serializers so they
+    cannot diverge (learning_84914604d129602e: the 4-serializer divergence
+    failure mode). Reads the entry's own category/obligation, so it is always
+    consistent with the payload it annotates.
+    """
+    lane, tier = classify_lane(entry.get("category", "info"), entry.get("obligation"))
+    entry["lane"] = lane
+    entry["tier"] = tier
+
+
+# Lanes-A within-page ordering rank (interface:lanes-a-server-wire-v0): an
+# un-engaged ask sorts above an engaged one, and both above everything cleared
+# or FYI. Anything not (action, 0/1) collapses to rank 2.
+_LANE_TIER_RANK = {("action", 0): 0, ("action", 1): 1}
+_PRIORITY_SORT = {"urgent": 0, "normal": 1, "low": 2}
+
+
+def _sort_messages_by_lane(messages: List[Dict[str, Any]]) -> None:
+    """In-place two-tier lanes-A sort (interface:lanes-a-server-wire-v0).
+
+    Order: action-open > action-responded > cleared/fyi; newest-first WITHIN a
+    tier; message priority (urgent>normal>low) as the FINAL tiebreak only — note
+    this DEMOTES priority from the old primary key to a tiebreak, the intended
+    lanes-A behavior change. Implemented as stable multi-pass (least-significant
+    key first) because the recency key sorts descending while the others ascend.
+    """
+    messages.sort(key=lambda x: _PRIORITY_SORT.get(x.get("priority"), 99))      # tertiary
+    messages.sort(key=lambda x: x.get("created") or "", reverse=True)           # secondary: recency
+    messages.sort(key=lambda x: _LANE_TIER_RANK.get((x.get("lane"), x.get("tier")), 2))  # primary
+
+
+def _compute_lane_counts(db, base_and: List[Dict[str, Any]], watermark=None,
+                         reader=None) -> Dict[str, int]:
+    """Server-side lane badge counts (interface:lanes-a-server-wire-v0).
+
+    base_and identifies the agent's inbox (instance + project clauses) WITHOUT
+    the page limit/cursor, so the badge reflects the whole actionable backlog the
+    plugin's page-1 can't see the tail of.
+
+      pending_action_open      — pending ACTION msgs with obligation open (or a
+                                 legacy action msg with no obligation set)
+      pending_action_responded — pending ACTION msgs with obligation responded
+      pending_fyi_waiting      — pending info msgs the reader hasn't READ. UNREAD
+                                 is per-message (read_by excludes `reader`,
+                                 build-plan task 2) with the seen-watermark kept
+                                 as a coarse floor (pre-task-2 history). The M
+                                 count stays read-INERT: a resource/announce scan
+                                 never writes read_by, so glancing never zeroes M.
+
+    Resolved (cleared) action msgs are in neither action count — they've left the
+    lane. Action counts ignore read state by design: a seen-but-unanswered
+    question still owes a reply, so it must stay on the badge.
+    """
+    def _count(extra: Dict[str, Any]) -> int:
+        return db.messages.count_documents({"$and": base_and + [extra]})
+
+    action_open = _count({
+        "category": {"$in": ACTION_CATEGORIES}, "status": "pending",
+        "obligation": {"$in": ["open", None]},
+    })
+    action_responded = _count({
+        "category": {"$in": ACTION_CATEGORIES}, "status": "pending",
+        "obligation": "responded",
+    })
+    # High-signal subset for the statusline (Tom UX, 2026-06-22 via coordinator):
+    # UNRESOLVED blockers addressed to the agent — category=blocker that has NOT
+    # cleared. open|responded|None all count (a blocker stays blocking until
+    # EXPLICITLY resolved; a reply leaves it "responded", still unresolved). This
+    # is a subset of the action counts above, surfaced separately because blocker
+    # is rare + high-signal (usually 0, spikes meaningfully) whereas action_open
+    # is inflated by responded-but-unclosed obligations.
+    blocker_open = _count({
+        "category": "blocker", "status": "pending",
+        "obligation": {"$in": ["open", "responded", None]},
+    })
+    fyi_clause: Dict[str, Any] = {"category": "info", "status": "pending"}
+    if reader is not None:
+        fyi_clause["read_by"] = {"$ne": reader}
+    if watermark is not None:
+        fyi_clause["created_at"] = {"$gt": watermark}
+    fyi_waiting = _count(fyi_clause)
+
+    # FYI aging signal (GUIDANCE, not force): age in hours of the OLDEST unread
+    # FYI, so a long-session agent can be nudged to drain before info ages out at
+    # MESSAGE_INFO_TTL_HOURS (48h). Pure data — nothing auto-expires/blocks on it;
+    # the agent/plugin decides whether/how to surface "FYIs aging, check soon".
+    # null when there are no waiting FYIs.
+    fyi_oldest_age_hours = None
+    if fyi_waiting:
+        oldest = next(iter(
+            db.messages.find({"$and": base_and + [fyi_clause]})
+                       .sort([("created_at", 1)]).limit(1)
+        ), None)
+        oc = (oldest or {}).get("created_at")
+        if oc is not None:
+            try:
+                fyi_oldest_age_hours = round(
+                    (utc_now() - oc).total_seconds() / 3600.0, 1
+                )
+            except TypeError:  # non-datetime created_at — skip the signal
+                fyi_oldest_age_hours = None
+    return {
+        "pending_action_open": action_open,
+        "pending_action_responded": action_responded,
+        "pending_blocker_open": blocker_open,
+        "pending_fyi_waiting": fyi_waiting,
+        "pending_fyi_oldest_age_hours": fyi_oldest_age_hours,
+        "fyi_ttl_hours": MESSAGE_INFO_TTL_HOURS,
+    }
 
 
 # Phase C1.1: destructive content gate. Body containing any of these patterns
@@ -206,12 +409,6 @@ _DESTRUCTIVE_KEYWORDS = re.compile(
     r"|git\s+push\s+(--force|-f)\b"
     r"|\brm\s+-rf\b"
 )
-
-# Legacy Phase C1 constant. Push-control v0 superseded this with a
-# configurable per-project depth_cap (default 12) evaluated inside
-# push_control.evaluate_send. Kept for any external code still referencing
-# the symbol; not consulted on the send path anymore.
-CHAIN_DEPTH_HARD_CAP = 5
 
 # ── Recency window (now drives push-suppression filter release, §3) ────────
 # Three signals open the 5-minute window for an agent:
@@ -271,6 +468,142 @@ def _bump_human_interaction(db, project: str, agent: str, when=None) -> None:
         pass
 
 
+def _get_messages_seen_through(db, project: str, agent: str):
+    """Return the agent's read-watermark (messages_seen_through) datetime, or None.
+
+    See design:message-read-watermark-v0. Distinct from last_seen /
+    last_human_interaction — those are recency signals for push-control's
+    5-min bypass and MUST NOT be overloaded as the read dedup marker.
+    """
+    if db is None or not project or not agent:
+        return None
+    try:
+        doc = db.agent_directory.find_one(
+            {"project": project, "instance": agent},
+            {"messages_seen_through": 1},
+        )
+    except Exception:
+        return None
+    if not doc:
+        return None
+    return parse_timestamp(doc.get("messages_seen_through"))
+
+
+def _advance_messages_seen_through(db, project: str, agent: str, ts) -> None:
+    """Advance the agent's read-watermark to `ts`, forward-only ($max).
+
+    $max only moves the stored value forward, so a late/out-of-order read can
+    never rewind the watermark and re-surface already-seen messages. Best-effort.
+    """
+    if db is None or not project or not agent or ts is None:
+        return
+    try:
+        db.agent_directory.update_one(
+            {"project": project, "instance": agent},
+            {"$max": {"messages_seen_through": ts}},
+            upsert=True,
+        )
+    except Exception:
+        pass
+
+
+def _mark_messages_read(db, message_ids, instance: str) -> None:
+    """Mark messages READ by `instance` — per-message read state, the SOURCE OF
+    TRUTH for unread (design:server-authoritative-delivery-v0 §E / contract:
+    message-lanes-v0 §E5, build-plan task 2). Replaces the auto-advancing
+    messages_seen_through watermark, which conflated "I glanced at a new message"
+    with "every older message is read". Idempotent ($addToSet read_by); marks ONLY
+    the given messages (per-message), so a truncated page never marks the
+    unreturned tail read. Does NOT touch the watermark (now a coarse floor only).
+    Best-effort: a read-state write must never break the read itself.
+    """
+    if db is None or not instance or not message_ids:
+        return
+    try:
+        db.messages.update_many(
+            {"_id": {"$in": list(message_ids)}},
+            {"$addToSet": {"read_by": instance}},
+        )
+    except Exception as e:  # pragma: no cover — defensive
+        log.debug("read-state: mark-read failed for %s: %s", instance, e)
+
+
+def _advance_parent_obligation_on_reply(db, parent_id: str, replier: str, now) -> "str | None":
+    """Auto-ack: when a reply's sender is the parent's OWNER, advance the parent's
+    obligation (design:unified-messaging-v0 Stage 3 / lanes-B).
+
+    owner_of(parent) := parent.owner ?? parent.to_instance — the generalized scope
+    guard. `owner` is unset today (claiming, Stage 2, populates it later), so this
+    falls back to the named recipient and is forward-compatible: a direct message's
+    owner IS its recipient, which is exactly the lanes-B guard reply.from==parent.to.
+
+    Transition (ACTION categories only; info/non-action carry no obligation):
+      {question, contract, review} -> resolved   (an answer satisfies)
+      {task, blocker}              -> responded   (engaged; stays in the action lane,
+                                                   deprioritized, until an explicit done)
+    Never downgrades an already-resolved parent (idempotent re-reply). Broadcast
+    parents (to_instance="*") never match a concrete replier -> never auto-ack.
+    Best-effort: a failure here must never break the underlying send.
+
+    RETURNS the new obligation state ("responded"|"resolved") iff it advanced an
+    open/responded ACTION parent, else None. The caller uses a non-None return to
+    PROMOTE this reply to push even if the reply's own category is badge-only
+    (contract:reply-promotion-v0) — the advance conditions ARE the promotion
+    conditions (action-lane parent + owner-guard + not-already-resolved).
+    """
+    if db is None or not parent_id or not replier:
+        return None
+    try:
+        parent = db.messages.find_one(
+            {"_id": parent_id},
+            {"category": 1, "to_instance": 1, "owner": 1, "obligation": 1},
+        )
+        if not parent:
+            return None
+        if parent.get("category") not in ACTION_CATEGORIES:
+            return None  # info / non-action messages carry no obligation
+        owner = parent.get("owner") or parent.get("to_instance")
+        if not owner or replier != owner:
+            return None  # scope guard: only the addressed owner's own reply clears it
+        if parent.get("obligation") == "resolved":
+            return None  # terminal — never downgrade (follow-up chatter, not promoted)
+        if parent["category"] in OBLIGATION_RESOLVE_ON_REPLY:
+            update = {"obligation": "resolved", "responded_at": now, "resolved_at": now}
+        else:  # task, blocker — engaged but not done
+            update = {"obligation": "responded", "responded_at": now}
+        db.messages.update_one({"_id": parent_id}, {"$set": update})
+        # Stage-5 TTL: a RESOLVED action is terminal → start its 7d expiry.
+        # "responded" is NOT terminal (stays in the action lane), so only the
+        # resolve branch ages the message out.
+        if update.get("obligation") == "resolved":
+            _set_action_message_expiry(db, parent_id)
+        return update["obligation"]
+    except Exception:
+        return None
+
+
+def _set_action_message_expiry(db, message_id):
+    """Stage-5 TTL: when an ACTION message reaches a terminal state (acked or
+    obligation resolved), give it expire_at = created + 7d so it ages out. Until
+    then an action carries expire_at=null and never expires (the load-bearing
+    "unacked action never vanishes" property). Idempotent — only sets when
+    expire_at is still null — and ACTION-only (info already got its 48h expiry at
+    send). Best-effort: a failure must never break the calling status update.
+    """
+    if db is None or not message_id:
+        return
+    try:
+        db.messages.update_one(
+            {"_id": message_id, "expire_at": None,
+             "category": {"$in": ACTION_CATEGORIES}},
+            [{"$set": {"expire_at": {
+                "$add": ["$created_at", MESSAGE_ACTION_TTL_DAYS * 24 * 3600 * 1000]
+            }}}],
+        )
+    except Exception:
+        pass
+
+
 @mcp.tool()
 async def memory_send_message(
     session_id: str,
@@ -284,6 +617,8 @@ async def memory_send_message(
     chain_depth: int = None,
     require_human: bool = False,
     human_interacted: bool = False,
+    component: str = None,
+    subject: str = None,
     ctx: Context = None
 ) -> str:
     """
@@ -324,6 +659,19 @@ async def memory_send_message(
             this on outbound sends made while processing a Tom-typed prompt).
             When True, refreshes the sender's per-agent recency window. Trusted
             in non-adversarial environments; default False on autopilot replies.
+        component: Optional sub-group under the project this message belongs to
+            (design:unified-messaging-v0 Stage 1 — ADDRESSING). Free-form,
+            human-chosen (e.g. "camera-sync"). Stage 1 carries it as first-class
+            metadata only — addressing is still by to_instance; component-based
+            pub/sub fan-out + claiming arrive in Stages 2-3. null (default) =
+            today's behavior, routes by to_instance. nimbus's direct-send world
+            is the component=null degenerate case (nimbus-compat invariant).
+        subject: Optional sender-authored header line (<=80ch primary triage
+            signal — server-authoritative delivery §E3 / contract:message-lanes-v0).
+            Required-BY-GUIDELINE, not hard-rejected: a missing subject on an
+            action message renders "(no subject)" on the recipient side. A reply
+            (in_response_to set) with no explicit subject defaults to
+            "Re: <parent subject>". Surfaces in get_messages and the announce packet.
     """
     error = require_session(session_id)
     if error:
@@ -349,14 +697,25 @@ async def memory_send_message(
     normalized_project = normalize_project(target_project)
     registered_project = db.projects.find_one({"name": normalized_project})
 
-    if registered_project:
-        # Project is registered - validate the target agent
-        if to_instance != "*":
-            registered_agent = db.registered_agents.find_one({
-                "project": normalized_project,
-                "name": to_instance
-            })
-            if not registered_agent:
+    if to_instance != "*":
+        # Resolve the recipient: a live agent name passes through; a
+        # nickname/alias (e.g. "coordinator" -> "emailTriage") is redirected
+        # to the canonical live agent; an unknown name returns None.
+        resolved = resolve_agent_name(db, normalized_project, to_instance)
+        if resolved:
+            to_instance = resolved
+        else:
+            # Unknown recipient. Fail loud whenever we have a roster to
+            # validate against — a REGISTERED project, OR an unregistered
+            # project that nonetheless has registered agents (e.g.
+            # emailtriage, which was silently voiding misrouted sends before
+            # the registered_project gate was relaxed). Only a project with
+            # no roster at all falls through (back-compat: a project being
+            # set up before any agent has registered).
+            has_roster = bool(registered_project) or db.registered_agents.find_one(
+                {"project": normalized_project}, {"_id": 1}
+            )
+            if has_roster:
                 # Agent not registered - hard reject with suggestions
                 suggestions = _fuzzy_match_agent(db, normalized_project, to_instance)
                 error_msg = f"Agent '{to_instance}' is not registered in project '{normalized_project}'."
@@ -370,8 +729,8 @@ async def memory_send_message(
                     if all_agents:
                         error_msg += f" Valid agents: {', '.join(all_agents)}"
                 return json.dumps({"error": error_msg})
-    # If project not registered, allow message through (backward compatibility)
-    # This lets messaging work before projects are fully set up
+            # No roster yet — allow message through (backward compatibility).
+            # This lets messaging work before projects are fully set up.
 
     # ── Dedup check ──
     # Reject identical messages to same target within 5 minutes
@@ -411,7 +770,7 @@ async def memory_send_message(
         final_depth = max(parent_depth + 1, caller_depth, 0)
 
     # ── Push control v0 evaluation (design:push-control-v0 v1.1.0) ──
-    # Replaces the legacy CHAIN_DEPTH_HARD_CAP=5 + Phase D2 recency-bypass
+    # Replaces the legacy hard cap (5) + Phase D2 recency-bypass
     # block. The new gate has three layers, all per-sender and all invisible
     # to the agent: push depth cap (per-thread, flat, no reset), push budget
     # (per-sender hourly, soft), hard ceiling (per-sender hourly, suspend).
@@ -481,6 +840,20 @@ async def memory_send_message(
         except Exception as e:
             log.error("push_control: hard_trip orchestration failed: %s", e)
 
+    # ── Limit-watch (design:limit-watch-v0) ──
+    # Persist the sender's hourly peak + fire once-per-hour budget_warn /
+    # push_budget_breach alerts. `suppressed` counts only budget-driven
+    # suppression — depth_cap suppression is conversation-shape, not volume,
+    # and would pollute the tuning data.
+    push_control.record_emission_history(
+        db,
+        session_info["claude_instance"],
+        from_project,
+        emission_count,
+        bool(suppress_push and push_suppress_reason in ("push_budget", "hard_ceiling")),
+        pc_eval["effective_config"],
+    )
+
     # ── Phase C1.1: destructive content gate, chain-depth-gated ──
     # Auto-flag only when this is a relayed/autopilot message (chain_depth>0).
     # Depth-0 sends are deliberate (human-tier or new agent chain) — the caller
@@ -491,6 +864,18 @@ async def memory_send_message(
         final_depth > 0 and bool(_DESTRUCTIVE_KEYWORDS.search(message))
     )
     final_require_human = bool(require_human) or body_is_destructive
+
+    # ── SUBJECT (server-authoritative delivery §E3 / build-plan task 1) ──
+    # Sender-authored primary header signal. Required-by-guideline, NOT
+    # hard-rejected. A reply with no explicit subject defaults to
+    # "Re: <parent subject>" (one extra lookup only on a reply-without-subject;
+    # the chain_depth branch above doesn't always fetch the parent).
+    final_subject = subject.strip() if isinstance(subject, str) and subject.strip() else None
+    if final_subject is None and in_response_to:
+        _parent_subj = db.messages.find_one({"_id": in_response_to}, {"subject": 1})
+        _ps = (_parent_subj or {}).get("subject")
+        if _ps:
+            final_subject = _ps if _ps.startswith("Re: ") else f"Re: {_ps}"
 
     # ── Build and store message ──
     message_id = f"msg_{uuid.uuid4().hex[:12]}"
@@ -505,6 +890,11 @@ async def memory_send_message(
         "message": message,
         "priority": priority,
         "category": category,
+        "subject": final_subject,
+        # Per-message read state (build-plan task 2): the recipients who have
+        # READ this message (body-pull or ack). Empty = unread by everyone; the
+        # source of truth for the unread filter, replacing the seen-watermark.
+        "read_by": [],
         "reply_to": reply_to,
         "in_response_to": in_response_to,
         "chain_depth": final_depth,
@@ -515,6 +905,31 @@ async def memory_send_message(
         # forgeable; new code should read sent_by_human instead.
         "user_originated": sent_by_human or session_info.get("claude_instance", "").startswith("user-"),
         "status": "pending",
+        # Obligation track (design:unified-messaging-v0 Stage 3 / lanes-B). ACTION
+        # categories start "open"; info carries none. A reply from the owner
+        # advances it via _advance_parent_obligation_on_reply.
+        "obligation": "open" if category in ACTION_CATEGORIES else None,
+        # Component (design:unified-messaging-v0 Stage 1 / ADDRESSING). Optional
+        # sub-group under the project. Stage 1 = first-class metadata only;
+        # component-routing/claiming land in Stages 2-3. null = route by
+        # to_instance (today's behavior; nimbus's degenerate case).
+        "component": component or None,
+        # Ownership (design:unified-messaging-v0 Stage 2 / CLAIMING). owner stays
+        # null until a GROUP message (broadcast to_instance="*" or component-
+        # addressed) is claimed via memory_claim_message (atomic CAS on
+        # owner:null). DIRECT sends leave owner null too — the obligation guard
+        # reads `owner ?? to_instance`, so a direct message's implicit owner is
+        # its recipient (nimbus-compat invariant). claimed_at stamps the win.
+        "owner": None,
+        "claimed_at": None,
+        # Differential TTL (design:unified-messaging-v0 Stage 5 / lanes-C). info
+        # ages in 48h; an ACTION message starts with NO expiry (unacked actions
+        # must never silently vanish) and gets expire_at=created+7d only when it
+        # reaches a terminal state (ack/resolve) via _set_action_message_expiry.
+        "expire_at": (
+            None if category in ACTION_CATEGORIES
+            else now + timedelta(hours=MESSAGE_INFO_TTL_HOURS)
+        ),
         "push_suppressed": suppress_push,
         "push_suppress_reason": push_suppress_reason,
         "emission_count": emission_count,
@@ -544,6 +959,19 @@ async def memory_send_message(
             intent_id=get_current_intent_id(),
         )
 
+    # ── lanes-B: reply auto-acks the parent's obligation ──
+    # A reply (in_response_to set) from the parent's owner advances the parent
+    # off the action lane (resolved) or marks it engaged (responded). Owner
+    # defaults to the named recipient (forward-compatible with Stage-2 claiming).
+    # Best-effort — never blocks the send. A non-None return means this reply
+    # advanced an open/responded action obligation → PROMOTE it to push even if
+    # its own category is badge-only (contract:reply-promotion-v0).
+    advanced_obligation = None
+    if in_response_to:
+        advanced_obligation = _advance_parent_obligation_on_reply(
+            db, in_response_to, session_info["claude_instance"], now
+        )
+
     # ── Phase D2: outbound recency bump ──
     # If the sender asserts human_interacted=True (and is not itself user-tier
     # — sent_by_human already implies a different identity), refresh the
@@ -558,7 +986,12 @@ async def memory_send_message(
     # / read_inbox) still surfaces the message — coordinator alert covers
     # visibility.
     if not suppress_push:
-        await _notify_inbox_for_send(msg_doc["to_project"], to_instance)
+        # Server-authoritative delivery §E: build the announce packet (None for
+        # badge-only/info) and content-push it alongside the resource-updated.
+        # contract:reply-promotion-v0: an obligation-closing reply is promoted to
+        # push even if its own category is badge-only, so the requester isn't blind.
+        announce_packet = _build_announce_packet(msg_doc, promoted=bool(advanced_obligation))
+        await _notify_inbox_for_send(msg_doc["to_project"], to_instance, announce_packet)
 
     # Subscriber count is read from the in-process subscription map, which
     # _notify_inbox_for_send may have just pruned of dead sessions. Reading
@@ -570,7 +1003,7 @@ async def memory_send_message(
     # final_depth. Kept in the response shape for backward compat.
     effective_chain_depth = final_depth
 
-    return json.dumps({
+    response = {
         "status": "queued",
         "message_id": message_id,
         "to": to_instance,
@@ -578,6 +1011,8 @@ async def memory_send_message(
         "from_project": from_project,
         "priority": priority,
         "category": category,
+        "obligation": msg_doc["obligation"],
+        "component": msg_doc["component"],
         "reply_to": reply_to,
         "in_response_to": in_response_to,
         "chain_depth": final_depth,
@@ -592,7 +1027,20 @@ async def memory_send_message(
         "emission_count": emission_count,
         "recency_bypass": recency_bypass,
         "live_subscribers": 0 if suppress_push else live_subscribers,
-    })
+    }
+
+    # Read-side idle-queue visibility (backlog_da56a6e0c46b). When the recipient
+    # has NO live stream to receive this push, tell the sender what's already
+    # waiting + how long they've been idle, so the sender can decide to escalate
+    # (manually wake the agent) rather than sit blind on an unanswered ask. Only
+    # on direct sends with a genuinely absent subscriber — a live recipient is
+    # getting the push, no escalation question to answer.
+    if live_subscribers == 0 and to_instance != "*":
+        idle = _recipient_idle_snapshot(db, msg_doc["to_project"], to_instance)
+        if idle is not None:
+            response["recipient_idle"] = idle
+
+    return json.dumps(response)
 
 
 @mcp.tool()
@@ -604,6 +1052,10 @@ async def memory_get_messages(
     for_instance: str = None,
     cursor: str = None,
     updated_within_days: int = None,
+    include_seen: bool = False,
+    headers_only: bool = False,
+    created_after: str = None,
+    created_before: str = None,
     ctx: Context = None
 ) -> str:
     """
@@ -627,8 +1079,32 @@ async def memory_get_messages(
         updated_within_days: Only return messages whose `created_at` is within
             the last N days. Omit (default None) to disable the recency filter.
             Server-side filter — cheaper than load-then-filter at the caller.
-            Note: messages have a 7-day TTL set at insert time (see clients.py),
-            so values > 7 silently behave as 7.
+            Note: messages have a DIFFERENTIAL TTL (design:unified-messaging-v0
+            Stage 5, see clients.py / config.py): info ages out in 48h, an
+            unacked action never ages, and an acked/resolved action lasts 7d from
+            creation. So for info, values > 2 effectively behave as 2.
+        include_seen: Default False — a top read (no cursor) by the owning agent
+            returns only messages newer than the agent's read-watermark
+            (messages_seen_through), and advances that watermark when it has
+            handed over the complete unseen set (has_more=False). This stops
+            every `go` from redisplaying the full 7-day window. Set True for a
+            full-window catch-up (skips the watermark filter and does not
+            advance it). The watermark is per-recipient and ONLY consulted on
+            the self, non-paginated path; cursor pagination and for_instance
+            peeks always bypass it. The inbox:// resource (push delivery,
+            control UI) is a separate path and is NOT affected by this filter.
+            See design:message-read-watermark-v0.
+        headers_only: Default False. True returns metadata WITHOUT the message
+            body — a triage/reconcile scan that is READ-INERT (does NOT mark the
+            returned messages read), so an agent can scan unread headers and then
+            choose which bodies to pull. The go/park reconcile path
+            (design:server-authoritative-delivery-v0 §E). Pull a body (by
+            message_id or a normal non-headers read) or ack to mark read.
+        created_after: ISO timestamp — only messages with created_at strictly
+            AFTER this. Explicit lower bound (vs updated_within_days' rolling
+            approximation). Build-plan task 3.
+        created_before: ISO timestamp — only messages with created_at strictly
+            BEFORE this. Explicit upper bound. Build-plan task 3.
     """
     error = require_session(session_id)
     if error:
@@ -665,6 +1141,11 @@ async def memory_get_messages(
                 return json.dumps({"error": "Permission denied. Only admins/coordinators can view other agents' messages."})
             if msg_project and msg_project != my_project:
                 return json.dumps({"error": "Permission denied. Message belongs to a different project."})
+        # Body-pull marks read (build-plan task 2): fetching your OWN message's
+        # body by id is a canonical read. Skip when an admin peeks at a message
+        # addressed to someone else (don't mark read on their behalf).
+        if doc.get("to_instance", doc.get("to")) in (my_instance, "*"):
+            _mark_messages_read(db, [doc["_id"]], my_instance)
         entry = {
             "id": doc["_id"],
             "from": doc.get("from_instance", doc.get("from", "?")),
@@ -672,9 +1153,15 @@ async def memory_get_messages(
             "to": doc.get("to_instance", doc.get("to", "?")),
             "to_project": doc.get("to_project", ""),
             "category": doc.get("category", "info"),
+            "subject": doc.get("subject"),
             "message": doc["message"],
             "priority": doc.get("priority", "normal"),
             "status": doc.get("status", "?"),
+            "obligation": doc.get("obligation"),
+            "component": doc.get("component"),
+            "owner": doc.get("owner"),
+            "claimed_at": doc["claimed_at"].isoformat() if hasattr(doc.get("claimed_at"), "isoformat") else doc.get("claimed_at"),
+            "expire_at": doc["expire_at"].isoformat() if hasattr(doc.get("expire_at"), "isoformat") else doc.get("expire_at"),
             "created": doc["created_at"].isoformat() if doc.get("created_at") else (doc["created"].isoformat() if doc.get("created") else None),
             "chain_depth": doc.get("chain_depth", 0),
             "require_human": bool(doc.get("require_human", False)),
@@ -691,6 +1178,7 @@ async def memory_get_messages(
             entry["reply_to"] = doc["reply_to"]
         if doc.get("in_response_to"):
             entry["in_response_to"] = doc["in_response_to"]
+        _add_lane_fields(entry)
         return json.dumps({"count": 1, "messages": [entry]})
 
     # ── Querying for another agent's messages ──
@@ -738,10 +1226,45 @@ async def memory_get_messages(
         recency_cutoff = utc_now() - timedelta(days=int(updated_within_days))
         query["$and"].append({"created_at": {"$gte": recency_cutoff}})
 
+    # Explicit created_at bounds (build-plan task 3). Distinct from cursor (which
+    # is a created_at < pagination key) and from updated_within_days (rolling).
+    # Silently ignore an unparseable bound rather than reject the whole read.
+    if created_after is not None:
+        _after_dt = parse_timestamp(created_after)
+        if _after_dt is not None:
+            query["$and"].append({"created_at": {"$gt": _after_dt}})
+    if created_before is not None:
+        _before_dt = parse_timestamp(created_before)
+        if _before_dt is not None:
+            query["$and"].append({"created_at": {"$lt": _before_dt}})
+
+    # ── Unread filter (build-plan task 2: per-message read state) ──
+    # A top read (no cursor) by the OWNING agent defaults to UNREAD-only. Read
+    # state is now PER-MESSAGE — read_by excludes the agent — replacing the
+    # single auto-advancing messages_seen_through watermark (which conflated
+    # "glanced at a new msg" with "older msgs read"). The watermark is DEMOTED to
+    # a coarse FLOOR: messages at/before it are treated as already-read, so an
+    # agent carrying a pre-task-2 watermark isn't re-flooded post-deploy. Cursor
+    # pagination and for_instance peeks bypass (I2/I3); include_seen is the
+    # full-window catch-up hatch (design:message-read-watermark-v0 invariants).
+    is_owner_read = (
+        not include_seen and cursor is None and target_instance == my_instance
+    )
+    if is_owner_read:
+        query["$and"].append({"read_by": {"$ne": my_instance}})
+        watermark = _get_messages_seen_through(db, my_project, my_instance)
+        if watermark is not None:
+            query["$and"].append({"created_at": {"$gt": watermark}})
+
     # Fetch limit+1 to detect "has more" without a separate count query.
+    # Sort recency-primary (created_at DESC). Priority is NOT a DB sort key:
+    # it is a STRING (low/normal/urgent), so ("priority",1) sorted it
+    # alphabetically (urgent LAST) and, applied before limit, stranded urgent
+    # behind a large backlog (design:inbox-surfacing-v0). created_at-primary
+    # also makes cursor pagination consistent (the cursor filters created_at <
+    # x). Within-page priority ordering is still applied below in Python.
     page_size = max(1, int(limit))
     db_cursor = db.messages.find(query).sort([
-        ("priority", 1),
         ("created_at", -1)
     ]).limit(page_size + 1)
 
@@ -757,7 +1280,6 @@ async def memory_get_messages(
         elif last_created is not None:
             next_cursor = str(last_created)
 
-    priority_sort = {"urgent": 0, "normal": 1, "low": 2}
     messages = []
     saw_human_message = False
     for doc in raw_docs:
@@ -772,9 +1294,15 @@ async def memory_get_messages(
             "from": doc.get("from_instance", doc.get("from", "?")),
             "from_project": doc.get("from_project", ""),
             "category": doc.get("category", "info"),
-            "message": doc.get("message", ""),
+            "subject": doc.get("subject"),
+            # headers_only (task 3) is a read-inert triage scan: omit the body so
+            # the recipient triages from headers and pulls bodies it wants.
+            "message": None if headers_only else doc.get("message", ""),
             "priority": doc.get("priority", "normal"),
             "status": doc.get("status", "pending"),
+            "obligation": doc.get("obligation"),
+            "component": doc.get("component"),
+            "owner": doc.get("owner"),
             "created": created_at,
             "delivered": doc.get("status", "pending") != "pending",
             "chain_depth": doc.get("chain_depth", 0),
@@ -792,6 +1320,7 @@ async def memory_get_messages(
             entry["reply_to"] = doc["reply_to"]
         if doc.get("in_response_to"):
             entry["in_response_to"] = doc["in_response_to"]
+        _add_lane_fields(entry)
         messages.append(entry)
 
     # ── Phase D2: inbound recency bump ──
@@ -802,12 +1331,38 @@ async def memory_get_messages(
     if saw_human_message and target_instance == my_instance:
         _bump_human_interaction(db, my_project, my_instance)
 
-    # Sort by priority then created
-    messages.sort(key=lambda x: (priority_sort.get(x["priority"], 99), x["created"] or ""))
+    # ── Mark returned messages read (build-plan task 2: per-message read) ──
+    # Replaces the old watermark auto-advance. A body-returning owner read marks
+    # ONLY the messages handed over (per-message), so a truncated page never marks
+    # the unreturned tail read — the old has_more guard is no longer needed.
+    # INERT for resource reads (read_inbox / I1), cursor pages (I2) and
+    # include_seen catch-ups (I3): is_owner_read already excludes those. The
+    # headers-only scan (build-plan task 3) will opt OUT of this marking so a pure
+    # triage glance stays inert.
+    if is_owner_read and not headers_only and raw_docs:
+        _mark_messages_read(db, [d["_id"] for d in raw_docs], my_instance)
+
+    # Lanes-A within-page display order (interface:lanes-a-server-wire-v0): tier
+    # over recency over priority. This is the POST-FETCH re-sort, NOT the DB
+    # selection key — selection stays created_at-primary above (design:inbox-
+    # surfacing-v0 Fix A), so nothing strands past limit() and the created_at
+    # cursor stays coherent. inbox's co-sign blocking condition (msg_83e884ecfac7).
+    _sort_messages_by_lane(messages)
+
+    # Lane badge counts over the FULL inbox (not page-limited — the plugin only
+    # sees page-1 and can't count the tail). Action counts ignore the watermark
+    # (a seen-but-unanswered ask still owes a reply); fyi counts unseen-only.
+    lane_counts = _compute_lane_counts(
+        db,
+        [instance_match, project_match],
+        watermark=_get_messages_seen_through(db, my_project, target_instance),
+        reader=target_instance,
+    )
 
     return json.dumps({
         "count": len(messages),
         "messages": messages,
+        "lane_counts": lane_counts,
         "next_cursor": next_cursor,
         "has_more": has_more,
     })
@@ -828,20 +1383,46 @@ async def memory_update_message_status(
     Args:
         session_id: Your session ID
         message_id: The message ID to update
-        status: New status (delivered, received, completed, failed)
+        status: New DELIVERY status (delivered, received, completed, failed) OR an
+            OBLIGATION verb (responded, resolved). The two are separate axes:
+            delivery statuses write the `status` field; "responded"/"resolved"
+            write the `obligation` field (lanes-B / design:unified-messaging-v0).
+            "resolved" is the explicit low-friction done verb for a task/blocker
+            that a reply only marked "responded".
     """
     error = require_session(session_id)
     if error:
         return error
-
-    if status not in MESSAGE_STATUSES:
-        return json.dumps({"error": f"Invalid status. Must be one of: {MESSAGE_STATUSES}"})
 
     db = get_mongo()
     if db is None:
         return json.dumps({"error": "MongoDB unavailable"})
 
     now = utc_now()
+
+    # ── Obligation track (lanes-B) — separate axis from delivery status ──
+    # "resolved"/"responded" are not delivery statuses; route them to the
+    # `obligation` field. "resolved" is the explicit done verb (clears a
+    # task/blocker that a reply left "responded").
+    if status in ("responded", "resolved"):
+        obl_update = {"obligation": status, "responded_at": now}
+        if status == "resolved":
+            obl_update["resolved_at"] = now
+        result = db.messages.update_one({"_id": message_id}, {"$set": obl_update})
+        if result.matched_count == 0:
+            return json.dumps({"error": f"Message not found: {message_id}"})
+        # Stage-5 TTL: "resolved" is terminal → start the 7d expiry.
+        if status == "resolved":
+            _set_action_message_expiry(db, message_id)
+        return json.dumps({
+            "obligation": status,
+            "message_id": message_id,
+            "updated": True,
+        })
+
+    if status not in MESSAGE_STATUSES:
+        return json.dumps({"error": f"Invalid status. Must be one of: {MESSAGE_STATUSES} (or obligation verbs: responded, resolved)"})
+
     update = {"status": status}
 
     # Set appropriate timestamp
@@ -860,10 +1441,135 @@ async def memory_update_message_status(
     if result.matched_count == 0:
         return json.dumps({"error": f"Message not found: {message_id}"})
 
+    # Per-message read state (build-plan task 2): an ack (received) is an explicit
+    # "I've seen and handled this" → mark it read by the acking agent, the other
+    # half of body-pull-marks-read. Keeps the unread filter / badge consistent
+    # whether the agent pulled the body or just acked.
+    if status == "received":
+        caller_instance = active_sessions.get(session_id, {}).get("claude_instance")
+        if caller_instance:
+            _mark_messages_read(db, [message_id], caller_instance)
+
+    # Stage-5 TTL: ack/completion is terminal for an action message → start its
+    # 7d expiry. "delivered" is NOT terminal (delivered ≠ acted-on).
+    if status in ("received", "completed", "failed"):
+        _set_action_message_expiry(db, message_id)
+
     return json.dumps({
         "status": status,
         "message_id": message_id,
         "updated": True
+    })
+
+
+@mcp.tool()
+async def memory_claim_message(
+    session_id: str,
+    message_id: str,
+    ctx: Context = None
+) -> str:
+    """
+    Claim ownership of a GROUP-addressed message (atomic, first-wins).
+
+    design:unified-messaging-v0 Stage 2 / CLAIMING. When a message is addressed
+    to a GROUP — a broadcast (to_instance="*") or a component — every subscriber
+    sees the same single doc. Calling this claims it for YOU via an atomic
+    compare-and-swap (find_one_and_update on owner:null): exactly one caller
+    wins, the rest learn they lost. The winner becomes the message's `owner`, so
+    the winner's reply auto-acks the obligation — the same `owner` the lanes-B
+    guard reads (claiming + auto-ack are one mechanism, by design).
+
+    DIRECT messages (addressed to a concrete agent) are NOT claimable — they
+    already have an implicit owner (the recipient). Claiming one is rejected.
+
+    Loser dedup is READ-SIDE in Stage 2: `owner` is surfaced on every message
+    read, so a non-winner sees owner=<someone-else> and skips it. The active
+    push-notify to other subscribers rides on Stage-3 component fan-out.
+
+    Args:
+        session_id: Your session ID.
+        message_id: The group message to claim.
+
+    Returns JSON {claimed, owner, message_id[, claimed_at][, note]}:
+      claimed=True  → you won; owner is you.
+      claimed=False → already held; owner is the agent who holds it.
+    """
+    error = require_session(session_id)
+    if error:
+        return error
+
+    session_info = active_sessions[session_id]
+    me = session_info["claude_instance"]
+    my_project = normalize_project(session_info.get("project", ""))
+
+    db = get_mongo()
+    if db is None:
+        return json.dumps({"error": "MongoDB unavailable"})
+
+    doc = db.messages.find_one(
+        {"_id": message_id},
+        {"to_instance": 1, "to_project": 1, "component": 1, "owner": 1},
+    )
+    if not doc:
+        return json.dumps({"error": f"Message not found: {message_id}"})
+
+    # ── Project visibility: you can only claim within your own project ──
+    msg_project = doc.get("to_project", "")
+    if msg_project and msg_project != my_project:
+        return json.dumps({"error": "Permission denied. Message belongs to a different project."})
+
+    # ── Group-addressing gate ──
+    # Only a GROUP message is claimable. Today the sole group form is a broadcast
+    # (to_instance="*"); a component-scoped group send is "*" + a component tag.
+    # A message with a CONCRETE recipient is direct — it has an implicit owner
+    # (that recipient) and must not be hijacked, EVEN IF it carries a component
+    # tag (the tag is metadata, not an address). When Stage 3 adds true
+    # component-addressed sends (no concrete to_instance), extend this gate; the
+    # owner:null CAS below already handles them unchanged.
+    to_instance = doc.get("to_instance", "")
+    is_group = to_instance == "*"
+    if not is_group:
+        return json.dumps({
+            "error": (
+                f"Message {message_id} is direct-addressed (to='{to_instance}') and "
+                f"cannot be claimed — it already has an implicit owner. Claiming "
+                f"applies only to group messages (broadcast to='*')."
+            )
+        })
+
+    # ── Atomic compare-and-swap: first-wins on owner:null ──
+    # find_one_and_update is the single round-trip CAS — the {_id, owner:None}
+    # filter is the precondition; only one concurrent caller matches it. Returns
+    # the post-update doc iff WE won, None if another caller already set owner.
+    now = utc_now()
+    won = db.messages.find_one_and_update(
+        {"_id": message_id, "owner": None},
+        {"$set": {"owner": me, "claimed_at": now}},
+        return_document=ReturnDocument.AFTER,
+    )
+    if won is not None:
+        try:
+            log_audit("message.claimed", me, my_project,
+                      {"message_id": message_id, "component": doc.get("component"),
+                       "to_instance": to_instance})
+        except Exception:
+            pass
+        return json.dumps({
+            "claimed": True,
+            "owner": me,
+            "message_id": message_id,
+            "claimed_at": now.isoformat() if hasattr(now, "isoformat") else now,
+        })
+
+    # Lost the race (or it was claimed earlier). Re-read to report who holds it.
+    current = db.messages.find_one({"_id": message_id}, {"owner": 1})
+    current_owner = current.get("owner") if current else None
+    return json.dumps({
+        "claimed": False,
+        "owner": current_owner,
+        "message_id": message_id,
+        "note": ("You already own this." if current_owner == me
+                 else f"Already claimed by {current_owner}."),
     })
 
 
@@ -1074,9 +1780,13 @@ def _format_inbox_message(doc: Dict[str, Any]) -> Dict[str, Any]:
         "to": doc.get("to_instance", doc.get("to", "?")),
         "to_project": doc.get("to_project", ""),
         "category": doc.get("category", "info"),
+        "subject": doc.get("subject"),
         "message": doc.get("message", ""),
         "priority": doc.get("priority", "normal"),
         "status": doc.get("status", "pending"),
+        "obligation": doc.get("obligation"),
+        "component": doc.get("component"),
+        "owner": doc.get("owner"),
         "created": created_at,
         "delivered": doc.get("status", "pending") != "pending",
         "chain_depth": doc.get("chain_depth", 0),
@@ -1094,6 +1804,7 @@ def _format_inbox_message(doc: Dict[str, Any]) -> Dict[str, Any]:
         entry["reply_to"] = doc["reply_to"]
     if doc.get("in_response_to"):
         entry["in_response_to"] = doc["in_response_to"]
+    _add_lane_fields(entry)
     return entry
 
 
@@ -1170,8 +1881,11 @@ async def read_inbox(project: str, agent: str) -> str:
             ]
         })
 
+    # Recency-primary sort (created_at DESC) — see the get_messages sort note:
+    # priority is a string, so DB-sorting on it stranded urgent behind a large
+    # backlog (design:inbox-surfacing-v0). Within-page priority ordering is
+    # applied in Python below; the inbox resource is the plugin's page-1 path.
     cursor = db.messages.find(query).sort([
-        ("priority", 1),
         ("created_at", -1),
     ]).limit(INBOX_DEFAULT_LIMIT + 1)
 
@@ -1187,14 +1901,26 @@ async def read_inbox(project: str, agent: str) -> str:
         elif last_created is not None:
             next_cursor = str(last_created)
 
-    priority_sort = {"urgent": 0, "normal": 1, "low": 2}
     messages = [_format_inbox_message(d) for d in docs]
-    messages.sort(key=lambda x: (priority_sort.get(x["priority"], 99), x["created"] or ""))
+    # Lanes-A within-page display order (post-fetch re-sort; DB selection above
+    # stays created_at-primary). See get_messages for the layering rationale.
+    _sort_messages_by_lane(messages)
 
     # Phase D2: bump recipient's recency timestamp the moment we hand them a
     # sent_by_human=True message via the inbox URI.
     if any(m.get("sent_by_human") for m in messages):
         _bump_human_interaction(db, project, agent)
+
+    # Lane badge counts over the full inbox. fyi M-count is per-message UNREAD
+    # (read_by excludes this agent) with the seen-watermark as a coarse floor —
+    # and this resource read is READ-INERT (never writes read_by), so surfacing
+    # the badge never zeroes M (build-plan task 2). action counts are read-state-
+    # independent by design.
+    lane_counts = _compute_lane_counts(
+        db, [instance_match, project_match],
+        watermark=_get_messages_seen_through(db, project, agent),
+        reader=agent,
+    )
 
     return json.dumps({
         "uri": inbox_uri(project, agent),
@@ -1202,6 +1928,7 @@ async def read_inbox(project: str, agent: str) -> str:
         "agent": agent,
         "count": len(messages),
         "messages": messages,
+        "lane_counts": lane_counts,
         "next_cursor": next_cursor,
         "has_more": has_more,
     })
@@ -1219,13 +1946,208 @@ def _parse_inbox_uri(uri_str: str) -> tuple:
     return (normalize_project(m.group(1)), m.group(2))
 
 
-async def _notify_inbox_for_send(to_project: str, to_instance: str) -> None:
-    """Dispatch ResourceUpdated notifications after memory_send_message.
+# ── Server-authoritative content-push ──────────────────────────────────────
+# design:server-authoritative-delivery-v0 §ANNOUNCE-PUSH (v0.5.1), ratified into
+# contract:message-lanes-v0 §E. The server pushes a small content packet to each
+# CONNECTED subscriber session instead of relying on the plugin to pull the
+# inbox:// window on a payload-less resource-updated. The custom method below +
+# the packet shape in _build_announce_packet ARE the frozen wire contract (§E3);
+# the junto-inbox plugin registers a handler for this exact method.
+ANNOUNCE_METHOD = "notifications/junto/announce"
+
+
+def _announce_mode(category, priority, require_human, is_system_notice, obligation):
+    """Render mode for the announce push, or None when the message must NOT push.
+
+    INJECT (full body inline):  blocker | urgent | require_human | system_notice
+    HEADER (one line, body-on-pull):  any other ACTION-lane OR fyi-lane (info) message
+    None  (badge-only, no push):  ONLY a resolved (cleared) action
+
+    info/fyi now pushes as a metadata-only HEADER (subject+from, body-on-pull) rather
+    than badge-only — directed AND broadcast (push-all-info-v0, Tom 2026-06-24: "info
+    has bitten us too often, push it like action; limit data to subject+from"). The
+    fyi lane keeps its no-obligation, ~48h-TTL semantics — only the PUSH changes, not
+    the lane (push ≠ obligation). A resolved action (lane "cleared") is the one case
+    that must NOT re-push. classify_lane is the single source of truth for the lane
+    (§E1); mode only adds the inject/header split on top.
+    """
+    lane, _tier = classify_lane(category, obligation)
+    if lane == "cleared":
+        return None  # a resolved action must not re-push
+    # action OR fyi → push. Escalate to a full-body inject only for must-read-now
+    # signals; everything else (incl. normal info) is a metadata-only header so the
+    # context cost is one line (subject + from), body pulled on demand.
+    if category == "blocker" or priority == "urgent" or require_human or is_system_notice:
+        return "inject"
+    return "header"
+
+
+def _build_announce_packet(msg_doc, promoted: bool = False):
+    """Build notifications/junto/announce params from a stored message doc, or
+    None when the message is badge-only (must not be pushed).
+
+    Frozen field set (contract:message-lanes-v0 §E3). Body is inlined ONLY for
+    mode=="inject"; header mode is metadata-only (body-on-pull). All values are
+    JSON primitives (created_at → ISO string) so the dict survives raw JSON-RPC
+    serialization on the write stream.
+
+    `promoted` (contract:reply-promotion-v0): when this reply advanced an open
+    action obligation but its OWN mode would be None, promote it to push so the
+    requester isn't left blind. Since push-all-info-v0 (2026-06-24) info pushes as
+    a header natively, so the only mode==None case left is a CLEARED action reply —
+    promotion now triggers rarely, but the safety net is kept. INJECT if the reply
+    is itself urgent/blocker/require_human/system_notice, else HEADER. The reply
+    still carries no NEW obligation — this only changes whether it pushes, not its
+    lane membership (push ≠ new obligation).
+    """
+    is_system_notice = bool(msg_doc.get("is_system_notice", False))
+    category = msg_doc.get("category", "info")
+    priority = msg_doc.get("priority", "normal")
+    require_human = bool(msg_doc.get("require_human", False))
+    mode = _announce_mode(category, priority, require_human, is_system_notice, msg_doc.get("obligation"))
+    if mode is None:
+        if not promoted:
+            return None
+        # Obligation-closing reply whose own category doesn't push → promote it.
+        mode = "inject" if (
+            category == "blocker" or priority == "urgent" or require_human or is_system_notice
+        ) else "header"
+    created_at = msg_doc.get("created_at")
+    packet = {
+        "mode": mode,
+        "from_agent": msg_doc.get("from_instance"),
+        "from_project": msg_doc.get("from_project"),
+        "category": msg_doc.get("category"),
+        "priority": msg_doc.get("priority"),
+        "msg_id": msg_doc.get("_id"),
+        "chain_depth": msg_doc.get("chain_depth"),
+        "in_response_to": msg_doc.get("in_response_to"),
+        "obligation_state": msg_doc.get("obligation"),
+        # SUBJECT is the primary triage line for a header push (info now pushes as
+        # header → subject+from is all the recipient sees until they pull the body).
+        "subject": msg_doc.get("subject"),
+        "require_human": bool(msg_doc.get("require_human", False)),
+        "is_system_notice": is_system_notice,
+        "created_at": created_at.isoformat() if hasattr(created_at, "isoformat") else created_at,
+    }
+    if mode == "inject":
+        packet["body"] = msg_doc.get("message")
+    return packet
+
+
+async def _content_push(session: Any, packet: Dict[str, Any]) -> None:
+    """Send one notifications/junto/announce content-push to a subscribed session.
+
+    A custom JSON-RPC method is NOT in the typed ServerNotification union, so
+    ServerSession.send_notification() would reject it. We build a raw
+    JSONRPCNotification and write it to the session's stream via the low-level
+    send_message escape hatch (mcp/server/session.py). SDK-coupling caveat:
+    send_message is documented 'low-level experimental' — see
+    learning_5dcf4824df37700f; the mcp SDK version is pinned. Raises on transport
+    failure so the caller prunes the dead session.
+    """
+    notif = JSONRPCNotification(jsonrpc="2.0", method=ANNOUNCE_METHOD, params=packet)
+    await session.send_message(SessionMessage(message=JSONRPCMessage(notif)))
+
+
+# ── SSE notification-stream keepalive ──────────────────────────────────────
+# A periodic no-op notification down each subscribed session's long-lived SSE
+# GET stream. PRIMARY purpose: keep the stream warm so an idle-connection reaper
+# on the path never silently drops it (the half-open-stream failure where the
+# server keeps "delivering" into a dead socket while the client's separate-socket
+# heartbeat keeps the session looking alive). SECONDARY: a genuinely dead socket
+# eventually blocks the write → the per-send timeout fires → we prune the
+# session. The plugin has no handler for this method, so it's ignored client-side
+# (same "unknown method degrades to quiet" property as the announce push).
+KEEPALIVE_METHOD = "notifications/junto/keepalive"
+_keepalive_task = None
+
+
+async def _send_keepalive(session: Any) -> None:
+    """Write one keepalive notification to a session's stream. Raises on transport
+    failure (and is cancellable by the wait_for timeout) so the caller prunes."""
+    notif = JSONRPCNotification(jsonrpc="2.0", method=KEEPALIVE_METHOD, params={})
+    await session.send_message(SessionMessage(message=JSONRPCMessage(notif)))
+
+
+async def _keepalive_one(uri_str: str, session: Any) -> None:
+    """Send a keepalive to one session under a per-send timeout; prune on failure.
+
+    The timeout is load-bearing: a half-open socket's write can BLOCK (the SDK's
+    notification stream is a zero-buffer memory stream, so send() waits for the
+    SSE writer to drain). Without the timeout one stuck session would wedge the
+    whole sweep. A timeout or transport error both mean "unusable" → drop it."""
+    try:
+        await asyncio.wait_for(_send_keepalive(session), timeout=SSE_KEEPALIVE_SEND_TIMEOUT)
+    except Exception as e:
+        log.debug("sse-keepalive: prune subscriber for %s: %s", uri_str, e)
+        bucket = inbox_subscriptions.get(uri_str)
+        if bucket is not None:
+            bucket.discard(session)
+            if not bucket:
+                inbox_subscriptions.pop(uri_str, None)
+
+
+async def _keepalive_sweep() -> None:
+    """One pass: keepalive every subscribed session concurrently (snapshot first
+    so prunes don't mutate what we're iterating). Concurrency means one slow/stuck
+    session can't serialize-block the others."""
+    tasks = [
+        _keepalive_one(uri_str, session)
+        for uri_str in list(inbox_subscriptions.keys())
+        for session in list(inbox_subscriptions.get(uri_str, ()))
+    ]
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def _keepalive_loop() -> None:
+    log.info("sse-keepalive: started (interval=%ss, send_timeout=%ss)",
+             SSE_KEEPALIVE_SECONDS, SSE_KEEPALIVE_SEND_TIMEOUT)
+    while True:
+        try:
+            await asyncio.sleep(SSE_KEEPALIVE_SECONDS)
+            await _keepalive_sweep()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # never let the loop die
+            log.error("sse-keepalive: loop error: %s", e)
+
+
+def start_keepalive() -> None:
+    """Start the SSE keepalive background task. Idempotent if already running."""
+    global _keepalive_task
+    if _keepalive_task is not None and not _keepalive_task.done():
+        return
+    _keepalive_task = asyncio.create_task(_keepalive_loop(), name="sse_keepalive")
+    log.info("sse-keepalive: background task created")
+
+
+def stop_keepalive() -> None:
+    """Cancel the keepalive task on shutdown."""
+    global _keepalive_task
+    if _keepalive_task is not None and not _keepalive_task.done():
+        _keepalive_task.cancel()
+    _keepalive_task = None
+
+
+async def _notify_inbox_for_send(
+    to_project: str, to_instance: str, packet: Dict[str, Any] = None
+) -> None:
+    """Dispatch inbox notifications after memory_send_message.
 
     Direct messages → notify the named agent's inbox URI.
     Broadcasts (to_instance='*') → notify every subscribed inbox URI in the
     target project, since each subscriber will see the broadcast in their
     own get_messages/inbox view.
+
+    `packet` (server-authoritative delivery §E): when provided AND the message is
+    push-eligible, each session gets a content-push in ADDITION to the
+    resource-updated. None (wake-all / sync / scheduler / cleared-action paths) =
+    resource-updated only. Since push-all-info-v0 (2026-06-24) info pushes as a
+    header, so broadcasts (info-lane by convention, §B) now DO carry a packet and
+    content-push to every subscriber in the target project — project-scoped, never
+    cross-project (the prefix below pins it to to_project).
     """
     if not to_project:
         return
@@ -1239,14 +2161,21 @@ async def _notify_inbox_for_send(to_project: str, to_instance: str) -> None:
             if p and a and a != "*":
                 targets.append((p, a))
         for project, agent in targets:
-            await _notify_inbox(project, agent)
+            await _notify_inbox(project, agent, packet)
         return
-    await _notify_inbox(to_project, to_instance)
+    await _notify_inbox(to_project, to_instance, packet)
 
 
-async def _notify_inbox(project: str, agent: str) -> None:
-    """Fire notifications/resources/updated to every session subscribed to
-    inbox://<project>/<agent>. Drops sessions whose send fails (dead transport).
+async def _notify_inbox(project: str, agent: str, packet: Dict[str, Any] = None) -> None:
+    """Notify every session subscribed to inbox://<project>/<agent>.
+
+    Always fires notifications/resources/updated (the pre-cutover plugin pulls the
+    inbox:// window on it). When `packet` is provided, ADDITIONALLY content-pushes
+    the announce packet (server-authoritative delivery §E2) — a post-cutover
+    plugin acts on this and ignores the resource-updated; a pre-cutover plugin
+    ignores the unknown announce method. Keeping BOTH during the transition means
+    a server-ahead-of-plugin (or plugin-ahead-of-server) state degrades to quiet,
+    never a flood (§E7). Drops sessions whose send fails (dead transport).
     Best-effort: a failure here must not break message insert.
     """
     if not project or not agent:
@@ -1266,6 +2195,8 @@ async def _notify_inbox(project: str, agent: str) -> None:
     for session in sessions:
         try:
             await session.send_resource_updated(url)
+            if packet is not None:
+                await _content_push(session, packet)
         except Exception as e:  # session closed / write end gone
             log.debug("inbox: drop dead subscriber for %s: %s", uri_str, e)
             dead.append(session)

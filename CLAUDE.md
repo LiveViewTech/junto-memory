@@ -103,6 +103,7 @@ Run in parallel where possible. STOP at step 6; do not execute the plan until us
    - `memory_get_messages(include_delivered=true)` — see acked threads too; cross-project notes are common
    - `memory_list_backlog(project="junto", assigned_to="memory", status="open", priority="high")`
    - `memory_get_active_work(project="junto")` — agent activity, locks, signals
+   - `memory_list_alerts(unacknowledged_only=True)` — limit-watch: budget_warn / push_budget_breach / hard_ceiling alerts (design:limit-watch-v0). Surface any unacked alert to Tom in section C — this is how he learns limits are being approached and decides whether to extend them.
 3. Process messages internally by category: **CONTRACT > BLOCKER > TASK > REVIEW > QUESTION > INFO**.
 4. Present briefing in this order. State spec leads — quote near-verbatim, do NOT paraphrase.
 
@@ -207,7 +208,7 @@ Exceptions:
 - **Reply with `in_response_to=<their msg_id>`** for thread continuity (chain_depth tracking).
 - **Don't echo "received, working on it"** for the sake of it. Silence is fine. Respond when you have an answer.
 
-User-tier messages (sender role=user) bypass chain_depth gating server-side via the human-sender rule. Phase D2 also bypasses the cap when either endpoint has a recent (<5min) human interaction (sent_by_human delivery to recipient OR human_interacted=True send from sender) — see `architecture:junto-memory-v1`.
+User-tier messages (sender role=user) are forced to `chain_depth=0` server-side, so they never reach the cap (human-sender rule). NOTE: the legacy **Phase-D2 recency-bypass of the depth cap was removed in push-control-v0** — the depth cap (12) is now **unconditional**; a recent (<5min) human interaction does NOT waive it. That window instead releases read-side push-suppression only (`messaging.py:671-678`). See `architecture:junto-memory-v1`.
 
 ---
 

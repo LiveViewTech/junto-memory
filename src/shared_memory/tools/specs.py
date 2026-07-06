@@ -1,6 +1,7 @@
 """Spec management tools - versioned specifications with owner enforcement."""
 
 import json
+import re
 from typing import List
 
 from mcp.server.fastmcp import Context
@@ -84,6 +85,25 @@ async def memory_define_spec(
         return json.dumps({
             "error": f"Content exceeds maximum size of {MAX_CONTENT_SIZE // 1024}KB",
             "size": f"{len(content.encode('utf-8')) // 1024}KB"
+        })
+
+    # Reject a malformed payload where a tool-call serialization leaked into the
+    # content body. Observed 2026-04-22: a write landed with content ending
+    # `</content><parameter name="spec_type">agent_state</parameter>...</invoke>`,
+    # which swallowed the real spec_type arg (defaulting it to "interface") and
+    # left a permanent ghost doc. Narrow signature so legitimate content that
+    # merely discusses XML isn't rejected.
+    if re.search(r"</content>\s*<\s*parameter\s+name\s*=", content) or \
+            content.rstrip().endswith("</invoke>"):
+        return json.dumps({
+            "error": "Malformed content: tool-call serialization leaked into the spec body",
+            "spec_name": name,
+            "suggestion": (
+                "Your content ends with tool-call XML (</content> / <parameter> / "
+                "</invoke>), which means the call was truncated or mis-serialized "
+                "before the real arguments were parsed. Re-send with the actual "
+                "spec content only."
+            ),
         })
 
     chroma = await get_chroma()
@@ -345,22 +365,58 @@ async def memory_get_spec(
     # Normalize spec name for doc_id
     spec_doc_id = f"spec_{name.replace(':', '_').replace('/', '_')}"
 
-    # Determine collection
+    # Resolve which collection(s) to read. A spec doc lives in exactly ONE
+    # collection: proj_<project> when written with project=..., else
+    # shared_patterns. get_spec historically read ONLY the collection named by
+    # the `project` ARG, so a project-scoped spec (every state: spec) was
+    # invisible when the caller omitted project, and a stale/orphaned doc at the
+    # shared id could shadow it (the 2026-06-14 frames-team ghost). Fix: when
+    # project is omitted, try the CALLER'S OWN project first (where its state
+    # specs live), then fall back to shared. An explicit project is honored
+    # exactly as before.
     if project:
-        collection = await get_project_collection(chroma, project)
+        collections_to_try = [await get_project_collection(chroma, project)]
     else:
-        collection = await get_shared_collection(chroma, "patterns")
+        collections_to_try = []
+        sess_proj = normalize_project(active_sessions[session_id].get("project", ""))
+        if sess_proj:
+            collections_to_try.append(await get_project_collection(chroma, sess_proj))
+        collections_to_try.append(await get_shared_collection(chroma, "patterns"))
+
+    # Collect ACTIVE matches across the candidate collections, then pick the
+    # most-recently-updated one. Two reasons:
+    #  - Skip non-active docs (archived / orphaned ghosts sitting at a live id)
+    #    so get_spec agrees with list_specs / standup (which filter active).
+    #  - A spec can wrongly exist in BOTH shared and a project collection
+    #    (historic divergence: some specs were written without project, then
+    #    later with it). Picking the newest active copy self-heals: a state
+    #    spec's live project copy beats a stale shared duplicate, while a
+    #    genuinely-shared spec whose shared copy is ahead is NOT regressed to an
+    #    older project shadow. (max() is stable → ties keep candidate order,
+    #    i.e. the caller's own project first.)
+    candidates = []
+    for collection in collections_to_try:
+        try:
+            result = await collection.get(ids=[spec_doc_id], include=["documents", "metadatas"])
+        except Exception as e:
+            return json.dumps({"error": f"Failed to retrieve spec: {str(e)}"})
+        if not result["ids"]:
+            continue
+        meta = result["metadatas"][0]
+        status = meta.get("status")
+        if status and status != "active":
+            continue  # archived / orphaned ghost — not the current spec
+        candidates.append({"meta": meta, "content": result["documents"][0]})
+    current_doc = max(
+        candidates, key=lambda d: d["meta"].get("updated") or "", default=None
+    ) if candidates else None
 
     if version:
-        # Get specific version from history
+        # 1) Try the historical version in the shared history collection.
         history_collection = await get_shared_collection(chroma, "context")
         history_id = f"spec_history_{name.replace(':', '_')}_{version.replace('.', '_')}"
-
         try:
-            result = await history_collection.get(
-                ids=[history_id],
-                include=["documents", "metadatas"]
-            )
+            result = await history_collection.get(ids=[history_id], include=["documents", "metadatas"])
             if result["ids"]:
                 meta = result["metadatas"][0]
                 return json.dumps({
@@ -373,35 +429,32 @@ async def memory_get_spec(
                 }, indent=2)
         except Exception:
             pass
+        # 2) The CURRENT version is never archived to history (only superseded
+        # versions are), so an explicit request for the current label would 404.
+        # Fall through to the live doc when the requested version IS current;
+        # otherwise it genuinely isn't available.
+        if not (current_doc and current_doc["meta"].get("spec_version") == version):
+            return json.dumps({
+                "error": f"Version {version} not found for spec '{name}'",
+                "suggestion": "Use memory_list_specs to see available versions"
+            })
 
-        return json.dumps({
-            "error": f"Version {version} not found for spec '{name}'",
-            "suggestion": "Use memory_list_specs to see available versions"
-        })
-
-    # Get current version
-    try:
-        result = await collection.get(
-            ids=[spec_doc_id],
-            include=["documents", "metadatas"]
-        )
-        if result["ids"]:
-            meta = result["metadatas"][0]
-            response = {
-                "spec_name": name,
-                "version": meta.get("spec_version"),
-                "owner": meta.get("spec_owner"),
-                "spec_type": meta.get("spec_type"),
-                "content": result["documents"][0],
-                "created": meta.get("created"),
-                "updated": meta.get("updated"),
-                "tags": json.loads(meta.get("tags", "[]"))
-            }
-            if meta.get("json_schema"):
-                response["json_schema"] = json.loads(meta["json_schema"])
-            return json.dumps(response, indent=2)
-    except Exception as e:
-        return json.dumps({"error": f"Failed to retrieve spec: {str(e)}"})
+    # Current version (or current-as-requested-version).
+    if current_doc:
+        meta = current_doc["meta"]
+        response = {
+            "spec_name": name,
+            "version": meta.get("spec_version"),
+            "owner": meta.get("spec_owner"),
+            "spec_type": meta.get("spec_type"),
+            "content": current_doc["content"],
+            "created": meta.get("created"),
+            "updated": meta.get("updated"),
+            "tags": json.loads(meta.get("tags", "[]"))
+        }
+        if meta.get("json_schema"):
+            response["json_schema"] = json.loads(meta["json_schema"])
+        return json.dumps(response, indent=2)
 
     return json.dumps({
         "error": f"Spec '{name}' not found",
@@ -476,19 +529,24 @@ async def memory_list_specs(
     # Get version history if requested
     if include_versions:
         history_collection = await get_shared_collection(chroma, "context")
+        # Build a spec_name -> [archived versions] index in ONE pass. The old
+        # per-spec where={spec_name, status} multi-key filter was UNRELIABLE in
+        # ChromaDB (same reason the main query above filters in Python) — it
+        # silently returned nothing, so every spec reported all_versions=[current]
+        # even though the history is fully intact. That false "no history" is
+        # what made a clobbered state spec look unrecoverable.
+        hist_by_name = {}
+        try:
+            all_hist = await history_collection.get(include=["metadatas"])
+            for m in all_hist.get("metadatas", []) or []:
+                if m and m.get("status") == "archived" and m.get("spec_name"):
+                    hist_by_name.setdefault(m["spec_name"], []).append(m.get("spec_version"))
+        except Exception:
+            hist_by_name = {}
         for spec in specs:
-            try:
-                # Query for history entries matching this spec
-                history_results = await history_collection.get(
-                    where={"spec_name": spec["name"], "status": "archived"},
-                    include=["metadatas"]
-                )
-                if history_results["ids"]:
-                    versions = [meta.get("spec_version") for meta in history_results["metadatas"]]
-                    versions.append(spec["version"])  # Add current
-                    spec["all_versions"] = sorted(set(versions), reverse=True)
-            except Exception:
-                spec["all_versions"] = [spec["version"]]
+            versions = list(hist_by_name.get(spec["name"], []))
+            versions.append(spec["version"])  # include current
+            spec["all_versions"] = sorted({v for v in versions if v}, reverse=True)
 
     return json.dumps({
         "specs": specs,

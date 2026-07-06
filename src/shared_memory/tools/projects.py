@@ -2,7 +2,7 @@
 
 import json
 from datetime import datetime
-from typing import List
+from typing import List, Optional
 
 from mcp.server.fastmcp import Context
 
@@ -61,6 +61,80 @@ def _fuzzy_match_agent(db, project_name: str, target_name: str, limit: int = 3) 
 
     suggestions.sort()
     return [name for _, name in suggestions[:limit]]
+
+
+def resolve_agent_name(db, project_name: str, target_name: str) -> Optional[str]:
+    """Resolve a recipient name to a canonical registered-agent name.
+
+    Returns the canonical `name` if `target_name` is either:
+      1. a live registered_agents.name in the project (returned as-is), or
+      2. listed in some agent's `aliases` array in the project (returns that
+         agent's canonical name, e.g. "coordinator" -> "emailTriage").
+    Returns None if neither — i.e. a genuinely unknown recipient, which the
+    send-path treats as fail-loud. Broadcast ("*") is handled by the caller
+    and must never be passed here.
+    """
+    if db is None or not target_name:
+        return None
+    direct = db.registered_agents.find_one(
+        {"project": project_name, "name": target_name}, {"name": 1}
+    )
+    if direct:
+        return direct["name"]
+    aliased = db.registered_agents.find_one(
+        {"project": project_name, "aliases": target_name}, {"name": 1}
+    )
+    if aliased:
+        return aliased["name"]
+    return None
+
+
+def persist_agent_aliases(db, project_name: str, agent_name: str,
+                          aliases: List[str]) -> dict:
+    """Set the `aliases` list on (project, agent_name)'s registered_agents doc.
+
+    Enforces per-project uniqueness: an alias is REJECTED if it collides with
+    any other agent's canonical name or with another agent's existing alias in
+    the same project — an alias must never shadow a live agent or another
+    alias (otherwise send-resolution would be ambiguous). A self-referential
+    alias (alias == own name) is silently dropped.
+
+    Returns {"accepted": [...], "rejected": {alias: reason}}. Updates an
+    EXISTING registered_agents doc only (upsert=False); if the agent has no
+    such doc, nothing is written and every alias lands in `rejected`.
+    """
+    accepted: List[str] = []
+    rejected: dict = {}
+    seen = set()
+    for raw in (aliases or []):
+        alias = (raw or "").strip()
+        if not alias or alias in seen:
+            continue
+        seen.add(alias)
+        if alias == agent_name:
+            continue  # no self-alias needed
+        if db.registered_agents.find_one(
+            {"project": project_name, "name": alias}, {"_id": 1}
+        ):
+            rejected[alias] = f"collides with live agent '{alias}'"
+            continue
+        other = db.registered_agents.find_one(
+            {"project": project_name, "aliases": alias,
+             "name": {"$ne": agent_name}}, {"name": 1}
+        )
+        if other:
+            rejected[alias] = f"already an alias of '{other['name']}'"
+            continue
+        accepted.append(alias)
+    result = db.registered_agents.update_one(
+        {"project": project_name, "name": agent_name},
+        {"$set": {"aliases": accepted}},
+    )
+    if result.matched_count == 0:
+        for alias in accepted:
+            rejected[alias] = "agent not registered — no doc to update"
+        accepted = []
+    return {"accepted": accepted, "rejected": rejected}
 
 
 @mcp.tool()

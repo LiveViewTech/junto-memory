@@ -39,8 +39,11 @@ CLAUDE_MODEL = "claude-3-5-haiku-20241022"  # Fast, cheap, good at code
 # MCP Server
 MCP_SERVER_URL = os.getenv("MCP_SERVER_URL", "http://localhost:8080")
 
-# Librarian webhook server
-LIBRARIAN_HOST = os.getenv("LIBRARIAN_HOST", "0.0.0.0")
+# Librarian webhook server.
+# Loopback by default (design:auth-origin-trust-v0). The enrichment webhook is
+# triggered locally; binding 0.0.0.0 exposed it on the tailnet/OVH-wg. Override
+# LIBRARIAN_HOST only if a remote trigger source is genuinely required.
+LIBRARIAN_HOST = os.getenv("LIBRARIAN_HOST", "127.0.0.1")
 LIBRARIAN_PORT = int(os.getenv("LIBRARIAN_PORT", "8085"))
 
 # Project root paths for file resolution

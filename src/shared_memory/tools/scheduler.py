@@ -304,7 +304,7 @@ async def _materialize_one(db, sched_doc: dict) -> Optional[str]:
     and gets retried on the next tick).
     """
     # Local import: avoid module-load cycles via tools/__init__.py.
-    from shared_memory.tools.messaging import _notify_inbox_for_send
+    from shared_memory.tools.messaging import _build_announce_packet, _notify_inbox_for_send
 
     agent = sched_doc["agent_instance"]
     project = sched_doc["agent_project"]
@@ -352,7 +352,9 @@ async def _materialize_one(db, sched_doc: dict) -> Optional[str]:
         return None
 
     try:
-        await _notify_inbox_for_send(project, agent)
+        # Server-authoritative delivery §E: content-push the announce (None for
+        # badge-only/info) so a scheduled action message wakes the recipient too.
+        await _notify_inbox_for_send(project, agent, _build_announce_packet(msg_doc))
     except Exception as e:
         # Push failure is non-fatal — message is in the inbox for pull-side delivery.
         log.warning("scheduler: inbox notify failed for sched_id=%s: %s", sched_doc["_id"], e)

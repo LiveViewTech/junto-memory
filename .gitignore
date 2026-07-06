@@ -55,3 +55,8 @@ mongo-data/
 # Temp scripts
 readmeInserts.md
 temp/
+
+# Launcher-written identity files (per-host, not source)
+.agent-name
+.agent-name.bak
+.project-name
