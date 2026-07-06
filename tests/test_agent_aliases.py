@@ -48,8 +48,13 @@ class _FakeRegisteredAgents:
         for d in self.docs:
             if _matches(d, filt):
                 d.update(update["$set"])
-                return
-        # upsert=False semantics: no matching doc -> no write
+                return _UpdateResult(matched=1)
+        return _UpdateResult(matched=0)
+
+
+class _UpdateResult:
+    def __init__(self, matched):
+        self.matched_count = matched
 
 
 class _FakeDB:
