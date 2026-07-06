@@ -126,10 +126,14 @@ def persist_agent_aliases(db, project_name: str, agent_name: str,
             rejected[alias] = f"already an alias of '{other['name']}'"
             continue
         accepted.append(alias)
-    db.registered_agents.update_one(
+    result = db.registered_agents.update_one(
         {"project": project_name, "name": agent_name},
         {"$set": {"aliases": accepted}},
     )
+    if result.matched_count == 0:
+        for alias in accepted:
+            rejected[alias] = "agent not registered — no doc to update"
+        accepted = []
     return {"accepted": accepted, "rejected": rejected}
 
 

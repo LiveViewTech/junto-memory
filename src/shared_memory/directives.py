@@ -148,7 +148,7 @@ def get_pending_directives(db, project: str, claude_instance: str) -> list:
     try:
         if db is None:
             return []
-        from shared_memory.helpers import parse_timestamp, utc_now
+        from shared_memory.helpers import normalize_project, parse_timestamp, utc_now
 
         now = utc_now()
         out = []
@@ -160,7 +160,8 @@ def get_pending_directives(db, project: str, claude_instance: str) -> list:
                     continue
             if not _directive_targets(d.get("target"), project, claude_instance):
                 continue
-            ack_id = f"{d['key']}:{project or ''}:{claude_instance or ''}"
+            norm_project = normalize_project(project) if project else ""
+            ack_id = f"{d['key']}:{norm_project}:{claude_instance or ''}"
             if db.directive_acks.find_one({"_id": ack_id}):
                 continue
             out.append({

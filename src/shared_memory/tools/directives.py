@@ -47,7 +47,8 @@ async def memory_ack_directive(
         return json.dumps({"error": f"No active directive with key '{key}'"})
 
     session_info = active_sessions[session_id]
-    project = session_info.get("project") or ""
+    from shared_memory.helpers import normalize_project
+    project = normalize_project(session_info.get("project") or "") or ""
     agent = session_info.get("claude_instance") or ""
 
     if not _directive_targets(directive.get("target"), project, agent):

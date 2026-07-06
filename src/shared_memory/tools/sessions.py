@@ -400,9 +400,14 @@ async def memory_start_session(
             # list clears the subscription (so an agent that moves off a
             # component drops out of its peer list). None = don't touch.
             if subscribed_components is not None:
-                update_fields["subscribed_components"] = [
-                    c for c in subscribed_components if c
-                ]
+                seen_comps: set = set()
+                clean_comps = []
+                for c in subscribed_components:
+                    s = (c or "").strip()
+                    if s and s not in seen_comps:
+                        seen_comps.add(s)
+                        clean_comps.append(s)
+                update_fields["subscribed_components"] = clean_comps
 
             insert_defaults = {"first_seen": utc_now()}
             if not role_description:
