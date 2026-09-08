@@ -243,7 +243,8 @@ async def main() -> int:
         subprocess.run(
             [
                 "docker", "exec", "mcp-mongodb",
-                "mongosh", "-u", "mcp_orch", "-p", "McpOrch2026!",
+                "mongosh", "-u", "mcp_orch", "-p",
+                os.environ.get("MONGO_PASSWORD", "changeme"),
                 "--authenticationDatabase", "admin", "mcp_orchestrator",
                 "--quiet", "--eval",
                 f"db.messages.deleteMany({{_id:{{$in:{ids_js}}}}})",
