@@ -92,7 +92,7 @@ async def main() -> int:
 
     # 2. invalid key hard-rejected
     async with open_mcp() as s:
-        out = await start(s, "smoke-badauth", api_key="smk_bogus_garbage")
+        out = await start(s, "smoke-badauth", api_key="not-a-real-key-test-fixture")
         ok = "error" in out and "Invalid" in out.get("error", "")
         results.append(("soft_auth_invalid_key", ok, out.get("error", "unexpected ok")[:80]))
 
