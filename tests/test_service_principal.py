@@ -197,3 +197,52 @@ async def test_other_claudes_briefing_excludes_principals(_wired, _auth_on):
     others = resp.get("other_claudes", [])
     assert any(o.startswith("regular@") for o in others)
     assert not any(o.startswith("sub-w1@") for o in others)
+
+
+async def test_other_claudes_one_line_per_identity(_wired, _auth_on):
+    # An agent's own session + its inbox plugin's session = one agent.
+    await _start(claude_instance="twin", api_key="smk_valid",
+                 task_description="junto-inbox channel plugin")
+    await _start(claude_instance="twin", api_key="smk_valid",
+                 task_description="fixing billing")
+    resp = await _start(claude_instance="observer", api_key="smk_valid")
+    twins = [o for o in resp.get("other_claudes", []) if o.startswith("twin@")]
+    assert len(twins) == 1
+    assert twins[0].endswith(": fixing billing")
+
+
+async def test_other_claudes_hides_plugin_boilerplate_and_own_identity(_wired, _auth_on):
+    await _start(claude_instance="quiet", api_key="smk_valid",
+                 task_description="junto-inbox channel plugin")
+    await _start(claude_instance="observer", api_key="smk_valid",
+                 task_description="junto-inbox channel plugin")
+    resp = await _start(claude_instance="observer", api_key="smk_valid")
+    others = resp.get("other_claudes", [])
+    assert any(o.startswith("quiet@") and ":" not in o for o in others)
+    assert not any(o.startswith("observer@") for o in others)
+
+
+def test_session_title_falls_back_to_summary_for_boilerplate():
+    from shared_memory.tools.sessions import session_title
+    assert session_title("junto-inbox channel plugin", "## Shipped X\nmore", 50) == "Shipped X"
+    assert session_title("real task", "summary", 50) == "real task"
+    assert session_title("", "", 50) == ""
+
+
+async def test_guidelines_held_returns_stub_when_hash_matches(_wired, _auth_on, monkeypatch):
+    from shared_memory.tools import guidelines as g_mod
+    monkeypatch.setattr(g_mod, "get_guidelines_for_session",
+                        lambda project: [{"rule": "R1"}, {"rule": "R2"}])
+    monkeypatch.setattr(g_mod, "get_guidelines_version", lambda db=None: 2)
+    full = await _start(claude_instance="g", api_key="smk_valid")
+    block = full["guidelines"]
+    assert block["rules"] == ["R1", "R2"] and len(block["hash"]) == 16
+
+    again = await _start(claude_instance="g", api_key="smk_valid",
+                         guidelines_held=block["hash"])
+    assert again["guidelines"]["unchanged"] is True
+    assert "rules" not in again["guidelines"]
+
+    stale = await _start(claude_instance="g", api_key="smk_valid",
+                         guidelines_held="0000000000000000")
+    assert stale["guidelines"]["rules"] == ["R1", "R2"]

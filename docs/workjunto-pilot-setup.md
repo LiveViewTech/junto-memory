@@ -1,3 +1,8 @@
+> **⚠️ Historical (May 2026).** This describes the planned AWS primary + per-laptop
+> Hyper-V peer pilot. The work deployment actually runs as a single standalone server,
+> spg-junto-central (Tailscale-only, keyed). For upgrading that server, follow the junto
+> spec `runbook:workbox-deploy-v0` (v2.x), plus CHANGELOG 1.40.0 "Upgrading from an older build".
+
 # workJunto pilot setup — step-by-step
 
 Purpose: walk operators (initially workClaude on the LVT corp side,

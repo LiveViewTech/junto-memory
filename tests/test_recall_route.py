@@ -221,12 +221,38 @@ def test_stale_handoffs_filtered_fresh_kept(stub, monkeypatch):
         ("handoff_undated", _meta(type="handoff", title="undated", updated="", created=""), 0.4, "u"),
         ("learning_old_fine", _meta(title="old learning ok", updated=stale), 0.4, "l"),
     ]
-    _, payload = _run(m._recall_payload({"project": "junto", "query": "x"}, None))
+    # Requester authored these handoffs (foreign digests are a separate gate).
+    _, payload = _run(m._recall_payload({"project": "junto", "query": "x", "agent": "memory"}, None))
     got = [s["id"] for s in payload["snippets"]]
     assert "handoff_fresh" in got
     assert "handoff_stale" not in got
     assert "handoff_undated" not in got
     assert "learning_old_fine" in got  # age-gate is handoff-only
+
+
+# --- foreign session digests (nimbus survey msg_171e9f2de967) -----------------
+def test_foreign_digests_excluded_own_kept(stub):
+    from datetime import timedelta
+    import shared_memory.helpers as h
+    recent = (h.utc_now() - timedelta(days=3)).isoformat()
+    stub["proj"].rows = [
+        ("handoff_other", _meta(type="handoff", claude_instance="pipeline", updated=recent), 0.3, "o"),
+        ("handoff_own", _meta(type="handoff", claude_instance="coord", updated=recent), 0.3, "w"),
+        ("learning_parksum", _meta(claude_instance="pipeline", updated=recent,
+                                   tags='["park-summary", "pipeline"]'), 0.3, "p"),
+        ("learning_real", _meta(claude_instance="pipeline", updated=recent,
+                                tags='["gotcha"]'), 0.3, "r"),
+    ]
+    _, payload = _run(m._recall_payload({"project": "junto", "query": "x", "agent": "coord"}, None))
+    got = [s["id"] for s in payload["snippets"]]
+    assert "handoff_other" not in got
+    assert "learning_parksum" not in got
+    assert "handoff_own" in got
+    assert "learning_real" in got
+    # Unidentified requester: every digest is foreign.
+    _, payload2 = _run(m._recall_payload({"project": "junto", "query": "x"}, None))
+    got2 = [s["id"] for s in payload2["snippets"]]
+    assert "handoff_own" not in got2 and "learning_real" in got2
 
 
 # --- type-aware exclusions (nimbus first-day read, msg_53e467692779) ----------
@@ -266,10 +292,18 @@ def test_recall_event_logged_on_hits_only(stub, monkeypatch):
     import shared_memory.recall_metrics as rm
     logged = []
     monkeypatch.setattr(rm, "log_recall_event",
-                        lambda db, project, agent, ids, floor: logged.append((project, agent, ids)))
+                        lambda db, project, agent, ids, floor, scores=None, **kw: logged.append((project, agent, ids, scores)))
     _run(m._recall_payload({"project": "junto", "query": "x", "agent": "coord"}, None))
     assert logged and logged[0][1] == "coord" and logged[0][2] == ["learning_aaaaaaaaaaaaaaaa"]
+    assert logged[0][3] and len(logged[0][3]) == 1  # scores parallel to ids
     logged.clear()
     stub["proj"].rows = []
     _run(m._recall_payload({"project": "junto", "query": "x"}, None))
     assert not logged  # count=0 -> no event row
+
+
+def test_age_days_on_snippets(stub):
+    _, payload = _run(m._recall_payload({"project": "junto", "query": "x"}, None))
+    assert payload["snippets"] and all("age_days" in s for s in payload["snippets"])
+    assert m._recall_age_days("") is None
+    assert isinstance(m._recall_age_days("2026-01-01T00:00:00+00:00"), int)

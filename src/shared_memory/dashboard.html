@@ -124,6 +124,10 @@
   .task { color: var(--text); font-size: 12px; max-width: 400px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   footer { text-align: center; color: var(--muted); padding: 20px; font-size: 12px; }
   code { background: var(--bg); padding: 1px 4px; border-radius: 3px; font-size: 12px; }
+  .keybox { display: inline-flex; gap: 6px; margin-right: 12px; align-items: center; }
+  .keybox input { background: var(--bg); color: inherit; border: 1px solid var(--border); border-radius: 4px; padding: 3px 6px; font-size: 12px; width: 170px; }
+  .keybox button { background: none; color: var(--accent); border: 1px solid var(--border); border-radius: 4px; padding: 3px 8px; font-size: 12px; cursor: pointer; }
+  .hidden { display: none; }
 </style>
 </head>
 <body>
@@ -132,6 +136,12 @@
   <h1>Shared Memory — Activity Dashboard</h1>
   <div>
     <span id="health-pill" class="status-pill healthy">healthy</span>
+    <span class="keybox">
+      <input id="key" type="password" placeholder="API key (if required)" autocomplete="off">
+      <button id="login">Use key</button>
+      <button id="logout" class="hidden">Forget key</button>
+    </span>
+    <a href="/admin" style="color: var(--accent); margin-right: 12px;">Junto Admin (settings) →</a>
     <span class="last-refresh">Last refresh: <span id="last-refresh">—</span></span>
   </div>
 </header>
@@ -180,15 +190,44 @@ function escapeHtml(s) {
     .replace(/"/g, '&quot;');
 }
 
+// API key lives only in this tab's sessionStorage (shared with /admin, same
+// origin); storage may be unavailable.
+let KEY = null;
+try { KEY = sessionStorage.getItem('junto_admin_key'); } catch (e) {}
+
+function showKeyState() {
+  document.getElementById('logout').classList.toggle('hidden', !KEY);
+}
+
 async function fetchJson(url) {
   try {
-    const res = await fetch(url);
+    const headers = {};
+    if (KEY) headers['Authorization'] = 'Bearer ' + KEY;
+    const res = await fetch(url, { headers });
+    if (res.status === 401 || res.status === 403) {
+      let detail = '';
+      try { detail = (await res.json()).error || ''; } catch (e) {}
+      throw new Error('This server requires an unscoped API key' + (detail ? ' (' + detail + ')' : '') + '. Enter one above.');
+    }
     if (!res.ok) throw new Error('HTTP ' + res.status);
     return await res.json();
   } catch (e) {
     return { error: e.message };
   }
 }
+
+document.getElementById('login').onclick = () => {
+  KEY = document.getElementById('key').value.trim() || null;
+  document.getElementById('key').value = '';
+  try { KEY ? sessionStorage.setItem('junto_admin_key', KEY) : sessionStorage.removeItem('junto_admin_key'); } catch (e) {}
+  showKeyState(); refresh();
+};
+document.getElementById('logout').onclick = () => {
+  KEY = null;
+  try { sessionStorage.removeItem('junto_admin_key'); } catch (e) {}
+  showKeyState(); refresh();
+};
+showKeyState();
 
 function renderSessions(data) {
   const el = document.getElementById('sessions-body');

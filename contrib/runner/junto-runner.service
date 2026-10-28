@@ -1,0 +1,20 @@
+# systemd USER unit for the delegated-inference runner (interface:delegated-inference-v0 §7).
+# Install:  cp contrib/runner/junto-runner.py ~/.local/bin/ && chmod 755 ~/.local/bin/junto-runner.py
+#           cp contrib/runner/junto-runner.service ~/.config/systemd/user/
+#           systemctl --user daemon-reload && systemctl --user enable --now junto-runner
+#           loginctl enable-linger $USER   # keep running without a login session
+# Config: ~/.config/junto-runner/config.json + runner.key (both mode 600).
+[Unit]
+Description=Junto delegated-inference runner (local model worker)
+After=network-online.target
+
+[Service]
+ExecStart=/usr/bin/python3 %h/.local/bin/junto-runner.py --config %h/.config/junto-runner/config.json
+Restart=always
+RestartSec=15
+# The runner needs only the junto server, local Ollama and the scopes' sources.
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=default.target

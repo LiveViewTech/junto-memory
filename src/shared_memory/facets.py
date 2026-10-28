@@ -34,7 +34,8 @@ legal forever (the container is optional; backfill covers gaps).
 
 Config (env):
   JUNTO_FACETS_ENABLED  "true" to enable (default false — dormant).
-  Model/endpoint: shares JUNTO_CLAIM_GATE_URL / JUNTO_CLAIM_GATE_MODEL.
+  Model/endpoint: shares JUNTO_CLAIM_GATE_URL and the claim extractor's model
+  (JUNTO_CLAIM_GATE_EXTRACT_MODEL, falling back to JUNTO_CLAIM_GATE_MODEL).
 """
 
 import asyncio
@@ -264,7 +265,7 @@ async def extract_operation(client, title: str, content: str,
     raw = await claim_gate._chat(
         client, OPERATION_SYSTEM,
         f"{title}\n\n{content[:claim_gate.CONTENT_HEAD_CHARS]}",
-        ONE_WORD_MAX_TOKENS,
+        ONE_WORD_MAX_TOKENS, extract=True,
     )
     return _parse_one_word(raw, OPERATION_ENUM)
 
@@ -273,7 +274,7 @@ async def extract_shelf_life(client, title: str, content: str) -> Optional[str]:
     raw = await claim_gate._chat(
         client, SHELF_LIFE_SYSTEM,
         f"{title}\n\n{content[:claim_gate.CONTENT_HEAD_CHARS]}",
-        ONE_WORD_MAX_TOKENS,
+        ONE_WORD_MAX_TOKENS, extract=True,
     )
     word = _parse_one_word(raw, ("DURABLE", "VOLATILE"))
     return word.lower() if word else None
@@ -283,7 +284,7 @@ async def extract_trigger(client, title: str, content: str) -> List[str]:
     raw = await claim_gate._chat(
         client, TRIGGER_SYSTEM,
         f"{title}\n\n{content[:claim_gate.CONTENT_HEAD_CHARS]}",
-        TRIGGER_MAX_TOKENS,
+        TRIGGER_MAX_TOKENS, extract=True,
     )
     lines = []
     for line in (raw or "").splitlines():
@@ -311,7 +312,7 @@ def _store_facets(db, doc_id: str, facets: Dict) -> None:
     row = {k: v for k, v in facets.items() if v}
     row.update({
         "recipe_version": FACETS_RECIPE_VERSION,
-        "model": claim_gate._gate_model(),
+        "model": claim_gate._extract_model(),
         "extracted_at": utc_now_iso(),
     })
     db[FACETS_COLLECTION].update_one({"_id": doc_id}, {"$set": row}, upsert=True)

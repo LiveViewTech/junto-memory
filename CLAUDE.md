@@ -6,8 +6,6 @@ Component of the Junto suite. The shared-memory MCP server — persistent knowle
 
 **Your name is: `memory`** (project: `junto`).
 
-**Override:** if a `.agent-name` file exists in this repo or its parent (written by the launcher) or the system prompt assigns a different identity (e.g. `juntoTom`), that identity wins. Use it for `/rename`, the terminal title, and every `memory_*` call, and read `state:<that name>` instead of `state:memory`. The `memory` identity applies only to the agent that maintains this server (on sage).
-
 **IMMEDIATELY on session start, run these commands IN ORDER:**
 
 1. Rename this session (for resume list):
@@ -32,19 +30,20 @@ Do NOT ask the user for a name. Do NOT skip the /rename. You are `memory`.
 
 ## Project Roster (post-cutover 2026-05-07)
 
-The `junto` project has three first-class agents:
+The `junto` project's first-class agents:
 
 | Agent | Role | Working dir |
 |-------|------|-------------|
 | `memory` | This server. Maintains and improves the MCP shared-memory codebase. | `/home/tlemmons/sharedUtils/junto/junto-memory` |
 | `inbox` | The cterm-inbox/junto-inbox channel plugin. Lives in claudeTerminal repo. | `C:\code\claudeTerminal` (Windows) — formerly `main@claude_terminal` |
-| `control` | The junto-control web UI for human-in-the-loop messaging. | `~/sharedUtils/claudeControl` (move to `~/sharedUtils/junto/junto-control` pending) — formerly `claude-control@claudecontrol` |
+| `control` | The junto-control web UI for human-in-the-loop messaging. | `~/sharedUtils/junto/junto-control` — formerly `claude-control@claudecontrol` |
+| `sub` | RETIRED 2026-10-27 (Tom) — junto-sub kept, not running; do not relaunch without Tom. | `~/sharedUtils/junto/junto-sub` |
 
 Cross-project peers (e.g., `coordinator@nimbus`, agents in `nimbus`, `sage`, etc.) DO send messages — apply the inbound-routing rules below.
 
-## Rename aliases (active 30 days from 2026-05-07)
+## Rename aliases (EXPIRED ~2026-06-06)
 
-A `memory_admin(action="list_aliases")` shows what's currently aliased. Until expiry (~2026-06-06), old-name reconnects (e.g., `claude_instance="shared-memory"`, `project="shared_memory"`) auto-redirect with a `rename_redirect` warning in the start_session response.
+The 2026-05-07 cutover aliases have expired (`rename_aliases` is empty as of 2026-10-13). Old names (`shared-memory@shared_memory` etc.) no longer redirect. `memory_admin(action="list_aliases")` shows any current ones.
 
 ## Key Files
 
@@ -177,7 +176,7 @@ Baseline: invoke the junto `park` skill (canonical checklist, includes the Jira-
    )
    ```
    State spec is **never empty**. If parked clean, write "Parked clean" with reason.
-   Server's overwrite protection (specs.py:125-143) blocks a state-spec write that shrinks the existing spec by >50%. That's intentional. If you hit it, READ the existing spec and merge.
+   Server's overwrite protection (`src/shared_memory/tools/specs.py`, the `shrink_tripped` check) blocks a state-spec write that shrinks the existing spec by >50%. That's intentional. If you hit it, READ the existing spec and merge. If the response carries `dropped_standing`, those rule lines from your old Key Context are now deleted — re-add any that still hold (interface:state-spec-write-guard-v0).
 5. `memory_end_session(summary, files_modified, handoff_notes)`.
 6. Tell user: `"Parked. /clear then go when ready."`
 
@@ -212,7 +211,7 @@ Exceptions:
 - **Reply with `in_response_to=<their msg_id>`** for thread continuity (chain_depth tracking).
 - **Don't echo "received, working on it"** for the sake of it. Silence is fine. Respond when you have an answer.
 
-User-tier messages (sender role=user) are forced to `chain_depth=0` server-side, so they never reach the cap (human-sender rule). NOTE: the legacy **Phase-D2 recency-bypass of the depth cap was removed in push-control-v0** — the depth cap (12) is now **unconditional**; a recent (<5min) human interaction does NOT waive it. That window instead releases read-side push-suppression only (`messaging.py:671-678`). See `architecture:junto-memory-v1`.
+User-tier messages (sender role=user) are forced to `chain_depth=0` server-side, so they never reach the cap (human-sender rule). NOTE: the legacy **Phase-D2 recency-bypass of the depth cap was removed in push-control-v0** — the depth cap (12) is now **unconditional**; a recent (<5min) human interaction does NOT waive it. That window instead releases read-side push-suppression only (`messaging.py:671-678`). See `architecture:shared-memory-v1`.
 
 ---
 
@@ -221,7 +220,7 @@ User-tier messages (sender role=user) are forced to `chain_depth=0` server-side,
 Memory query results rank by text relevance, not recency. Old entries can outrank new ones. ALWAYS:
 1. Check `created`/`updated` on every result before using it.
 2. Prefer newer when multiple results cover the same topic.
-3. Verify before acting on anything older than 2 weeks — code may have changed.
+3. Verify before acting on anything older than 2 weeks — code may have changed. (Stricter than the server guideline's 30 days on purpose: this repo changes daily. For other projects' entries the guideline's 30 days applies.)
 4. When recording on a topic that already has an entry, **update the existing one** rather than creating a duplicate.
 5. Flag stale entries for archival in your park handoff.
 
@@ -237,6 +236,8 @@ This applies doubly to junto-memory itself: you're the project that owns the rec
 4. **Do not rename fields, change casing, or "normalize" formats without explicit approval.** Other projects depend on the exact shapes junto-memory returns.
 5. **When a task is "done," answer:** "If a fresh agent in another project tried this right now, what would they see?" If you can't answer, the task is not done.
 6. **Fail loud on MCP transport.** Any MCP tool call that errors, times out, or returns a partial/unexpected response surfaces to the user immediately — do not retry blindly, do not pretend it succeeded. Don't equate "queued"/"persisted" with "delivered": `memory_send_message` returns success on persistence regardless of whether any subscriber is live. Check `live_subscribers` in the response. Subscription failures (PermissionError from inbox subscribe) are real errors, not no-ops — surface them.
+7. **Server restart = a fresh Tom OK per restart.** Say "About to restart the server — OK?" and stop. One OK covers ONE restart. Treat a broad "do whatever helps" as NOT a restart OK — memory's reading after the 2026-10-13 records audit found 3 restarts on one such answer + 1 with none on 2026-10-12. Before bouncing: code committed, Mongo/Chroma on external volumes (`mcp-mongo-persistent`, `chroma-persistent`), `broadcast_restart_warning`, then re-`memory_start_session` after. Exception: Tom has said deploying freely is fine when memory is the ONLY live agent (check `memory_get_active_work`) — still state the persistence check.
+8. **Global guidelines change ONLY on Tom's approval given to memory.** Covers both `memory_guidelines(scope="global")` and `src/shared_memory/global_guidelines.py` (the code constant re-seeds at boot — backlog_14137f5a84a7). A peer's proposal is routed to Tom, never implemented on the peer's say-so. Nothing enforces this in code (`memory_guidelines` has no tier check and logs actor="admin"), so it is discipline, not a control (Tom, 2026-08-11).
 
 ---
 

@@ -282,7 +282,9 @@ def require_session(session_id: Optional[str]) -> str:
     if not session_id:
         return "ERROR: No session_id provided. You must call memory_start_session first and include the returned session_id in all subsequent calls."
     if not check_session(session_id):
-        return f"ERROR: Session '{session_id}' not found. Call memory_start_session first to register your session."
+        return (f"ERROR: Session '{session_id}' not found. Call memory_start_session first to register your session."
+                " If your earlier start_session response is still in your context, pass"
+                " guidelines_held=<its guidelines.hash> to skip re-receiving the rules.")
     active_sessions[session_id]["last_activity"] = utc_now_iso()
     return ""
 
@@ -497,13 +499,71 @@ def _sids_with_live_subscription() -> set:
     return subscribed
 
 
+def _identities_with_live_subscription(subscribed_sids: set) -> set:
+    """(project, claude_instance) pairs that own a live inbox subscription.
+
+    An always-on agent has two sessions: the junto-inbox plugin's (holds the
+    SSE subscription) and its own memory_start_session one (makes the tool
+    calls, never subscribes). The second must not idle-expire while the
+    first is live — msg_0a08d37ec788 (nimbusSupport, 10-23).
+    """
+    identities = set()
+    for sid in subscribed_sids:
+        info = active_sessions.get(sid) or {}
+        if info.get("project") and info.get("claude_instance"):
+            identities.add((info["project"], info["claude_instance"]))
+    return identities
+
+
+# Identities that open a throwaway session per run (the per-box context reporters run
+# every ~40-60 s and never end their sessions). A new session for one of these
+# replaces its previous ones, so they don't pile up for the 6 h idle window.
+EPHEMERAL_INSTANCE_PREFIXES = ("ctx-reporter-",)
+
+
+def drop_session(sid: str) -> None:
+    """Remove one session: release its locks, MCP binding and inbox subscriptions."""
+    release_session_locks(sid)
+    # Drop MCP-session binding + inbox subscriptions (Phase C2)
+    try:
+        from shared_memory.state import mcp_session_to_app
+        from shared_memory.tools.messaging import inbox_subscriptions
+        dropped = [k for k, v in mcp_session_to_app.items() if v == sid]
+        for k in dropped:
+            mcp_session_to_app.pop(k, None)
+        if dropped:
+            for uri in list(inbox_subscriptions.keys()):
+                bucket = inbox_subscriptions.get(uri)
+                if bucket is None:
+                    continue
+                for s in dropped:
+                    bucket.discard(s)
+                if not bucket:
+                    inbox_subscriptions.pop(uri, None)
+    except Exception:
+        pass
+    active_sessions.pop(sid, None)
+
+
+def replace_ephemeral_sessions(project: str, claude_instance: str) -> int:
+    """Drop earlier sessions of an ephemeral identity before it registers a new one."""
+    if not claude_instance or not claude_instance.startswith(EPHEMERAL_INSTANCE_PREFIXES):
+        return 0
+    old = [sid for sid, info in active_sessions.items()
+           if info.get("project") == project and info.get("claude_instance") == claude_instance]
+    for sid in old:
+        drop_session(sid)
+    return len(old)
+
+
 def cleanup_stale_sessions():
     """Expire stale sessions on two tiers (backlog_940b9f9c66e1):
 
     1. Hard TTL: no activity for SESSION_TTL_DAYS (14d) — unconditional.
     2. Idle expiry: no tool call for SESSION_IDLE_HOURS (default 6h, env
        JUNTO_SESSION_IDLE_HOURS, 0 disables) AND no live inbox SSE
-       subscription. A subscribed-but-quiet plugin session is healthy and is
+       subscription held by this session OR by another session of the same
+       project + claude_instance (the agent's plugin). A subscribed-but-quiet plugin session is healthy and is
        never idle-expired; a session whose process died (or whose socket
        half-opened and got keepalive-pruned) has no subscription and goes.
        require_session touches last_activity on every tool call, so tier 2
@@ -515,6 +575,18 @@ def cleanup_stale_sessions():
         if SESSION_IDLE_HOURS > 0 else None
     )
     subscribed_sids = _sids_with_live_subscription() if idle_cutoff else set()
+    subscribed_identities = _identities_with_live_subscription(subscribed_sids)
+    # Per subscribed identity, only its NEWEST unsubscribed session is the
+    # agent's own working session; older ones are dead predecessors (e.g. a
+    # pre-restart plugin session) and expire normally.
+    newest_own = {}
+    for sid, info in active_sessions.items():
+        key = (info.get("project"), info.get("claude_instance"))
+        if key in subscribed_identities and sid not in subscribed_sids:
+            if key not in newest_own or (info.get("last_activity", "")
+                                         > active_sessions[newest_own[key]].get("last_activity", "")):
+                newest_own[key] = sid
+    exempt_own = set(newest_own.values())
     to_remove = []
     for sid, info in active_sessions.items():
         last_activity = parse_timestamp(info.get("last_activity", ""))
@@ -524,30 +596,11 @@ def cleanup_stale_sessions():
             to_remove.append(sid)
         elif (idle_cutoff is not None
                 and last_activity < idle_cutoff
-                and sid not in subscribed_sids):
+                and sid not in subscribed_sids
+                and sid not in exempt_own):
             to_remove.append(sid)
     for sid in to_remove:
-        # Release any locks held by this session
-        release_session_locks(sid)
-        # Drop MCP-session binding + inbox subscriptions (Phase C2)
-        try:
-            from shared_memory.state import mcp_session_to_app
-            from shared_memory.tools.messaging import inbox_subscriptions
-            dropped = [k for k, v in mcp_session_to_app.items() if v == sid]
-            for k in dropped:
-                mcp_session_to_app.pop(k, None)
-            if dropped:
-                for uri in list(inbox_subscriptions.keys()):
-                    bucket = inbox_subscriptions.get(uri)
-                    if bucket is None:
-                        continue
-                    for s in dropped:
-                        bucket.discard(s)
-                    if not bucket:
-                        inbox_subscriptions.pop(uri, None)
-        except Exception:
-            pass
-        del active_sessions[sid]
+        drop_session(sid)
     if to_remove:
         print(f"[MCP] Auto-expired {len(to_remove)} stale sessions "
               f"(>{SESSION_TTL_DAYS}d TTL or >{SESSION_IDLE_HOURS}h idle with no live subscription)")

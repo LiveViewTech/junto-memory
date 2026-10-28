@@ -6,6 +6,7 @@ from typing import List
 from mcp.server.fastmcp import Context
 
 from shared_memory.app import mcp
+from shared_memory.auth import collection_allowed
 from shared_memory.clients import get_chroma, get_mongo
 from shared_memory.config import MAX_CONTENT_SIZE, ORIGIN_SERVER_ID, PROJECT_PREFIX
 from shared_memory.helpers import (
@@ -21,6 +22,26 @@ from shared_memory.op_log import (
     fetch_embedding_for_op_log,
 )
 from shared_memory.state import active_sessions
+
+
+async def _case_variant_specs(collection, name: str) -> List[str]:
+    """Active spec names in `collection` that equal `name` case-insensitively
+    but not exactly (backlog_d3fb15db8acd). Spec doc ids are derived from the
+    name verbatim, so `db:Accounting.Sales` and `db:accounting.sales` are two
+    different docs; this is the only way to see the twin. Best-effort: a
+    Chroma error returns [] rather than blocking the write/read."""
+    target = name.casefold()
+    try:
+        result = await collection.get(where={"type": "spec"}, include=["metadatas"])
+    except Exception:
+        return []
+    variants = set()
+    for meta in result.get("metadatas") or []:
+        other = (meta or {}).get("spec_name") or ""
+        status = (meta or {}).get("status")
+        if other != name and other.casefold() == target and (not status or status == "active"):
+            variants.add(other)
+    return sorted(variants)
 
 
 @mcp.tool()
@@ -73,7 +94,9 @@ async def memory_define_spec(
         project: Project this belongs to (omit for shared specs)
         json_schema: Optional JSON schema for validation
         tags: Tags for categorization
-        force: Override safety checks (e.g., state spec overwrite protection). Default False.
+        force: Override safety checks (state spec overwrite protection; the
+            case-variant name collision guard that refuses to create
+            `db:accounting.sales` beside an existing `db:Accounting.Sales`). Default False.
     """
     error = require_session(session_id)
     if error:
@@ -127,6 +150,8 @@ async def memory_define_spec(
 
     # Check if spec already exists
     existing = None
+    write_guard = None
+    _dropped: List[str] = []
     try:
         result = await collection.get(ids=[spec_doc_id], include=["documents", "metadatas"])
         if result["ids"]:
@@ -188,11 +213,24 @@ async def memory_define_spec(
 
         # State spec overwrite protection: reject if new content is much shorter
         # This prevents tangent sessions from accidentally erasing prior context
+        existing_len = len(existing["content"])
+        new_len = len(content)
+        shrink_tripped = existing_len > 200 and new_len < existing_len * 0.5
+        if name.startswith("state:"):
+            # interface:state-spec-write-guard-v0 — advisory, never blocks.
+            # Recorded on op_log/audit because force used to leave no trace.
+            from shared_memory.state_guard import dropped_standing
+            _dropped = dropped_standing(existing["content"], content)
+            write_guard = {
+                "forced": bool(force),
+                "shrink_guard_overridden": bool(force) and shrink_tripped,
+                "size_before": existing_len,
+                "size_after": new_len,
+                "dropped_standing": len(_dropped),
+            }
         if name.startswith("state:") and not force:
-            existing_len = len(existing["content"])
-            new_len = len(content)
             # If new content is less than half the length, block it
-            if existing_len > 200 and new_len < existing_len * 0.5:
+            if shrink_tripped:
                 return json.dumps({
                     "error": "State spec overwrite protection triggered",
                     "spec_name": name,
@@ -240,6 +278,26 @@ async def memory_define_spec(
 
         action = "updated"
     else:
+        # Case-variant collision guard (backlog_d3fb15db8acd): creating
+        # `db:accounting.sales` next to an existing `db:Accounting.Sales`
+        # silently forks the spec — readers keep finding the stale original.
+        # Refuse unless force=True.
+        if not force:
+            variants = await _case_variant_specs(collection, name)
+            if variants:
+                return json.dumps({
+                    "error": "Case-variant spec name collision",
+                    "spec_name": name,
+                    "existing": variants,
+                    "location": location,
+                    "suggestion": (
+                        f"A spec named {variants[0]!r} already exists and differs from "
+                        f"{name!r} only by letter case. Spec names are case-sensitive, so "
+                        "creating this would FORK it. Call memory_define_spec again with "
+                        "the existing name to update it. Pass force=True only if you "
+                        "really want a separate spec."
+                    ),
+                })
         # New spec - default to version 1.0.0
         if not version:
             version = "1.0.0"
@@ -307,6 +365,8 @@ async def memory_define_spec(
     # (see design:local-first-junto-v0-mvp v0.5.0 §7.4).
     if spec_type == "agent_state":
         spec_payload["origin_server_id"] = ORIGIN_SERVER_ID
+    if write_guard is not None:
+        spec_payload["write_guard"] = write_guard
     emit_op_log_from_context(
         db=get_mongo(),
         op_type=spec_op_type,
@@ -322,8 +382,11 @@ async def memory_define_spec(
     # Audit log for spec changes
     try:
         from shared_memory.audit import log_audit
+        _audit_details = {"spec_name": name, "version": version}
+        if write_guard is not None:
+            _audit_details["write_guard"] = write_guard
         log_audit(f"spec.{action}", owner, project or "",
-                  {"spec_name": name, "version": version}, session_id)
+                  _audit_details, session_id)
     except Exception:
         pass
 
@@ -335,6 +398,17 @@ async def memory_define_spec(
         "location": location,
         "note": "Owner-only updates enforced. Previous versions preserved in history."
     }
+    if _dropped:
+        from shared_memory.state_guard import MAX_REPORTED
+        result["dropped_standing"] = _dropped[:MAX_REPORTED]
+        result["dropped_standing_count"] = len(_dropped)
+        result["dropped_standing_note"] = (
+            f"{len(_dropped)} rule-shaped line(s) (NEVER/ALWAYS/MUST/⚠️…) from the previous "
+            "version's Key Context / rules sections are not in this version — they are now "
+            "deleted from the live spec. Re-add any that still hold; move durable "
+            "lessons to memory_record_learning or CLAUDE.md. (Advisory; the write "
+            "was saved.)"
+        )
     if _spec_lint_notes:
         result["write_lint"] = _spec_lint_notes
         result["action_required"] = (
@@ -470,6 +544,21 @@ async def memory_get_spec(
             response["json_schema"] = json.loads(meta["json_schema"])
         return json.dumps(response, indent=2)
 
+    # Miss: surface case-insensitive near-matches (backlog_d3fb15db8acd).
+    did_you_mean = []
+    for collection in collections_to_try:
+        for variant in await _case_variant_specs(collection, name):
+            if variant not in did_you_mean:
+                did_you_mean.append(variant)
+    if did_you_mean:
+        return json.dumps({
+            "error": f"Spec '{name}' not found",
+            "did_you_mean": did_you_mean,
+            "suggestion": (
+                "Spec names are case-sensitive. A spec differing only by case exists. "
+                f"Retry memory_get_spec(name={did_you_mean[0]!r})."
+            ),
+        })
     return json.dumps({
         "error": f"Spec '{name}' not found",
         "suggestion": "Use memory_list_specs to see available specs"
@@ -518,7 +607,8 @@ async def memory_list_specs(
         # Search shared and all project collections
         all_collections = await chroma.list_collections()
         for col in all_collections:
-            if col.name.startswith(PROJECT_PREFIX) or col.name == "shared_patterns":
+            if ((col.name.startswith(PROJECT_PREFIX) or col.name == "shared_patterns")
+                    and collection_allowed(active_sessions.get(session_id), col.name)):  # tenant isolation R3
                 collections_to_search.append(col)
 
     for collection in collections_to_search:

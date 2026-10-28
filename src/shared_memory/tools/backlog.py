@@ -7,6 +7,7 @@ from typing import List
 from mcp.server.fastmcp import Context
 
 from shared_memory.app import mcp
+from shared_memory.auth import collection_allowed, project_allowed, tenant_isolation_error
 from shared_memory.clients import get_chroma, get_mongo
 from shared_memory.config import BACKLOG_PRIORITIES, BACKLOG_STATUSES, PROJECT_PREFIX, SHARED_PREFIX
 from shared_memory.helpers import (
@@ -234,8 +235,10 @@ async def memory_list_backlog(
             if col.name == f"{PROJECT_PREFIX}{project}":
                 target_collections.append(col)
         else:
-            # All project and shared collections
-            if col.name.startswith(PROJECT_PREFIX) or col.name.startswith(SHARED_PREFIX):
+            # All project and shared collections (a scoped key sees only its
+            # own projects + shared — tenant isolation R3)
+            if ((col.name.startswith(PROJECT_PREFIX) or col.name.startswith(SHARED_PREFIX))
+                    and collection_allowed(active_sessions.get(session_id), col.name)):
                 target_collections.append(col)
 
     # Priority order for sorting
@@ -375,6 +378,8 @@ async def memory_update_backlog_item(
     for col in collections:
         if not (col.name.startswith(PROJECT_PREFIX) or col.name.startswith(SHARED_PREFIX)):
             continue
+        if not collection_allowed(session_info, col.name):
+            continue  # tenant isolation R4: other projects' items read as not found
 
         try:
             result = await col.get(ids=[item_id], include=["metadatas", "documents"])
@@ -538,6 +543,8 @@ async def memory_complete_backlog_item(
     for col in collections:
         if not (col.name.startswith(PROJECT_PREFIX) or col.name.startswith(SHARED_PREFIX)):
             continue
+        if not collection_allowed(session_info, col.name):
+            continue  # tenant isolation R4: other projects' items read as not found
 
         try:
             result = await col.get(ids=[item_id], include=["metadatas", "documents"])
@@ -651,6 +658,10 @@ async def memory_batch_backlog(
                     continue
 
                 project = normalize_project(item.get("project", "")) if item.get("project") else ""
+                if not project_allowed(session_info, project):
+                    results["failed"] += 1
+                    results["errors"].append({"index": i, "error": tenant_isolation_error(session_info, project)})
+                    continue
                 priority = item.get("priority", "medium")
                 if priority not in BACKLOG_PRIORITIES:
                     priority = "medium"
@@ -733,6 +744,8 @@ async def memory_batch_backlog(
                 for col in collections:
                     if not (col.name.startswith(PROJECT_PREFIX) or col.name.startswith(SHARED_PREFIX)):
                         continue
+                    if not collection_allowed(session_info, col.name):
+                        continue  # tenant isolation R4: other projects' items read as not found
                     try:
                         result = await col.get(ids=[update_id], include=["metadatas", "documents"])
                         if result["ids"]:
@@ -813,6 +826,8 @@ async def memory_batch_backlog(
                 for col in collections:
                     if not (col.name.startswith(PROJECT_PREFIX) or col.name.startswith(SHARED_PREFIX)):
                         continue
+                    if not collection_allowed(session_info, col.name):
+                        continue  # tenant isolation R4: other projects' items read as not found
                     try:
                         result = await col.get(ids=[complete_id], include=["metadatas", "documents"])
                         if result["ids"]:

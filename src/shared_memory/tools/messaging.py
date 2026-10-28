@@ -17,6 +17,7 @@ from pymongo import ReturnDocument
 from shared_memory import push_control
 from shared_memory.app import mcp
 from shared_memory.audit import log_audit
+from shared_memory.auth import project_allowed, scoped_projects
 from shared_memory.clients import get_mongo
 from shared_memory.config import (
     ACTION_CATEGORIES,
@@ -626,6 +627,52 @@ def _advance_parent_obligation_on_reply(db, parent_id: str, replier: str, now) -
         return None
 
 
+SIZE_HINT_CHARS = 3000
+POSSIBLE_PARENT_MAX = 3
+
+
+def _send_hints(db, message, to_instance, to_project, sender, sender_project,
+                in_response_to) -> Dict[str, Any]:
+    """Advisory send-response fields (design:action-lapse-v0 C + D). Never
+    blocks, never raises.
+
+    size_hint: the body is long. Every recipient pays it in context (nimbus avg
+    1,807 chars, 23% over 3K).
+    possible_parent: a direct send with no in_response_to while the recipient
+    has open asks to the sender. The usual cause of obligations that never
+    clear is a reply sent as a new message.
+    """
+    hints: Dict[str, Any] = {}
+    try:
+        n = len(message or "")
+        if n > SIZE_HINT_CHARS:
+            hints["size_hint"] = (
+                f"long message ({n} chars): every recipient pays this in context. "
+                "Consider a spec/doc plus a pointer."
+            )
+        if db is not None and not in_response_to and to_instance and to_instance != "*":
+            rows = list(db.messages.find(
+                {"from_instance": to_instance, "from_project": to_project,
+                 "to_instance": sender, "to_project": sender_project,
+                 "category": {"$in": ACTION_CATEGORIES}, "status": "pending",
+                 "obligation": {"$in": ["open", "responded"]}},
+                {"category": 1, "created_at": 1, "subject": 1, "message": 1},
+            ).sort([("created_at", -1)]).limit(POSSIBLE_PARENT_MAX))
+            if rows:
+                hints["possible_parent"] = [{
+                    "id": r["_id"],
+                    "category": r.get("category"),
+                    "created": r["created_at"].isoformat() if hasattr(r.get("created_at"), "isoformat") else None,
+                    "preview": ((r.get("subject") or r.get("message") or "").replace("\n", " "))[:60],
+                } for r in rows]
+                hints["possible_parent_hint"] = (
+                    "If this answers one of these, resend with in_response_to=<id> so it clears."
+                )
+    except Exception:
+        pass
+    return hints
+
+
 def _set_action_message_expiry(db, message_id):
     """Stage-5 TTL: when an ACTION message reaches a terminal state (acked or
     obligation resolved), give it expire_at = created + 7d so it ages out. Until
@@ -1123,6 +1170,9 @@ async def memory_send_message(
     }
     if _ref_advisory:
         response.update(_ref_advisory)
+    response.update(_send_hints(db, message, to_instance, msg_doc["to_project"],
+                                session_info["claude_instance"], from_project,
+                                in_response_to))
 
     # Read-side idle-queue visibility (backlog_da56a6e0c46b). When the recipient
     # has NO live stream to receive this push, tell the sender what's already
@@ -1466,6 +1516,23 @@ async def memory_update_message_status(
     # "resolved"/"responded" are not delivery statuses; route them to the
     # `obligation` field. "resolved" is the explicit done verb (clears a
     # task/blocker that a reply left "responded").
+    # Revive / lapse (design:action-lapse-v0): "open" puts a lapsed (or any)
+    # action back in the lane; "lapsed" retires one by hand. Neither touches
+    # expire_at — a lapsed message persists, it just leaves the action lane.
+    if status in ("open", "lapsed"):
+        if status == "open":
+            change = {"$set": {"obligation": "open"},
+                      "$unset": {"lapsed_at": "", "lapsed_from": ""}}
+        else:
+            msg = db.messages.find_one({"_id": message_id}, {"obligation": 1})
+            change = {"$set": {"obligation": "lapsed", "lapsed_at": now,
+                               "lapsed_from": (msg or {}).get("obligation") or "open"}}
+        result = db.messages.update_one(
+            {"_id": message_id, "category": {"$in": ACTION_CATEGORIES}}, change)
+        if result.matched_count == 0:
+            return json.dumps({"error": f"Action message not found: {message_id}"})
+        return json.dumps({"obligation": status, "message_id": message_id, "updated": True})
+
     if status in ("responded", "resolved"):
         obl_update = {"obligation": status, "responded_at": now}
         if status == "resolved":
@@ -1483,7 +1550,7 @@ async def memory_update_message_status(
         })
 
     if status not in MESSAGE_STATUSES:
-        return json.dumps({"error": f"Invalid status. Must be one of: {MESSAGE_STATUSES} (or obligation verbs: responded, resolved)"})
+        return json.dumps({"error": f"Invalid status. Must be one of: {MESSAGE_STATUSES} (or obligation verbs: responded, resolved, open, lapsed)"})
 
     update = {"status": status}
 
@@ -1733,14 +1800,34 @@ async def memory_get_agent_status(
     query = {"instance": instance} if instance else {}
     cursor = db.agent_status.find(query)
 
+    # agent_status rows carry no project (keyed by instance), so a scoped key
+    # resolves its visible instances through the directory (tenant isolation R5).
+    _scoped = scoped_projects(active_sessions.get(session_id))
+    _visible = None
+    if _scoped is not None:
+        _visible = set(db.agent_directory.distinct(
+            "instance", {"project": {"$in": [normalize_project(p) for p in _scoped]}}))
+
     agents = []
     now = utc_now()
     for doc in cursor:
+        if _visible is not None and doc.get("instance") not in _visible:
+            continue
         last_hb = parse_timestamp(doc.get("last_heartbeat"))
         stale = False
         if last_hb:
             age_seconds = (now - last_hb).total_seconds()
             stale = age_seconds > 300  # 5 minutes = stale
+
+        # Context gauge (interface:context-tokens-sideband-v0 v0.2): the
+        # sage-context-report timer / plugin sideband upsert these. context_stale
+        # keys off the capture time (context_reported_at), not the heartbeat — a
+        # live agent whose reporter stopped (process dying) reads stale here while
+        # last_heartbeat may still be fresh. Absent reporter => all null + stale.
+        ctx_reported = parse_timestamp(doc.get("context_reported_at"))
+        ctx_stale = True
+        if ctx_reported:
+            ctx_stale = (now - ctx_reported).total_seconds() > 180  # ~3x reporter cadence
 
         agents.append({
             "instance": doc["instance"],
@@ -1748,13 +1835,127 @@ async def memory_get_agent_status(
             "current_task": doc.get("current_task"),
             "tmux_target": doc.get("tmux_target"),
             "last_heartbeat": last_hb.isoformat() if last_hb else None,
-            "stale": stale
+            "stale": stale,
+            "context_tokens": doc.get("context_tokens"),
+            "context_window": doc.get("context_window"),
+            "context_pct": doc.get("context_pct"),
+            "context_reported_at": ctx_reported.isoformat() if ctx_reported else None,
+            "context_stale": ctx_stale,
         })
 
     return json.dumps({
         "count": len(agents),
         "agents": agents
     })
+
+
+@mcp.tool()
+async def memory_report_context(
+    session_id: str,
+    reports: list = None,
+    reset_results: list = None,
+    ctx: Context = None
+) -> str:
+    """
+    Report per-agent context-window fill for the fleet context gauge.
+
+    Lets an off-box reporter (one per machine) push every local agent's current
+    context occupancy into the central agent_status store, so memory_get_agent_status
+    returns it fleet-wide — any junto-connected agent on any machine, including the
+    caller's own. Sage's agents are covered by a direct-Mongo reporter; other boxes
+    use THIS tool because the Mongo port is localhost-only while this MCP server is
+    network-reachable (interface:context-tokens-sideband-v0).
+
+    TRUST: this sets another instance's context fields, so it is only appropriate in
+    a trusted fleet (home/junto). With JUNTO_REQUIRE_KEY on, a non-owner/admin
+    caller may report only its own instance (others land in `skipped`) — the
+    per-session self-report path (interface:context-self-report-v0).
+
+    Args:
+        session_id: Your session ID
+        reports: list of per-agent dicts:
+            {instance, context_tokens, context_window,
+             context_pct (optional; derived tokens*100//window if absent),
+             written_at (optional ISO capture time -> context_reported_at; default now.
+                 The statusline stamps it once per turn, so a newer one also resets the
+                 agent's idle-park timer: idle_park.note_turn)}
+        reset_results: optional outcomes for idle-park auto-resets this reporter
+            attempted (design:idle-park-autoreset-v0):
+            [{reset_id, outcome: done|failed|deferred, detail}]
+
+    Returns {status, reported, skipped, resets}. `resets` lists pending
+    idle-park auto-resets for agents in this call's reports
+    ([{reset_id, project, agent, requested_at}]); reporters that don't run the
+    tmux safe-inject gate can ignore it.
+    """
+    error = require_session(session_id)
+    if error:
+        return error
+    if not isinstance(reports, list) or not reports:
+        return json.dumps({"error": "reports must be a non-empty list of {instance, context_tokens, context_window}"})
+
+    db = get_mongo()
+    if db is None:
+        return json.dumps({"error": "MongoDB unavailable"})
+
+    # Keyed deployments (JUNTO_REQUIRE_KEY): a non-admin caller may report only
+    # its OWN context — the self-report path the junto-inbox plugin uses
+    # (interface:context-self-report-v0). A trusted-LAN fleet keeps the
+    # one-reporter-per-box model, where a reporter session speaks for others.
+    from shared_memory import auth as _auth
+    from shared_memory.context_stamp import record_history as record_context_history
+    from shared_memory.idle_park import note_turn
+    _caller = active_sessions.get(session_id) or {}
+    _self_only = (_auth.REQUIRE_KEY
+                  and _caller.get("role", "agent") not in ("owner", "admin"))
+
+    now = utc_now()
+    now_iso = now.isoformat()
+    written = 0
+    skipped = []
+    for r in reports:
+        if not isinstance(r, dict):
+            skipped.append(str(r)[:40])
+            continue
+        instance = r.get("instance")
+        if _self_only and instance != _caller.get("claude_instance"):
+            skipped.append(f"{str(instance)[:40]} (self-report only)")
+            continue
+        tokens = r.get("context_tokens")
+        window = r.get("context_window")
+        if not instance or not isinstance(tokens, int) or tokens <= 0:
+            skipped.append(str(instance or r)[:40])
+            continue
+        pct = r.get("context_pct")
+        if pct is None and isinstance(window, int) and window > 0:
+            pct = tokens * 100 // window
+        db.agent_status.update_one(
+            {"instance": instance},
+            {"$set": {
+                "instance": instance,
+                "context_tokens": tokens,
+                "context_window": window,
+                "context_pct": pct,
+                "context_reported_at": r.get("written_at") or now_iso,
+            }},
+            upsert=True,
+        )
+        record_context_history(db, instance, tokens, window, now)
+        note_turn(instance, r.get("written_at"))
+        written += 1
+
+    from shared_memory.idle_park import apply_reset_results, pending_resets_for
+
+    response = {"status": "ok", "reported": written, "skipped": skipped}
+    try:
+        if reset_results:
+            response["reset_results"] = apply_reset_results(db, reset_results)
+        response["resets"] = pending_resets_for(
+            db, [r.get("instance") for r in reports if isinstance(r, dict)]
+        )
+    except Exception as e:
+        response["resets_error"] = str(e)
+    return json.dumps(response)
 
 
 @mcp.tool()
@@ -1806,7 +2007,11 @@ async def memory_list_agents(
 
     agents = []
     now = utc_now()
+    _me = active_sessions.get(session_id)
     for doc in cursor:
+        # A scoped key lists only its own projects' agents (tenant isolation R5).
+        if not project_allowed(_me, doc.get("project")):
+            continue
         _reg_pre = roster.get((doc.get("project"), doc.get("instance")))
         # Search the AUTHORITATIVE role text, not the directory cache —
         # otherwise a query matches (or misses) on words the caller can no

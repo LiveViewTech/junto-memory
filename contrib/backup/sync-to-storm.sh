@@ -4,7 +4,7 @@
 # 2026-08-22: repointed from the ex-storm Windows host (192.168.15.250, physical
 # box decommissioned 08-14) to LXC 212 on madrox (192.168.15.98), an SFTP-only
 # chrooted receiver (user junto-backup, jail dirs /data/chroma + /data/mongo).
-# 212 owns retention (keep-14 per modality) AND the offsite/cloud push, so this
+# 212 owns retention (keep-7 per modality since 2026-10-26) AND the offsite/cloud push, so this
 # script only lands tarballs — no remote rotation, no cloud step here.
 # The OFFSITE_* / "storm" names are kept as the offsite-target abstraction.
 # Ref: junto/backlog_39b05cf07539, learning (storm decom + VM250 stopgap).
@@ -38,6 +38,21 @@ fail() { echo "[$(date +'%Y-%m-%d %H:%M:%S')] ERROR: $*" >&2; FAILURES=$(( FAILU
 # Run a batch of sftp commands on stdin; returns sftp's exit code.
 sftp_batch() { sftp "${SFTP_OPTS[@]}" -b - "$DEST"; }
 
+# Free bytes on the receiver filesystem holding <remote_dir> (sftp `df`, 1K
+# blocks, "Avail" column = what a non-root writer can use). Empty on failure.
+remote_avail_bytes() {
+    printf 'df %s\n' "$1" | sftp_batch 2>/dev/null \
+        | awk '$1 ~ /^[0-9]+$/ && NF >= 4 { print $3 * 1024; exit }'
+}
+
+# Headroom kept free on the receiver beyond the file itself.
+SPACE_MARGIN_BYTES="${SPACE_MARGIN_BYTES:-$(( 100 * 1024 * 1024 ))}"
+
+# Only land backups younger than the receiver's retention (212 prunes
+# -mtime +7). Local keeps 14, so without this every pruned file looked "new"
+# and was re-uploaded with a fresh mtime, defeating retention (2026-10-27).
+OFFSITE_MAX_AGE_DAYS="${OFFSITE_MAX_AGE_DAYS:-7}"
+
 # ── Verify receiver is reachable ──
 log "Checking offsite receiver ${DEST} ..."
 if ! printf 'pwd\n' | sftp_batch >/dev/null 2>&1; then
@@ -61,12 +76,26 @@ sync_dir() {
         | sftp "${SFTP_OPTS[@]}" -b - "$DEST" 2>/dev/null \
         | sed -n "s#.*/##p" | grep -E "^${pattern//\*/.*}$" || true)
 
-    local new=0 skip=0 f base
+    local new=0 skip=0 old=0 f base
     for f in "$local_dir"/$pattern; do
         [ -f "$f" ] || continue
         base=$(basename "$f")
+        if [ $(( $(date +%s) - $(stat -c %Y "$f") )) -gt $(( OFFSITE_MAX_AGE_DAYS * 86400 )) ]; then
+            old=$(( old + 1 ))
+            continue
+        fi
         if grep -qxF "$base" <<< "$remote_names"; then
             skip=$(( skip + 1 ))
+            continue
+        fi
+        # Space guard (2026-10-26): a put that hits ENOSPC leaves a .partial
+        # filling the receiver, which then also fails the next modality.
+        # Skip (and report) instead of starting an upload that cannot fit.
+        local size avail
+        size=$(stat -c %s "$f")
+        avail=$(remote_avail_bytes "$remote_dir")
+        if [ -n "$avail" ] && [ $(( size + SPACE_MARGIN_BYTES )) -gt "$avail" ]; then
+            fail "${label}: NOT uploading ${base}: needs ${size}B + margin, receiver has ${avail}B free"
             continue
         fi
         # Atomic: upload to .partial, then rename to the final name.
@@ -77,14 +106,19 @@ sync_dir() {
             new=$(( new + 1 ))
         else
             fail "${label}: upload FAILED for ${base}"
+            # Don't leave a half-written .partial eating receiver space.
+            printf 'rm %s/%s.partial\n' "$remote_dir" "$base" | sftp_batch >/dev/null 2>&1 \
+                && log "${label}: removed leftover ${base}.partial"
         fi
     done
-    log "${label}: ${new} new, ${skip} already present"
+    log "${label}: ${new} new, ${skip} already present, ${old} older than ${OFFSITE_MAX_AGE_DAYS}d (not sent)"
 }
 
 log "=== junto offsite sync -> ${DEST} start ==="
-sync_dir "chroma" "$CHROMA_LOCAL_DIR" "$CHROMA_REMOTE" "chroma-backup-*.tar.gz"
+# Mongo first: it is the source of truth and small, so a full receiver
+# can't starve it behind a large chroma tarball.
 sync_dir "mongo"  "$MONGO_LOCAL_DIR"  "$MONGO_REMOTE"  "mongo-backup-*.archive.gz"
+sync_dir "chroma" "$CHROMA_LOCAL_DIR" "$CHROMA_REMOTE" "chroma-backup-*.tar.gz"
 
 # Retention is enforced on the receiver (212, keep-14). No remote rotation here.
 

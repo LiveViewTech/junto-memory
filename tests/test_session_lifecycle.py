@@ -88,6 +88,42 @@ def test_idle_session_with_live_subscription_survives():
     assert "plugin" in active_sessions
 
 
+def test_idle_agent_session_survives_while_its_plugin_is_subscribed():
+    # Same identity: plugin session holds the subscription, the agent's own
+    # session makes the tool calls and has been quiet for 8h.
+    _mk_session("plugin", idle_hours=8)
+    _mk_session("agent", idle_hours=8)
+    transport = object()
+    mcp_session_to_app[transport] = "plugin"
+    messaging_mod.inbox_subscriptions["inbox://junto/t"] = {transport}
+    removed = cleanup_stale_sessions()
+    assert removed == []
+    assert "agent" in active_sessions
+
+
+def test_only_newest_own_session_is_exempt():
+    _mk_session("plugin", idle_hours=8)
+    _mk_session("agent-old", idle_hours=30)
+    _mk_session("agent", idle_hours=8)
+    transport = object()
+    mcp_session_to_app[transport] = "plugin"
+    messaging_mod.inbox_subscriptions["inbox://junto/t"] = {transport}
+    removed = cleanup_stale_sessions()
+    assert removed == ["agent-old"]
+    assert "agent" in active_sessions
+
+
+def test_idle_session_of_other_identity_still_expires():
+    _mk_session("plugin", idle_hours=8)
+    _mk_session("other", idle_hours=8)
+    active_sessions["other"]["claude_instance"] = "someone-else"
+    transport = object()
+    mcp_session_to_app[transport] = "plugin"
+    messaging_mod.inbox_subscriptions["inbox://junto/t"] = {transport}
+    removed = cleanup_stale_sessions()
+    assert removed == ["other"]
+
+
 def test_hard_ttl_expires_even_with_subscription():
     _mk_session("ancient", idle_hours=15 * 24)
     transport = object()

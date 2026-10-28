@@ -9,6 +9,7 @@ from typing import Any, Dict, List
 from mcp.server.fastmcp import Context
 
 from shared_memory.app import mcp
+from shared_memory.auth import collection_allowed, project_allowed
 from shared_memory.clients import get_chroma, get_mongo
 from shared_memory.config import PROJECT_PREFIX, SHARED_PREFIX
 from shared_memory.helpers import (
@@ -438,6 +439,7 @@ async def memory_get_enrichment_queue(
         }
         for func_id, info in function_enrichment_queue.items()
         if not info["enriched"]
+        and project_allowed(active_sessions.get(session_id), info.get("project"))  # tenant isolation R5
     ]
 
     return json.dumps({
@@ -650,6 +652,8 @@ async def memory_enrich_function(
     for col in collections:
         if not (col.name.startswith(PROJECT_PREFIX) or col.name.startswith(SHARED_PREFIX)):
             continue
+        if not collection_allowed(session_info, col.name):
+            continue  # tenant isolation R4: other projects' functions read as not found
 
         try:
             result = await col.get(ids=[func_id], include=["documents", "metadatas"])

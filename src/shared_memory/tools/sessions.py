@@ -103,6 +103,44 @@ def _active_component_peers(db, project, instance, subscribed_components,
     return peers
 
 
+# Task strings a CLIENT passes on every session (not a description of this
+# session's work). In a park-summary title the facet model reads them as the
+# doc's subject: 52 claims credited "the junto-inbox channel plugin" with
+# other agents' work (librarian nightly 2026-10-15).
+_BOILERPLATE_TASKS = {"junto-inbox channel plugin"}
+
+
+def park_title_task_hint(task) -> str:
+    """Task suffix for a park-summary title; empty for client boilerplate."""
+    hint = (task or "").strip()
+    if hint.lower() in _BOILERPLATE_TASKS:
+        return ""
+    return hint[:60]
+
+
+def session_title(task, summary, limit: int) -> str:
+    """Handoff/work-item title: the session's task, or the summary's first line
+    when the task is empty or client boilerplate (librarian 10-23/24: 1,664
+    docs titled "Handoff: junto-inbox channel plugin")."""
+    hint = park_title_task_hint(task)
+    if not hint:
+        hint = next((ln.strip(" #*-") for ln in (summary or "").splitlines()
+                     if ln.strip(" #*-")), "")
+    return hint[:limit]
+
+
+def guidelines_hash(rules) -> str:
+    """Short content hash of a served guideline block (the corpus `version`
+    counter is not bumped on rule edits, so it can't key a cache)."""
+    import hashlib
+    return hashlib.sha256("\n".join(rules).encode("utf-8")).hexdigest()[:16]
+
+
+def _display_task(task) -> str:
+    hint = (task or "").strip()
+    return "" if hint.lower() in _BOILERPLATE_TASKS else hint
+
+
 @mcp.tool()
 async def memory_start_session(
     project: str,
@@ -116,6 +154,8 @@ async def memory_start_session(
     subscribed_components: List[str] = None,
     aliases: List[str] = None,
     principal: bool = False,
+    guidelines_held: str = None,
+    timezone: str = None,
     ctx: Context = None
 ) -> str:
     """
@@ -158,6 +198,11 @@ async def memory_start_session(
             per project — an alias that collides with a live agent name or
             another agent's alias is rejected (surfaced in `registry_warning`).
             None = leave existing aliases untouched; [] = clear them.
+        timezone: Optional IANA time zone for this agent (e.g. "America/Denver").
+            Persisted on the agent_directory record; the idle-park nudge uses it
+            for the agent's local time and DAY/NIGHT verdict. None = leave the
+            stored value untouched. An invalid name is ignored and reported in
+            `timezone_warning`.
         principal: Service-principal session mode (design:identity-lifecycle-v0
             Mechanism A; first consumer: subConscience runtime subs). Requires a
             VALIDATED api key (arg or Bearer header) — keyless/soft-auth
@@ -167,6 +212,11 @@ async def memory_start_session(
             from active-work / other-claudes enumeration. A principal can never
             be a message RECIPIENT (send-validation is roster-based, and there
             is no roster row). Lifecycle = key lifecycle (revoke to kill).
+        guidelines_held: The `guidelines.hash` from an earlier start_session
+            response that is STILL IN YOUR CONTEXT (reconnect after "Session
+            not found"). If it matches, `guidelines` comes back as a short
+            unchanged stub instead of the full rules. Never pass it after
+            /clear. (interface:start-session-guidelines-held-v0)
     """
     # Cleanup stale sessions on each new session start
     cleanup_stale_sessions()
@@ -342,6 +392,7 @@ async def memory_start_session(
 
     # ── Registry awareness ──
     _needs_role_description = False
+    _timezone_warning = None
     _registry_warning = None
     _identity_suggestion = None
     _is_worker = False
@@ -480,6 +531,13 @@ async def memory_start_session(
                 update_fields["role_description"] = role_description
             if spawned_by:
                 update_fields["spawned_by"] = spawned_by
+            if timezone is not None:
+                from shared_memory.idle_park import valid_timezone
+                if valid_timezone(timezone):
+                    update_fields["timezone"] = timezone.strip()
+                else:
+                    _timezone_warning = (f"timezone {timezone!r} is not a valid IANA zone "
+                                         "(e.g. 'America/Denver'); not stored")
             # Component subscriptions (design:unified-messaging-v0 Stage 1).
             # Normalize to a clean list of non-empty strings; an explicit empty
             # list clears the subscription (so an agent that moves off a
@@ -541,6 +599,10 @@ async def memory_start_session(
     # Generate session ID
     session_id = f"{project}_{claude_instance}_{uuid.uuid4().hex[:8]}"
 
+    # Ephemeral identities (per-run reporters): the new session replaces the old ones.
+    from shared_memory.helpers import replace_ephemeral_sessions
+    replace_ephemeral_sessions(project, claude_instance)
+
     # Register session
     active_sessions[session_id] = {
         "project": project,
@@ -559,6 +621,12 @@ async def memory_start_session(
         # the other_claudes briefing block) filters on this flag.
         "is_principal": principal,
     }
+
+    try:
+        from shared_memory import idle_park
+        idle_park.note_session_start(project, claude_instance, task_description)
+    except Exception:
+        pass  # best-effort: idle-park bookkeeping must never fail a session start
 
     # Phase C2 inbox auth: bind this app-session to the underlying MCP
     # transport so resource handlers can resolve the caller's identity from
@@ -656,12 +724,22 @@ async def memory_start_session(
     # the 4th enumeration surface alongside list_agents/standup/get_active_work
     # (the spec's code map listed three; this one is session-keyed like
     # get_active_work).
-    _other_active = []
+    # One line per identity: an agent's own session and its inbox plugin's
+    # session are the same agent. Prefer the task that isn't plugin boilerplate.
+    _by_identity = {}
     for sid, info in active_sessions.items():
-        if sid != session_id and not info.get("is_principal"):
-            _other_active.append(f"{info['claude_instance']}@{info['project']}: {info['task'][:50]}")
-            if len(_other_active) >= 20:
-                break
+        if sid == session_id or info.get("is_principal"):
+            continue
+        key = (info["claude_instance"], info["project"])
+        if key == (claude_instance, project):
+            continue
+        task = _display_task(info.get("task"))
+        if key not in _by_identity or (task and not _by_identity[key]):
+            _by_identity[key] = task
+    _other_active = [
+        f"{inst}@{proj}: {task[:50]}" if task else f"{inst}@{proj}"
+        for (inst, proj), task in list(_by_identity.items())[:20]
+    ]
 
     # Component peers (design:unified-messaging-v0 Stage 1 — ADDRESSING):
     # who else is recently active in any of MY subscribed components?
@@ -686,11 +764,25 @@ async def memory_start_session(
         guidelines = get_guidelines_for_session(project)
         if guidelines:
             _gv = get_guidelines_version()
-            _guidelines_block = {
-                "instructions": "MANDATORY: Follow these rules for the entire session. They are authoritative.",
-                "version": _gv,
-                "rules": [g["rule"] for g in guidelines],
-            }
+            _rules = [g["rule"] for g in guidelines]
+            _gh = guidelines_hash(_rules)
+            _g_unchanged = bool(guidelines_held) and guidelines_held.strip() == _gh
+            if _g_unchanged:
+                _guidelines_block = {
+                    "instructions": (
+                        "UNCHANGED — keep following the guideline rules you already "
+                        f"hold from your earlier memory_start_session (hash {_gh})."),
+                    "version": _gv,
+                    "hash": _gh,
+                    "unchanged": True,
+                }
+            else:
+                _guidelines_block = {
+                    "instructions": "MANDATORY: Follow these rules for the entire session. They are authoritative.",
+                    "version": _gv,
+                    "hash": _gh,
+                    "rules": _rules,
+                }
             # Stamp the corpus version the agent actually received. Sessions
             # are otherwise in-process only, so this is a small append-only
             # mongo log (TTL 30d) — the join surface for compliance canaries:
@@ -708,6 +800,8 @@ async def memory_start_session(
                         "instance": claude_instance,
                         "ts": utc_now(),
                         "guidelines_version": _gv,
+                        "guidelines_hash": _gh,
+                        "guidelines_unchanged": _g_unchanged,
                     })
             except Exception:
                 pass
@@ -759,6 +853,8 @@ async def memory_start_session(
         }
     if _registry_warning:
         output["registry_warning"] = _registry_warning
+    if _timezone_warning:
+        output["timezone_warning"] = _timezone_warning
     if _is_worker:
         output["worker"] = {
             "auto_id": claude_instance,
@@ -946,7 +1042,7 @@ async def memory_end_session(
         ids=[handoff_id],
         documents=[handoff_content],
         metadatas=[{
-            "title": f"Handoff: {session_info['task'][:50]}",
+            "title": f"Handoff: {session_title(session_info['task'], summary, 50)}",
             "type": "handoff",
             "status": "active",
             "session_id": session_id,
@@ -963,7 +1059,7 @@ async def memory_end_session(
     # findability gap is part of why orphaned content stayed orphaned.
     if learnings:
         learning_id = generate_doc_id(learnings, "learning")
-        _task_hint = (session_info.get("task") or "").strip()[:60]
+        _task_hint = park_title_task_hint(session_info.get("task"))
         await proj_collection.add(
             ids=[learning_id],
             documents=[learnings],
@@ -989,7 +1085,7 @@ async def memory_end_session(
         ids=[work_id],
         documents=[summary],
         metadatas=[{
-            "title": session_info["task"][:100],
+            "title": session_title(session_info["task"], summary, 100),
             "status": "completed",
             "session_id": session_id,
             "claude_instance": session_info["claude_instance"],

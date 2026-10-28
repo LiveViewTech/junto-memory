@@ -141,6 +141,31 @@ def _recall_stale_handoff(meta):
     return (utc_now() - ts) > timedelta(days=RECALL_HANDOFF_MAX_AGE_DAYS)
 
 
+def _recall_age_days(updated):
+    """Whole days since `updated` (interface:recall-v0 1.4.0), None if undateable.
+    Lets a hook show "· 143d" so a stale header looks stale."""
+    from shared_memory.helpers import parse_timestamp, utc_now
+    ts = parse_timestamp(updated) if updated else None
+    if ts is None:
+        return None
+    return max(0, (utc_now() - ts).days)
+
+
+def _recall_foreign_digest(meta, agent):
+    """Another agent's session digest: a handoff, or an end_session
+    park-summary learning (a list of pointers to that session's learnings).
+    Measured 10-05..10-12 on nimbus: 414 handoff headers served, 1 body
+    pulled; learnings 1,856 served, 32 pulled. The nimbus fleet survey
+    (msg_171e9f2de967) asked for exactly this de-weighting. A digest only
+    summarises; the learnings it points at surface on their own. The
+    requester's OWN digests still surface ("what was my last session doing")."""
+    if meta.get("type") != "handoff":
+        from shared_memory.facets import is_park_summary
+        if not is_park_summary(meta.get("tags")):
+            return False
+    return not agent or meta.get("claude_instance") != agent
+
+
 # Self-echo suppression window: a doc authored by the REQUESTING agent this
 # recently is context it already holds — injecting it back is waste by
 # construction (nimbus first-day case: an agent served its own 10-minute-old
@@ -156,11 +181,14 @@ def _recall_excluded(doc_id, meta, agent):
       is 100% redundant at ANY age — a fresh one is the worst case.
       Interface/design/runbook specs are NOT excluded.
     - stale handoffs (>14d, see above).
+    - other agents' session digests (handoffs, park-summary learnings).
     - self-echo: requester's own docs updated within 48h (only when the
       request identifies the agent)."""
     if str(doc_id).startswith("spec_state_"):
         return True
     if _recall_stale_handoff(meta):
+        return True
+    if _recall_foreign_digest(meta, agent):
         return True
     if agent and meta.get("claude_instance") == agent:
         from datetime import timedelta
@@ -296,9 +324,16 @@ async def _recall_payload(body, api_key, via_tunnel=False):
     # Floor: explicit request threshold wins; else the three-layer config
     # merge (code default 0.6 → server doc → project override).
     floor = threshold
+    _qcfg = query_config.get_effective_config(mongo, project)
     if floor is None:
-        floor = float(query_config.get_effective_config(
-            mongo, project)["recall_floor"])
+        floor = float(_qcfg["recall_floor"])
+    # Chunked arctic2 lane (interface:chunk-index-v0): own floor (chunk cosine
+    # is not the MiniLM scale); an explicit request threshold still wins.
+    from shared_memory import chunk_index
+    chunk_floor = threshold if threshold is not None else float(
+        _qcfg.get("chunk_recall_floor", floor))
+    cvec = await chunk_index.embed_query(qtext) if chunk_index.enabled_for(_qcfg) else None
+    retriever = "minilm"
 
     # Chroma is load-bearing — fail loud, never mask an outage as count:0.
     try:
@@ -315,7 +350,7 @@ async def _recall_payload(body, api_key, via_tunnel=False):
     qvec = None
 
     async def _scan(collection, source, n):
-        nonlocal embed_ms, qvec
+        nonlocal embed_ms, qvec, retriever
         # ONE embedding per request, computed off the event loop, reused by
         # every later scan (backlog_c5dba6d13707). The previous comment here
         # claimed "subsequent calls reuse chroma's per-call embed" — THAT WAS
@@ -328,9 +363,14 @@ async def _recall_payload(body, api_key, via_tunnel=False):
             if qvec is not None:
                 embed_ms = int((_time.monotonic() - t_e) * 1000)
         t_q = _time.monotonic()
-        got = await collection.query(
-            **query_kwargs(qtext, qvec), n_results=n, where=where
-        )
+        got = await chunk_index.scan(collection, cvec, n, where) if cvec is not None else None
+        use_floor = floor
+        if got is not None:
+            use_floor, retriever = chunk_floor, "chunk"
+        else:
+            got = await collection.query(
+                **query_kwargs(qtext, qvec), n_results=n, where=where
+            )
         if embed_ms is None:
             # Fallback path only (embed_query_once failed → query_texts): the
             # first query still carries the embedding, so time it as before.
@@ -344,7 +384,7 @@ async def _recall_payload(body, api_key, via_tunnel=False):
             if _recall_excluded(got["ids"][0][i], meta, agent):
                 continue
             score = calculate_relevance(dist)
-            if score < floor:
+            if score < use_floor:
                 continue
             candidates.append({
                 "id": got["ids"][0][i],
@@ -357,9 +397,34 @@ async def _recall_payload(body, api_key, via_tunnel=False):
                 "_source": source,
             })
 
+    lexical_max = 0
     try:
-        await _scan(await get_project_collection(chroma, project),
-                    f"project:{project}", k)
+        lexical_max = int(_qcfg.get("lexical_max", 0))
+    except Exception:
+        pass
+    lexical = []
+
+    try:
+        proj_col = await get_project_collection(chroma, project)
+        await _scan(proj_col, f"project:{project}", k)
+        # Exact identifier hits (lexical.py) — kept even below the floor.
+        if lexical_max > 0 and qvec is not None:
+            from shared_memory.lexical import lexical_scan
+            for h in await lexical_scan(proj_col, qtext, qvec, where, min(lexical_max, k),
+                                        exclude_ids={c["id"] for c in candidates}):
+                if is_expired(h["meta"]) or _recall_excluded(h["id"], h["meta"], agent):
+                    continue
+                lexical.append({
+                    "id": h["id"],
+                    "type": h["meta"].get("type"),
+                    "title": h["meta"].get("title", "Untitled"),
+                    "score": round(calculate_relevance(h["dist"]), 3),
+                    "match": "exact",
+                    "updated": h["meta"].get("updated") or h["meta"].get("created", ""),
+                    "authored_by": h["meta"].get("claude_instance"),
+                    "_content": h["doc"],
+                    "_source": f"project:{project}",
+                })
         # Shared collections ride along exactly as memory_query's do (max 2
         # each), at the SAME floor — 0.6 already sits above memory_query's
         # shared bump (0.4).
@@ -370,7 +435,7 @@ async def _recall_payload(body, api_key, via_tunnel=False):
         return 500, {"error": f"recall query failed: {e}"}
 
     candidates.sort(key=lambda c: -c["score"])
-    candidates = candidates[:k]
+    candidates = candidates[:max(0, k - len(lexical))] + lexical
 
     # one_line: claim facet when present (mongo best-effort), else content head.
     claims = {}
@@ -393,13 +458,17 @@ async def _recall_payload(body, api_key, via_tunnel=False):
         # corpus without a backfill.
         shape = modality_shape(c.get("title", ""), content)
         c["one_line"] = _recall_one_line(claims.get(c["id"]), content, shape)
+        c["age_days"] = _recall_age_days(c.get("updated"))
         if shape:
             c["shape"] = shape
         snippets.append(c)
 
     if snippets:
         from shared_memory.recall_metrics import log_recall_event
-        log_recall_event(mongo, project, agent, [s["id"] for s in snippets], floor)
+        log_recall_event(mongo, project, agent, [s["id"] for s in snippets], floor,
+                         scores=[s["score"] for s in snippets], query=qtext,
+                         matches=[s.get("match") for s in snippets],
+                         retriever=retriever)
 
     return 200, {
         "project": project,
@@ -512,6 +581,16 @@ def main():
             "active_signals": len(active_signals)
         }, status_code=200 if status == "healthy" else 503)
 
+    # ── Junto Admin (settings / agents / alerts web UI) — admin_ui.py ──
+    from shared_memory.admin_ui import register_admin_routes, register_connection_routes, register_task_routes
+    register_admin_routes(mcp, get_mongo)
+    register_connection_routes(mcp, get_mongo)
+    register_task_routes(mcp, get_mongo)
+
+    # ── Delegated-inference runner API (runners are service principals) — runner_api.py ──
+    from shared_memory.runner_api import register_runner_routes
+    register_runner_routes(mcp, get_mongo)
+
     # ── Dashboard (read-only web UI) ──
 
     dashboard_html_path = Path(__file__).parent / "dashboard.html"
@@ -528,6 +607,11 @@ def main():
     @mcp.custom_route("/dashboard/api/sessions", methods=["GET"])
     async def dashboard_sessions(request):
         from starlette.responses import JSONResponse
+
+        from shared_memory.admin_ui import _lan_only
+        blocked = _lan_only(request)
+        if blocked:
+            return blocked
         sessions = []
         for sid, info in active_sessions.items():
             sessions.append({
@@ -544,6 +628,11 @@ def main():
     @mcp.custom_route("/dashboard/api/agents", methods=["GET"])
     async def dashboard_agents(request):
         from starlette.responses import JSONResponse
+
+        from shared_memory.admin_ui import _lan_only
+        blocked = _lan_only(request)
+        if blocked:
+            return blocked
         db = get_mongo()
         if db is None:
             return JSONResponse({"error": "MongoDB unavailable", "agents": []})
@@ -569,6 +658,11 @@ def main():
     @mcp.custom_route("/dashboard/api/messages", methods=["GET"])
     async def dashboard_messages(request):
         from starlette.responses import JSONResponse
+
+        from shared_memory.admin_ui import _lan_only
+        blocked = _lan_only(request)
+        if blocked:
+            return blocked
         db = get_mongo()
         if db is None:
             return JSONResponse({"error": "MongoDB unavailable", "messages": []})
@@ -596,6 +690,11 @@ def main():
     @mcp.custom_route("/dashboard/api/backlog", methods=["GET"])
     async def dashboard_backlog(request):
         from starlette.responses import JSONResponse
+
+        from shared_memory.admin_ui import _lan_only
+        blocked = _lan_only(request)
+        if blocked:
+            return blocked
         try:
             chroma = await get_chroma()
             all_collections = await chroma.list_collections()
@@ -655,6 +754,11 @@ def main():
         Data is collected for one week to inform the v3 PostCompact decision.
         """
         from starlette.responses import JSONResponse
+
+        from shared_memory.admin_ui import _key_if_required
+        blocked = _key_if_required(request)
+        if blocked:
+            return blocked
         try:
             body = await request.json()
         except Exception:
@@ -681,6 +785,11 @@ def main():
     async def hook_compact_stats(request):
         """Read-only stats for compaction event collection."""
         from starlette.responses import JSONResponse
+
+        from shared_memory.admin_ui import _lan_only
+        blocked = _lan_only(request)
+        if blocked:
+            return blocked
         db = get_mongo()
         if db is None:
             return JSONResponse({"error": "MongoDB unavailable"}, status_code=503)

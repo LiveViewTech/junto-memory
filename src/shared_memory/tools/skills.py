@@ -42,6 +42,7 @@ from typing import List
 from mcp.server.fastmcp import Context
 
 from shared_memory.app import mcp
+from shared_memory.auth import project_allowed
 from shared_memory.clients import get_mongo
 from shared_memory.helpers import (
     _match_path_patterns,
@@ -109,7 +110,12 @@ def _resolve(skills_col, session_id: str, name_or_id: str, project: str):
     or None. project defaults to the caller's session project when resolving
     by name."""
     if name_or_id.startswith("skill_"):
-        return skills_col.find_one({"_id": name_or_id})
+        doc = skills_col.find_one({"_id": name_or_id})
+        # By-id reaches every project; a scoped key sees another project's
+        # skill as not found (tenant isolation R4).
+        if doc is not None and not project_allowed(active_sessions.get(session_id), doc.get("project")):
+            return None
+        return doc
     proj = normalize_project(project) if project else active_sessions[session_id].get("project")
     doc = skills_col.find_one({"project": proj or "", "name": name_or_id})
     if doc is None and proj:

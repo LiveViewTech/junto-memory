@@ -182,7 +182,7 @@ MESSAGE_STATUSES = ["pending", "delivered", "received", "completed", "failed"]
 #   OBLIGATION_RESOLVE_ON_REPLY — an owner's reply RESOLVES (an answer satisfies).
 #   OBLIGATION_RETAIN_ON_REPLY  — an owner's reply marks RESPONDED but the item
 #                                 stays in the action lane until an explicit done.
-OBLIGATION_STATES = ["open", "responded", "resolved"]
+OBLIGATION_STATES = ["open", "responded", "resolved", "lapsed"]  # lapsed: design:action-lapse-v0
 ACTION_CATEGORIES = ["task", "question", "blocker", "contract", "review"]
 OBLIGATION_RESOLVE_ON_REPLY = ["question", "contract", "review"]
 OBLIGATION_RETAIN_ON_REPLY = ["task", "blocker"]
@@ -202,6 +202,9 @@ def classify_lane(category, obligation):
       lane "cleared" — an ACTION-category message whose obligation is resolved
                        (drops OUT of the action lane)
       lane "fyi"     — info / non-action
+      lane "lapsed"  — an ACTION-category message whose obligation lapsed
+                       unanswered (design:action-lapse-v0): out of the action
+                       lane, not deleted, revivable
 
       tier 0 — obligation "open" (or a legacy action message with no obligation):
                an un-engaged ask, top of the action lane
@@ -211,6 +214,8 @@ def classify_lane(category, obligation):
     if category in ACTION_CATEGORIES:
         if obligation == "resolved":
             return "cleared", None
+        if obligation == "lapsed":
+            return "lapsed", None
         # "open" or a legacy pre-lanes-B action message (obligation unset) → tier 0;
         # only an explicit "responded" demotes to tier 1.
         return "action", (1 if obligation == "responded" else 0)

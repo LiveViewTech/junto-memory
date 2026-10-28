@@ -17,8 +17,10 @@ from mcp.server.fastmcp import Context
 
 from shared_memory import push_control
 from shared_memory.app import mcp
+from shared_memory.auth import project_allowed
 from shared_memory.clients import get_mongo
 from shared_memory.helpers import normalize_project, require_session, utc_now
+from shared_memory.state import active_sessions
 
 
 @mcp.tool()
@@ -60,6 +62,10 @@ async def memory_list_alerts(
         project=project,
         limit=limit,
     )
+    # A scoped key sees only alerts for its own projects' agents; the
+    # sample_messages carry other projects' bodies (tenant isolation R5).
+    _me = active_sessions.get(session_id)
+    alerts = [a for a in alerts if project_allowed(_me, a.get("agent_project"))]
 
     # Trim sample bodies for transport (full bodies are in the alert doc,
     # accessible via direct Mongo if needed). 200 chars per sample is plenty
@@ -123,6 +129,8 @@ async def memory_get_emission_stats(
             continue
         if project and entry["project"] != project:
             continue
+        if not project_allowed(active_sessions.get(session_id), entry["project"]):
+            continue  # tenant isolation R5
         # Resolve the agent's effective config (depth_cap/push_budget/hard_ceiling
         # are project-scoped; suspension is per-agent). PyMongo Database does
         # not implement __bool__, so `is not None` is required.
@@ -192,6 +200,8 @@ async def memory_get_emission_stats(
         except Exception as e:
             rows = []
             payload["history_error"] = str(e)
+        rows = [r for r in rows
+                if project_allowed(active_sessions.get(session_id), r.get("project"))]
 
         summary = {}
         for r in rows:

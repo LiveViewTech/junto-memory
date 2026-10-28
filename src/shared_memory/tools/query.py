@@ -6,8 +6,9 @@ from typing import List
 
 from mcp.server.fastmcp import Context
 
-from shared_memory import query_config
+from shared_memory import chunk_index, query_config, rerank
 from shared_memory.app import mcp
+from shared_memory.auth import collection_allowed, project_allowed, scoped_projects
 from shared_memory.clients import get_chroma, get_mongo
 from shared_memory.config import OVERLAP_WINDOW_HOURS, PROJECT_PREFIX, SHARED_PREFIX
 from shared_memory.helpers import (
@@ -155,16 +156,34 @@ async def memory_query(
     # function lives on the collection object); every later scan reuses it.
     _qvec = None
 
+    # Chunked arctic2 lane (interface:chunk-index-v0), per-project flag, default
+    # OFF. Fails open per collection: _vscan falls back to the MiniLM query when
+    # the lane is unusable. Its scores are chunk cosine — own floor.
+    _cvec = await chunk_index.embed_query(query) if chunk_index.enabled_for(_qcfg) else None
+    _chunk_min = float(_qcfg.get("chunk_min_relevance", MIN_RELEVANCE_THRESHOLD))
+
+    # Cross-encoder rerank (interface:rerank-v0), per-project flag, default OFF.
+    # On: each scan returns a wider pool with NO similarity floor and no
+    # access-stat bumps; the rerank step below selects (or, if the service is
+    # down, re-applies today's floors and per-collection caps).
+    _rr = rerank.enabled_for(_qcfg)
+
+    async def _vscan(col, n):
+        """(results, chunked): chunk lane when usable, else the MiniLM query."""
+        if _cvec is not None:
+            got = await chunk_index.scan(col, _cvec, n, where_clause)
+            if got is not None:
+                return got, True
+        return await col.query(**query_kwargs(query, _qvec), n_results=n, where=where_clause), False
+
     # Search project collection if specified
     if project:
         try:
             proj_collection = await get_project_collection(chroma, project)
             _qvec = await embed_query_once(proj_collection, query)
-            proj_results = await proj_collection.query(
-                **query_kwargs(query, _qvec),
-                n_results=limit,
-                where=where_clause
-            )
+            proj_results, _chunked = await _vscan(
+                proj_collection, rerank.pool_size(limit) if _rr else limit)
+            _proj_min = _chunk_min if _chunked else MIN_RELEVANCE_THRESHOLD
 
             if proj_results["documents"] and proj_results["documents"][0]:
                 for i, (doc, meta, dist) in enumerate(zip(
@@ -178,7 +197,7 @@ async def memory_query(
 
                     # Calculate relevance and skip if below threshold
                     relevance = calculate_relevance(dist)
-                    if relevance < MIN_RELEVANCE_THRESHOLD:
+                    if relevance < _proj_min and not _rr:
                         continue
 
                     # Recency filter (optional)
@@ -215,10 +234,55 @@ async def memory_query(
                         "authored_by": meta.get("claude_instance"),
                         "warning": warning if warning else None
                     })
+                    if _rr:
+                        results[-1].update(_sim=relevance, _min=_proj_min, _cap_key="project",
+                                           _text=rerank.doc_text(meta.get("title", ""), doc),
+                                           _col=proj_collection)
 
-                    # Track access (fire-and-forget)
-                    if doc_id:
+                    # Track access (fire-and-forget); rerank mode counts only the served rows
+                    if doc_id and not _rr:
                         await update_access_stats(proj_collection, doc_id)
+
+            # Exact identifier hits (lexical.py) — kept even below the
+            # relevance threshold, flagged match="exact", capped by config.
+            try:
+                _lex_max = int(_qcfg.get("lexical_max", 0))
+            except Exception:
+                _lex_max = 0
+            if _lex_max > 0 and _qvec is not None:
+                from shared_memory.lexical import lexical_scan
+                for h in await lexical_scan(proj_collection, query, _qvec, where_clause,
+                                            min(_lex_max, limit),
+                                            exclude_ids={r["id"] for r in results}):
+                    meta = h["meta"]
+                    if is_expired(meta):
+                        continue
+                    if recency_cutoff is not None:
+                        ts = parse_timestamp(meta.get("updated") or meta.get("created"))
+                        if ts is None or ts < recency_cutoff:
+                            continue
+                    status = meta.get("status", "active")
+                    staleness = format_staleness_warning(meta)
+                    warning = format_status_warning(status, meta.get("superseded_by"))
+                    if staleness:
+                        warning = (warning + " " + staleness).strip() if warning else staleness
+                    results.append({
+                        "source": f"project:{project}",
+                        "id": h["id"],
+                        "title": meta.get("title", "Untitled"),
+                        "type": meta.get("type"),
+                        "status": status,
+                        "relevance": f"{calculate_relevance(h['dist']):.0%}",
+                        "match": "exact",
+                        "created": meta.get("created", ""),
+                        "updated": meta.get("updated", ""),
+                        "age": format_age(meta.get("updated") or meta.get("created")),
+                        "content": h["doc"],
+                        "access_count": meta.get("access_count", 0),
+                        "authored_by": meta.get("claude_instance"),
+                        "warning": warning if warning else None
+                    })
+                    await update_access_stats(proj_collection, h["id"])
         except Exception:
             pass
 
@@ -234,11 +298,10 @@ async def memory_query(
                     # No project scan happened, so this is the first collection
                     # we hold — embed here and the second shared scan reuses it.
                     _qvec = await embed_query_once(shared, query)
-                shared_results = await shared.query(
-                    **query_kwargs(query, _qvec),
-                    n_results=min(2, limit),  # Max 2 from each shared collection
-                    where=where_clause
-                )
+                # Max 2 from each shared collection
+                shared_results, _chunked = await _vscan(
+                    shared, rerank.POOL_SHARED if _rr else min(2, limit))
+                _shared_min = (_chunk_min + 0.1) if _chunked else shared_threshold
 
                 if shared_results["documents"] and shared_results["documents"][0]:
                     for i, (doc, meta, dist) in enumerate(zip(
@@ -252,7 +315,7 @@ async def memory_query(
 
                         # Calculate relevance and skip if below threshold
                         relevance = calculate_relevance(dist)
-                        if relevance < shared_threshold:
+                        if relevance < _shared_min and not _rr:
                             continue
 
                         # Recency filter (optional)
@@ -279,12 +342,28 @@ async def memory_query(
                             "authored_by": meta.get("claude_instance"),
                             "warning": staleness if staleness else None
                         })
+                        if _rr:
+                            results[-1].update(_sim=relevance, _min=_shared_min, _cap_key=shared_name,
+                                               _text=rerank.doc_text(meta.get("title", ""), doc),
+                                               _col=shared)
 
-                        # Track access (fire-and-forget)
-                        if doc_id:
+                        # Track access (fire-and-forget); rerank mode counts only the served rows
+                        if doc_id and not _rr:
                             await update_access_stats(shared, doc_id)
             except Exception:
                 pass
+
+    if _rr and results:
+        _pool = [r for r in results if r.get("match") != "exact"]
+        _exact_rows = [r for r in results if r.get("match") == "exact"]
+        _scores = await rerank.score(query, [r["_text"] for r in _pool])
+        _caps = {"project": limit, "patterns": min(2, limit), "context": min(2, limit)}
+        _kept = rerank.apply(_pool, _scores, float(_qcfg.get("rerank_min", 0.5)), _caps)
+        for r in _kept:
+            if r.get("id") and r.get("_col") is not None:
+                await update_access_stats(r["_col"], r["id"])
+        results = _kept + _exact_rows
+        rerank.strip_private(results)
 
     if not results:
         return json.dumps({
@@ -305,7 +384,24 @@ async def memory_query(
         return (band, -epoch)
 
     results.sort(key=_sort_key)
+    # Exact identifier hits keep their slots; the vector rows fill the rest.
+    _exact = [r for r in results if r.get("match") == "exact"]
+    if _exact:
+        _rest = [r for r in results if r.get("match") != "exact"]
+        results = _rest[:max(0, limit - len(_exact))] + _exact
+        results.sort(key=_sort_key)
     results = results[:limit]
+
+    # Eval-set seeding (recall_metrics.query_events; scripts/retrieval_eval.py).
+    try:
+        from shared_memory.recall_metrics import log_query_event
+        log_query_event(
+            get_mongo(), project, active_sessions.get(session_id, {}).get("claude_instance"),
+            query, [r["id"] for r in results],
+            scores=[int(r["relevance"].rstrip("%")) / 100 for r in results],
+            matches=[r.get("match") for r in results])
+    except Exception:
+        pass
 
     # ── Facets inline delivery (design:memory-facets-v0 §consumer) ──
     # Contract guarantee: when a result row's learning has facets, they ride
@@ -465,10 +561,13 @@ async def memory_get_by_id(
         collections_to_search.append(await get_shared_collection(chroma, "context"))
         collections_to_search.append(await get_shared_collection(chroma, "work"))
     else:
-        # Search all collections
+        # Search all collections (a scoped key: its own projects + shared,
+        # so another project's doc reads as not found — tenant isolation R4)
+        _sess_info = active_sessions.get(session_id)
         all_collections = await chroma.list_collections()
         for col in all_collections:
-            if col.name.startswith(PROJECT_PREFIX) or col.name.startswith(SHARED_PREFIX):
+            if ((col.name.startswith(PROJECT_PREFIX) or col.name.startswith(SHARED_PREFIX))
+                    and collection_allowed(_sess_info, col.name)):
                 collections_to_search.append(col)
 
     async def _found_response(col, found_id: str, meta: dict, doc: str,
@@ -636,6 +735,10 @@ async def memory_get_active_work(
     if project:
         project = normalize_project(project)
 
+    # A scoped key sees only its own projects' agents and work (tenant
+    # isolation R5); _me is None-scoped for everyone else.
+    _me = active_sessions.get(session_id)
+
     # Get from active sessions (in-memory)
     active_work = []
     since_cutoff = None
@@ -650,6 +753,8 @@ async def memory_get_active_work(
             if info.get("is_principal"):
                 continue
             if project and normalize_project(info["project"]) != project:
+                continue
+            if not project_allowed(_me, info.get("project")):
                 continue
             if instance and info["claude_instance"] != instance:
                 continue
@@ -687,6 +792,8 @@ async def memory_get_active_work(
                 updated = meta.get("updated", "")
                 if updated < cutoff:
                     continue
+                if not project_allowed(_me, meta.get("project")):
+                    continue
                 recent_work.append({
                     "title": meta.get("title"),
                     "status": meta.get("status"),
@@ -698,10 +805,27 @@ async def memory_get_active_work(
     except Exception:
         recent_work = []
 
+    # Plugin sessions carry the client's boilerplate task ("junto-inbox
+    # channel plugin") on every agent (backlog_df486507318c). Show the
+    # identity's real task instead: its other session's, else its newest
+    # work-item title in the window, else "".
+    from shared_memory.tools.sessions import _display_task
+    real_task = {}
+    for info in active_sessions.values():
+        t = _display_task(info.get("task"))
+        if t:
+            real_task.setdefault((info["claude_instance"], info["project"]), t)
+    for w in sorted(recent_work, key=lambda w: w.get("updated") or "", reverse=True):
+        if w.get("title"):
+            real_task.setdefault((w.get("claude"), w.get("project")), w["title"])
+    for row in active_work:
+        if not _display_task(row["task"]):
+            row["task"] = real_task.get((row["claude_instance"], row["project"]), "")
+
     # NEW: Include blocked agents info
     blocked_agents = []
     for sid, info in active_sessions.items():
-        if info.get("blocked_by"):
+        if info.get("blocked_by") and project_allowed(_me, info.get("project")):
             blocked_agents.append({
                 "agent": info.get("claude_instance"),
                 "waiting_for": info.get("blocked_by"),
@@ -711,7 +835,16 @@ async def memory_get_active_work(
 
     # NEW: Include recent signals
     cleanup_stale_signals()
-    recent_signals = list(active_signals.values())[:10]
+    recent_signals = list(active_signals.values())
+    if scoped_projects(_me) is not None:
+        # A signal carries no project; resolve it from the sender's session
+        # and drop it when that session is gone or out of scope.
+        recent_signals = [
+            sig for sig in recent_signals
+            if (active_sessions.get(sig.get("from_session")) or {}).get("project")
+            and project_allowed(_me, active_sessions[sig["from_session"]]["project"])
+        ]
+    recent_signals = recent_signals[:10]
 
     return json.dumps({
         "currently_active": active_work[:limit],

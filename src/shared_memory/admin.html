@@ -1,0 +1,373 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Junto Admin</title>
+<style>
+  :root {
+    --bg: #0d1117; --panel: #161b22; --border: #30363d; --text: #c9d1d9;
+    --muted: #8b949e; --accent: #58a6ff; --green: #3fb950; --yellow: #d29922; --red: #f85149;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+         background: var(--bg); color: var(--text); font-size: 14px; }
+  header { background: var(--panel); border-bottom: 1px solid var(--border); padding: 10px 20px;
+           display: flex; flex-wrap: wrap; gap: 12px; justify-content: space-between; align-items: center; }
+  h1 { margin: 0; font-size: 18px; font-weight: 600; }
+  nav button { background: none; border: none; color: var(--muted); font-size: 14px; padding: 6px 10px;
+               cursor: pointer; border-bottom: 2px solid transparent; }
+  nav button.active { color: var(--text); border-bottom-color: var(--accent); }
+  .login { display: flex; gap: 6px; align-items: center; font-size: 12px; color: var(--muted); }
+  input, select { background: var(--bg); color: var(--text); border: 1px solid var(--border);
+                  border-radius: 4px; padding: 4px 6px; font-size: 13px; }
+  button.btn { background: #21262d; color: var(--text); border: 1px solid var(--border); border-radius: 4px;
+               padding: 4px 10px; font-size: 12px; cursor: pointer; }
+  button.btn:hover { border-color: var(--accent); }
+  button.btn:disabled { opacity: .4; cursor: default; }
+  main { padding: 16px 20px; max-width: 1500px; margin: 0 auto; }
+  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 6px; padding: 14px; margin-bottom: 16px; }
+  .panel h2 { margin: 0 0 10px; font-size: 13px; font-weight: 600; color: var(--accent);
+              text-transform: uppercase; letter-spacing: .5px; }
+  .scroll { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th { text-align: left; padding: 6px 8px; color: var(--muted); font-weight: 500; border-bottom: 1px solid var(--border);
+       font-size: 11px; text-transform: uppercase; white-space: nowrap; }
+  td { padding: 7px 8px; border-bottom: 1px solid rgba(48,54,61,.5); vertical-align: top; }
+  .k { font-family: ui-monospace, monospace; font-weight: 600; }
+  .desc { color: var(--muted); font-size: 12px; max-width: 420px; }
+  .muted { color: var(--muted); }
+  .eff { font-family: ui-monospace, monospace; }
+  .ovr { color: var(--yellow); }
+  .pill { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 11px; font-weight: 600; }
+  .ok { background: rgba(63,185,80,.15); color: var(--green); }
+  .warn { background: rgba(210,153,34,.15); color: var(--yellow); }
+  .bad { background: rgba(248,81,73,.15); color: var(--red); }
+  .bar { height: 6px; background: #21262d; border-radius: 3px; min-width: 80px; }
+  .bar > div { height: 6px; border-radius: 3px; }
+  .toolbar { display: flex; gap: 10px; align-items: center; margin-bottom: 12px; flex-wrap: wrap; }
+  .hidden { display: none; }
+  #toast { position: fixed; bottom: 16px; right: 16px; padding: 10px 14px; border-radius: 6px; background: var(--panel);
+           border: 1px solid var(--border); display: none; max-width: 420px; }
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; }
+  .tile { background: var(--panel); border: 1px solid var(--border); border-radius: 6px; padding: 12px; }
+  .tile .n { font-size: 24px; font-weight: 600; }
+  .tile .l { color: var(--muted); font-size: 12px; }
+  a { color: var(--accent); }
+</style>
+</head>
+<body>
+<header>
+  <h1>Junto Admin</h1>
+  <nav id="tabs">
+    <button data-tab="overview" class="active">Overview</button>
+    <button data-tab="settings">Settings</button>
+    <button data-tab="agents">Agents</button>
+    <button data-tab="alerts">Alerts</button>
+    <button data-tab="tasks">Local tasks</button>
+    <button data-tab="connections">Connections</button>
+    <button data-tab="changes">Change log</button>
+  </nav>
+  <div class="login">
+    <span id="who">read-only</span>
+    <input id="key" type="password" placeholder="owner API key" size="18">
+    <button class="btn" id="login">Unlock edits</button>
+    <button class="btn hidden" id="logout">Lock</button>
+  </div>
+</header>
+
+<main>
+  <section id="tab-overview">
+    <div class="tiles" id="tiles"></div>
+    <p class="muted">Activity feed (sessions, messages, backlog): <a href="/dashboard">/dashboard</a> · raw health: <a href="/health">/health</a></p>
+  </section>
+
+  <section id="tab-settings" class="hidden">
+    <div class="toolbar">
+      <label>Scope <select id="scope"></select></label>
+      <span class="muted" id="scope-note"></span>
+    </div>
+    <div id="settings"></div>
+  </section>
+
+  <section id="tab-agents" class="hidden"><div class="panel"><h2>Agents</h2><div class="scroll" id="agents"></div></div></section>
+  <section id="tab-alerts" class="hidden">
+    <div class="toolbar"><label><input type="checkbox" id="all-alerts"> include acknowledged</label></div>
+    <div class="panel"><h2>Alerts</h2><div class="scroll" id="alerts"></div></div>
+  </section>
+  <section id="tab-tasks" class="hidden">
+    <p class="muted">Tasks agents have handed to local-model workers. Owners edit them with memory_schedule; you can pause, resume, run now, or approve here.</p>
+    <div class="panel"><h2>Tasks</h2><div class="scroll" id="tasks"></div></div>
+    <div class="panel"><h2>Recent runs <span class="muted" id="runs-filter"></span></h2><div class="scroll" id="runs"></div></div>
+    <div class="panel"><h2>Runners</h2><div class="scroll" id="runners"></div></div>
+  </section>
+  <section id="tab-connections" class="hidden">
+    <p class="muted">Data connections for local-model tasks. Agents request them; you activate one by entering its secret (that is the approval) or approving it. Secrets are encrypted in the vault and never shown again. <span id="vault-state"></span></p>
+    <div class="panel"><h2>Connections</h2><div class="scroll" id="connections"></div></div>
+    <div class="panel"><h2>Connection audit</h2><div class="scroll" id="conn-audit"></div></div>
+  </section>
+  <section id="tab-changes" class="hidden"><div class="panel"><h2>Settings changes</h2><div class="scroll" id="changes"></div></div></section>
+</main>
+<div id="toast"></div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+function esc(s) { if (s == null) return ''; return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+function age(iso) {
+  if (!iso) return '—';
+  const d = (Date.now() - new Date(iso).getTime()) / 1000;
+  if (isNaN(d)) return '—';
+  if (d < 60) return Math.floor(d) + 's'; if (d < 3600) return Math.floor(d/60) + 'm';
+  if (d < 86400) return Math.floor(d/3600) + 'h'; return Math.floor(d/86400) + 'd';
+}
+function fmt(v) { if (v === null || v === undefined) return '<span class="muted">—</span>'; if (v === '') return '<span class="muted">""</span>'; return esc(JSON.stringify(v)); }
+function toast(msg, bad) { const t = $('toast'); t.textContent = msg; t.style.borderColor = bad ? 'var(--red)' : 'var(--green)'; t.style.display = 'block'; clearTimeout(t._h); t._h = setTimeout(() => t.style.display = 'none', 4000); }
+
+// API key lives only in this tab's sessionStorage; storage may be unavailable.
+let KEY = null; let CAN_WRITE = false;
+try { KEY = sessionStorage.getItem('junto_admin_key'); } catch (e) {}
+async function api(path, opts = {}) {
+  const headers = opts.headers || {};
+  if (KEY) headers['Authorization'] = 'Bearer ' + KEY;
+  if (opts.body) headers['Content-Type'] = 'application/json';
+  const r = await fetch(path, { ...opts, headers });
+  let data; try { data = await r.json(); } catch (e) { data = { error: 'HTTP ' + r.status }; }
+  if (!r.ok && !data.error) data.error = 'HTTP ' + r.status;
+  return data;
+}
+async function checkLogin() {
+  if (!KEY) { CAN_WRITE = false; $('who').textContent = 'read-only'; $('logout').classList.add('hidden'); return; }
+  const me = await api('/admin/api/whoami');
+  if (me.error) { toast('Key rejected: ' + me.error, true); KEY = null; try { sessionStorage.removeItem('junto_admin_key'); } catch (e) {} CAN_WRITE = false; $('who').textContent = 'read-only'; return; }
+  CAN_WRITE = !!me.can_write;
+  $('who').textContent = me.name + ' (' + me.role + ')' + (CAN_WRITE ? '' : ' · not owner: read-only');
+  $('logout').classList.remove('hidden');
+}
+$('login').onclick = async () => { KEY = $('key').value.trim(); $('key').value = ''; try { sessionStorage.setItem('junto_admin_key', KEY); } catch (e) {} await checkLogin(); render(); };
+$('logout').onclick = async () => { KEY = null; try { sessionStorage.removeItem('junto_admin_key'); } catch (e) {} await checkLogin(); render(); };
+
+let TAB = 'overview';
+document.querySelectorAll('#tabs button').forEach(b => b.onclick = () => {
+  document.querySelectorAll('#tabs button').forEach(x => x.classList.toggle('active', x === b));
+  TAB = b.dataset.tab;
+  document.querySelectorAll('main > section').forEach(s => s.classList.toggle('hidden', s.id !== 'tab-' + TAB));
+  render();
+});
+
+async function renderOverview() {
+  const [h, al, ag, cn] = await Promise.all([api('/health'), api('/admin/api/alerts'), api('/admin/api/agents'), api('/admin/api/connections')]);
+  const pendingConn = (cn.connections || []).filter(c => c.status && c.status.startsWith('pending')).length;
+  const agents = ag.agents || [];
+  const fresh = agents.filter(a => a.context_reported_at && (Date.now() - new Date(a.context_reported_at)) < 15*60*1000);
+  const high = fresh.filter(a => (a.context_tokens || 0) >= 500000);
+  const tiles = [
+    ['Server', h.status === 'healthy' ? '<span class="pill ok">healthy</span>' : '<span class="pill bad">' + esc(h.status || h.error) + '</span>'],
+    ['Active sessions', esc(h.active_sessions ?? '—')],
+    ['Open alerts', (al.alerts || []).length ? '<span class="pill warn">' + al.alerts.length + '</span>' : '0'],
+    ['Agents reporting context', fresh.length + ' / ' + agents.length],
+    ['Agents ≥ 500K context', high.length ? '<span class="pill warn">' + high.length + '</span>' : '0'],
+    ['Connections awaiting you', pendingConn ? '<span class="pill warn">' + pendingConn + '</span>' : '0'],
+  ];
+  $('tiles').innerHTML = tiles.map(([l, n]) => '<div class="tile"><div class="n">' + n + '</div><div class="l">' + l + '</div></div>').join('');
+}
+
+async function loadScopes() {
+  const sel = $('scope'); if (sel.options.length) return;
+  const p = await api('/admin/api/projects');
+  sel.innerHTML = '<option value="">Server default (all projects)</option>' + (p.projects || []).map(x => '<option>' + esc(x) + '</option>').join('');
+  sel.onchange = render;
+}
+async function renderSettings() {
+  await loadScopes();
+  const project = $('scope').value;
+  $('scope-note').textContent = project ? 'Project overrides win over the server default.' : 'Server default applies to every project without an override.';
+  const data = await api('/admin/api/settings' + (project ? '?project=' + encodeURIComponent(project) : ''));
+  if (data.error) { $('settings').innerHTML = '<div class="panel bad">' + esc(data.error) + '</div>'; return; }
+  let html = '';
+  for (const sec of data.sections) {
+    html += '<div class="panel"><h2>' + esc(sec.title) + '</h2><div class="scroll"><table><thead><tr><th>Setting</th><th>Code default</th><th>Server</th>' +
+            (project ? '<th>' + esc(project) + '</th>' : '') + '<th>Effective</th><th>' + (CAN_WRITE ? 'Change' : '') + '</th></tr></thead><tbody>';
+    for (const s of sec.settings) {
+      const cur = project ? s.project_value : s.server_value;
+      let edit = '';
+      if (CAN_WRITE) {
+        const id = sec.id + '__' + s.key;
+        const ph = s.secret ? 'new value (hidden)' : (cur ?? s.effective ?? '');
+        const input = s.type === 'bool'
+          ? '<select id="' + id + '"><option value="true">true</option><option value="false">false</option></select>'
+          : '<input id="' + id + '" size="14" ' + (s.secret ? 'type="password" ' : '') + 'placeholder="' + esc(ph) + '">';
+        edit = input + ' <button class="btn" onclick="save(\'' + sec.id + '\',\'' + s.key + '\',\'' + s.type + '\')">Save</button>' +
+               (project && s.project_value !== null ? ' <button class="btn" onclick="resetKey(\'' + sec.id + '\',\'' + s.key + '\')">Clear override</button>' : '');
+      }
+      html += '<tr><td><div class="k">' + esc(s.key) + '</div><div class="desc">' + esc(s.description) + '</div></td>' +
+              '<td class="eff">' + fmt(s.code_default) + '</td><td class="eff">' + fmt(s.server_value) + '</td>' +
+              (project ? '<td class="eff ovr">' + fmt(s.project_value) + '</td>' : '') +
+              '<td class="eff"><b>' + fmt(s.effective) + '</b></td><td style="white-space:nowrap">' + edit + '</td></tr>';
+    }
+    html += '</tbody></table></div></div>';
+  }
+  $('settings').innerHTML = html;
+}
+async function save(section, key, type) {
+  const el = $(section + '__' + key); let v = el.value;
+  if (v === '' && type !== 'str') { toast('Enter a value first', true); return; }
+  if (type === 'int') v = parseInt(v, 10); else if (type === 'float') v = parseFloat(v);
+  const project = $('scope').value || null;
+  const r = await api('/admin/api/settings', { method: 'POST', body: JSON.stringify({ section, key, value: v, project }) });
+  if (r.error) toast(key + ': ' + r.error, true); else toast(key + ' = ' + JSON.stringify(r.effective_after) + ' (' + (project || 'server default') + ')');
+  renderSettings();
+}
+async function resetKey(section, key) {
+  const project = $('scope').value;
+  const r = await api('/admin/api/settings', { method: 'POST', body: JSON.stringify({ section, key, project, reset: true }) });
+  if (r.error) toast(r.error, true); else toast(key + ' override cleared for ' + project);
+  renderSettings();
+}
+
+async function renderAgents() {
+  const d = await api('/admin/api/agents');
+  if (d.error) { $('agents').innerHTML = esc(d.error); return; }
+  let html = '<table><thead><tr><th>Agent</th><th>Project</th><th>Context</th><th></th><th>Reported</th><th>Last seen</th><th>Idle-park</th><th>Role</th></tr></thead><tbody>';
+  for (const a of d.agents) {
+    const pct = a.context_pct ?? null;
+    const color = pct == null ? 'var(--muted)' : pct >= 80 ? 'var(--red)' : pct >= 50 ? 'var(--yellow)' : 'var(--green)';
+    const ctx = a.context_tokens ? Math.round(a.context_tokens / 1000) + 'K' : '—';
+    html += '<tr><td class="k">' + esc(a.instance) + '</td><td>' + esc(a.project) + '</td><td>' + ctx + '</td>' +
+            '<td><div class="bar"><div style="width:' + (pct || 0) + '%;background:' + color + '"></div></div></td>' +
+            '<td class="muted">' + age(a.context_reported_at) + '</td><td class="muted">' + age(a.last_seen) + '</td>' +
+            '<td>' + esc(a.idle_park) + '</td><td class="desc">' + esc((a.role || '').slice(0, 90)) + '</td></tr>';
+  }
+  $('agents').innerHTML = html + '</tbody></table>';
+}
+
+async function renderAlerts() {
+  const d = await api('/admin/api/alerts' + ($('all-alerts').checked ? '?all=1' : ''));
+  const rows = d.alerts || [];
+  if (!rows.length) { $('alerts').innerHTML = '<p class="muted">No alerts.</p>'; return; }
+  let html = '<table><thead><tr><th>When</th><th>Type</th><th>Agent</th><th>Detail</th><th></th></tr></thead><tbody>';
+  for (const a of rows) {
+    const id = a.alert_id || a._id || a.id;
+    html += '<tr><td class="muted">' + age(a.created_at || a.ts) + '</td><td>' + esc(a.alert_type || a.type) + '</td>' +
+            '<td class="k">' + esc((a.agent_instance || a.agent || '') + (a.agent_project ? '@' + a.agent_project : '')) + '</td>' +
+            '<td class="desc">' + esc(a.reason || a.message || JSON.stringify(a.details || '')) + '</td>' +
+            '<td>' + (a.acknowledged ? '<span class="pill ok">acked</span>' : (CAN_WRITE ? '<button class="btn" onclick="ack(\'' + esc(id) + '\')">Acknowledge</button>' : '')) + '</td></tr>';
+  }
+  $('alerts').innerHTML = html + '</tbody></table>';
+}
+$('all-alerts').onchange = render;
+async function ack(id) {
+  const r = await api('/admin/api/alerts/ack', { method: 'POST', body: JSON.stringify({ alert_id: id }) });
+  if (r.error) toast(r.error, true); else toast('Acknowledged');
+  renderAlerts();
+}
+
+async function renderChanges() {
+  const d = await api('/admin/api/changes');
+  const rows = d.changes || [];
+  if (!rows.length) { $('changes').innerHTML = '<p class="muted">No changes made through this page yet. (Changes made with memory_admin are in the server audit log.)</p>'; return; }
+  let html = '<table><thead><tr><th>When</th><th>Who</th><th>Scope</th><th>Setting</th><th>Action</th><th>Before</th><th>After</th></tr></thead><tbody>';
+  for (const c of rows) {
+    html += '<tr><td class="muted">' + esc(new Date(c.ts).toLocaleString()) + '</td><td>' + esc(c.actor) + '</td><td>' + esc(c.scope) + '</td>' +
+            '<td class="k">' + esc(c.section + '.' + c.key) + '</td><td>' + esc(c.action) + '</td><td class="eff">' + fmt(c.effective_before) +
+            '</td><td class="eff">' + fmt(c.effective_after) + '</td></tr>';
+  }
+  $('changes').innerHTML = html + '</tbody></table>';
+}
+
+let RUN_TASK = null;
+async function renderTasks() {
+  const [t, r, rn] = await Promise.all([api('/admin/api/tasks'), api('/admin/api/runs?limit=60' + (RUN_TASK ? '&task_id=' + encodeURIComponent(RUN_TASK) : '')), api('/admin/api/runners')]);
+  const st = (s) => '<span class="pill ' + (s === 'active' ? 'ok' : (s === 'paused' || s === 'deleted') ? 'bad' : 'warn') + '">' + esc(s) + '</span>';
+  let html = '<table><thead><tr><th>Task</th><th>Owner</th><th>Connection</th><th>Status</th><th>Schedule</th><th>Model</th><th>Last run</th><th>Next run</th><th>Fails</th><th>Action</th></tr></thead><tbody>';
+  for (const x of t.tasks || []) {
+    const sched = x.schedule ? (x.schedule.every ? 'every ' + x.schedule.every : x.schedule.cron) : 'one-off';
+    let act = '<button class="btn" onclick="showRuns(\'' + esc(x.task_id) + '\')">Runs</button> ';
+    if (CAN_WRITE) {
+      act += '<button class="btn" onclick="taskAction(\'' + esc(x.task_id) + '\',\'run_now\')">Run now</button> ';
+      if (x.status === 'active') act += '<button class="btn" onclick="taskAction(\'' + esc(x.task_id) + '\',\'pause\')">Pause</button>';
+      else if (x.status === 'paused') act += '<button class="btn" onclick="taskAction(\'' + esc(x.task_id) + '\',\'resume\')">Resume</button>';
+      else if (x.status === 'awaiting_approval') act += '<button class="btn" onclick="taskAction(\'' + esc(x.task_id) + '\',\'approve\')">Approve</button>';
+    }
+    html += '<tr><td class="k">' + esc(x.name) + '<br><span class="muted">' + esc(x.task_id) + ' v' + esc(x.version) + '</span></td><td>' + esc(x.owner) + '</td><td>' + esc(x.scope) + '</td><td>' + st(x.status) +
+            '</td><td>' + esc(sched) + '</td><td>' + esc(x.model) + '</td><td>' + age(x.last_run_at) + '</td><td>' + (x.next_run_at ? esc(new Date(x.next_run_at + (x.next_run_at.endsWith('Z') ? '' : 'Z')).toLocaleTimeString()) : '—') +
+            '</td><td>' + (x.consecutive_failures ? '<span class="pill bad">' + esc(x.consecutive_failures) + '</span>' : '0') + '</td><td>' + act + '</td></tr>';
+  }
+  $('tasks').innerHTML = html + '</tbody></table>';
+  $('runs-filter').innerHTML = RUN_TASK ? '(task ' + esc(RUN_TASK) + ') <a href="#" onclick="showRuns(null);return false">show all</a>' : '(all tasks)';
+  let rh = '<table><thead><tr><th>Queued</th><th>Task</th><th>Status</th><th>Examined</th><th>Routes</th><th>Canary</th><th>Tools</th><th>Took</th><th>Evidence / error</th></tr></thead><tbody>';
+  for (const x of r.runs || []) {
+    const c = x.canary || {}; const can = c.ran ? (c.failed && c.failed.length ? '<span class="pill bad">' + c.passed + '/' + c.expected + '</span>' : '<span class="pill ok">' + c.passed + '/' + c.expected + '</span>') : '—';
+    const rs = x.status === 'done' ? 'ok' : x.status === 'failed' ? 'bad' : 'warn';
+    rh += '<tr><td class="muted">' + age(x.queued_at) + ' ago</td><td>' + esc(x.task_name || x.task_id) + '</td><td><span class="pill ' + rs + '">' + esc(x.status) + '</span></td><td>' + esc(x.items_examined ?? '—') +
+          '</td><td class="eff">' + fmt(x.route_counts) + '</td><td>' + can + '</td><td>' + esc(x.tool_calls_total ?? 0) + '</td><td>' + (x.duration_s != null ? esc(x.duration_s) + 's' : '—') +
+          '</td><td class="eff">' + (x.error ? '<span style="color:var(--red)">' + esc(x.error) + '</span>' : fmt(x.source_evidence)) + '</td></tr>';
+  }
+  $('runs').innerHTML = rh + '</tbody></table>';
+  let nh = '<table><thead><tr><th>Runner</th><th>Host</th><th>Version</th><th>Adapters</th><th>Last heartbeat</th><th>Models</th></tr></thead><tbody>';
+  for (const x of rn.runners || []) {
+    const fresh = x.last_heartbeat && (Date.now() - new Date(x.last_heartbeat + (x.last_heartbeat.endsWith('Z') ? '' : 'Z'))) < 5*60*1000;
+    nh += '<tr><td class="k">' + esc(x.runner_id) + '</td><td>' + esc(x.host) + '</td><td>' + esc(x.version) + '</td><td>' + esc((x.adapters || []).join(', ')) + '</td><td><span class="pill ' + (fresh ? 'ok' : 'bad') + '">' + age(x.last_heartbeat + (x.last_heartbeat && !x.last_heartbeat.endsWith('Z') ? 'Z' : '')) + ' ago</span></td><td class="muted">' + esc((x.models || []).length) + ' models</td></tr>';
+  }
+  $('runners').innerHTML = nh + '</tbody></table>';
+}
+function showRuns(tid) { RUN_TASK = tid; renderTasks(); }
+async function taskAction(tid, action) {
+  const r = await api('/admin/api/tasks/action', { method: 'POST', body: JSON.stringify({ task_id: tid, action }) });
+  if (r.error) toast(r.error, true); else toast(action + ': ' + (r.status || 'ok'));
+  renderTasks();
+}
+
+async function renderConnections() {
+  const d = await api('/admin/api/connections');
+  if (d.error) { $('connections').innerHTML = '<p class="muted">' + esc(d.error) + '</p>'; return; }
+  $('vault-state').innerHTML = d.vault_ready ? '<span class="pill ok">vault ready</span>' : '<span class="pill bad">vault key missing on server</span>';
+  const pill = (st) => '<span class="pill ' + (st === 'active' ? 'ok' : st === 'revoked' ? 'bad' : 'warn') + '">' + esc(st) + '</span>';
+  let html = '<table><thead><tr><th>Connection</th><th>Status</th><th>Type</th><th>Params</th><th>Requested by</th><th>Granted to</th><th>Secret</th><th>Tasks</th><th>Action</th></tr></thead><tbody>';
+  for (const c of d.connections || []) {
+    const id = 'sec_' + c.name.replace(/[^a-z0-9]/gi, '_');
+    let act = '';
+    if (CAN_WRITE) {
+      if (c.secret_kind && c.secret_kind !== 'none' && c.secret_kind !== 'oauth') {
+        act += '<input type="password" id="' + id + '" placeholder="' + esc(c.secret_kind) + '" size="14"> ' +
+               '<button class="btn" onclick="activateConn(\'' + esc(c.name) + '\', \'' + id + '\')">' + (c.secret_set ? 'Rotate' : 'Activate') + '</button> ';
+      } else if (c.secret_kind === 'oauth') {
+        act += '<span class="muted">Google sign-in: coming (phase 3)</span> ';
+      } else if (c.status !== 'active') {
+        act += '<button class="btn" onclick="activateConn(\'' + esc(c.name) + '\', null)">Approve</button> ';
+      }
+      if (c.status !== 'revoked') act += '<button class="btn" onclick="revokeConn(\'' + esc(c.name) + '\')">Revoke</button>';
+    } else { act = '<span class="muted">unlock to edit</span>'; }
+    const secret = c.secret_kind === 'none' || !c.secret_kind ? '<span class="muted">none</span>' :
+      (c.secret_set ? 'set ' + age(c.secret_set_at) + ' ago' + (c.secret_set_by ? ' by ' + esc(c.secret_set_by) : '') :
+       (c.legacy_credential_file ? 'runner file (legacy)' : '<span class="pill warn">missing</span>'));
+    html += '<tr><td class="k">' + esc(c.name) + '</td><td>' + pill(c.status) + '</td><td>' + esc(c.type) + '</td><td class="eff">' + fmt(c.params) +
+            (c.tools_allowed ? '<br><span class="muted">tools: ' + esc(c.tools_allowed.join(', ')) + '</span>' : '') +
+            '</td><td>' + esc(c.requested_by || '—') + '</td><td>' + esc((c.grants || []).join(', ')) + '</td><td>' + secret + '</td><td>' + esc(c.tasks) + '</td><td>' + act + '</td></tr>';
+  }
+  $('connections').innerHTML = html + '</tbody></table>';
+  let a = '<table><thead><tr><th>When</th><th>Who</th><th>What</th><th>Connection</th><th>Detail</th></tr></thead><tbody>';
+  for (const r of d.audit || []) a += '<tr><td class="muted">' + esc(new Date(r.at).toLocaleString()) + '</td><td>' + esc(r.actor) + '</td><td>' + esc(r.kind) + '</td><td>' + esc(r.target) + '</td><td class="eff">' + fmt(r.detail) + '</td></tr>';
+  $('conn-audit').innerHTML = a + '</tbody></table>';
+}
+async function activateConn(name, inputId) {
+  let body = { name };
+  if (inputId) { const el = $(inputId); if (!el.value) { toast('Enter the secret first', true); return; } body.secret = el.value; el.value = ''; }
+  const r = await api('/admin/api/connections/activate', { method: 'POST', body: JSON.stringify(body) });
+  if (r.error) toast(r.error, true); else toast(name + ' active' + (r.tasks_started ? ', ' + r.tasks_started + ' task(s) started' : ''));
+  renderConnections();
+}
+async function revokeConn(name) {
+  if (!confirm('Revoke ' + name + '? Its secret is destroyed and queued runs are cancelled.')) return;
+  const r = await api('/admin/api/connections/revoke', { method: 'POST', body: JSON.stringify({ name }) });
+  if (r.error) toast(r.error, true); else toast(name + ' revoked');
+  renderConnections();
+}
+
+function render() {
+  return ({ overview: renderOverview, settings: renderSettings, agents: renderAgents, alerts: renderAlerts, tasks: renderTasks, connections: renderConnections, changes: renderChanges })[TAB]();
+}
+checkLogin().then(render);
+setInterval(() => { if (TAB === 'overview' || TAB === 'agents' || TAB === 'alerts' || TAB === 'tasks') render(); }, 30000);
+</script>
+</body>
+</html>

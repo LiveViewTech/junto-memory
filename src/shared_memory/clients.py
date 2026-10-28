@@ -82,14 +82,12 @@ async def get_chroma():
 
 @asynccontextmanager
 async def app_lifespan(app):
-    """Lifespan manager for startup tasks + shutdown cleanup.
+    """Idempotently start the process-global background tasks.
 
-    Chroma is lazy-initialized via get_chroma() and not handled here. Tasks that
-    need an event loop (scheduled-message scanner, future periodic jobs) start
-    here. We run with stateless_http=False (app.py), so lifespan is reliable.
+    Runs once per MCP client session (see the note after the yield), so every
+    start_* below must be idempotent and there must be no teardown. Chroma is
+    lazy-initialized via get_chroma() and not handled here.
     """
-    global _chroma_client
-
     # Start the scheduled-message scanner (timed self-messages). Local import
     # avoids load-time cycles between clients.py and tools/scheduler.py.
     try:
@@ -111,20 +109,57 @@ async def app_lifespan(app):
         import logging
         logging.getLogger(__name__).error("lifespan: sse-keepalive startup failed: %s", e)
 
+    # Start the idle→park nudge sweep (idle_park.py).
+    try:
+        from shared_memory.idle_park import start_idle_park
+        start_idle_park()
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).error("lifespan: idle-park startup failed: %s", e)
+
+    # Start the stale-action lapse sweep (action_lapse.py).
+    try:
+        from shared_memory.action_lapse import start_action_lapse
+        start_action_lapse()
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).error("lifespan: action-lapse startup failed: %s", e)
+
+    # Restore persisted sessions + start the snapshot loop (session_persist.py).
+    try:
+        from shared_memory.session_persist import start_session_persist
+        start_session_persist()
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).error("lifespan: session-persist startup failed: %s", e)
+
+    # Start the chunk-index freshness sweep (chunk_index.py, interface:chunk-index-v0).
+    try:
+        from shared_memory.chunk_index import start_chunk_sweep
+        start_chunk_sweep()
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).error("lifespan: chunk-index sweep startup failed: %s", e)
+
+    # Start the delegated-inference scheduler (delegation.py).
+    try:
+        from shared_memory.delegation import start_delegation
+        start_delegation()
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).error("lifespan: delegation startup failed: %s", e)
+
     yield {}
 
-    # Shutdown cleanup.
-    try:
-        from shared_memory.tools.scheduler import stop_scheduler
-        stop_scheduler()
-    except Exception:
-        pass
-    try:
-        from shared_memory.tools.messaging import stop_keepalive
-        stop_keepalive()
-    except Exception:
-        pass
-    _chroma_client = None
+    # NO teardown here. The MCP lowlevel Server.run() enters this lifespan once
+    # PER CLIENT SESSION (mcp/server/lowlevel/server.py run(): enter_async_context
+    # (self.lifespan(self))), not once per process. The old teardown called
+    # stop_scheduler()/stop_keepalive() and reset _chroma_client every time ANY
+    # client disconnected, killing the process-global tasks until the next
+    # session's entry restarted them — 7,328 scheduler restarts in one 8-day
+    # container, and reminders silently stalled in the gaps (backlog_0ef6f4134559,
+    # learning_43fce7ace6a98330). The start_* calls above are idempotent, so each
+    # session entry is a free self-heal; process exit tears everything down.
 
 
 # =============================================================================
@@ -286,7 +321,16 @@ def get_mongo():
         # Ensure indexes for guidelines collection (server-managed agent instructions)
         guidelines_col = _mongo_db.guidelines
         guidelines_col.create_index("scope")
-        guidelines_col.create_index("name", unique=True)
+        # Unique per (name, scope): a project rule like park_on_idle_nudge can
+        # exist once per project. The old name-only unique index made `set`
+        # move the row between scopes (2026-10-26); drop it if present.
+        try:
+            if "name_1" in guidelines_col.index_information():
+                guidelines_col.drop_index("name_1")
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning("guidelines: could not drop legacy name_1 index: %s", e)
+        guidelines_col.create_index([("name", 1), ("scope", 1)], unique=True)
 
         # Seed code-defined GLOBAL guidelines (scope="global") into the DB so a
         # guidance change travels with the deploy to every server — incl. the
@@ -358,6 +402,17 @@ def get_mongo():
             import logging
             logging.getLogger(__name__).error(
                 "directives: code-seed failed: %s", e
+            )
+        # Default skills (default_skills.py): insert-if-absent, so a fresh or
+        # isolated server has the "parking" skill the global rules point at,
+        # and a locally edited copy is never overwritten.
+        try:
+            from shared_memory.default_skills import seed_default_skills
+            seed_default_skills(_mongo_db)
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).error(
+                "skills: default-skill seed failed: %s", e
             )
 
         # Op-log (Phase 1 foundation, design v0.3.0 §4.2). Collection +

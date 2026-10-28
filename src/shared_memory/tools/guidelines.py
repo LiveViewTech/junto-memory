@@ -95,6 +95,26 @@ def bump_guidelines_version(db, actor: str) -> int:
     return int(doc["value"]) if doc else 1
 
 
+def _resolve_named(db, name: str, normalized_scope: str):
+    """Find the guideline row `name` for get/delete -> (doc|None, error|None).
+
+    scope given (not "global") -> that project's row only. scope left at the
+    default "global" -> the global row if one exists, else the single project
+    row with that name; several project rows -> an error naming their scopes.
+    """
+    if normalized_scope != "global":
+        return db.guidelines.find_one({"name": name, "scope": normalized_scope}), None
+    rows = list(db.guidelines.find({"name": name}))
+    for row in rows:
+        if row.get("scope") == "global":
+            return row, None
+    if len(rows) > 1:
+        scopes = sorted(r.get("scope", "") for r in rows)
+        return None, {"error": f"Guideline '{name}' exists in several projects {scopes}; pass scope=<project>",
+                      "scopes": scopes}
+    return (rows[0] if rows else None), None
+
+
 @mcp.tool()
 async def memory_guidelines(
     action: str,
@@ -113,8 +133,9 @@ async def memory_guidelines(
     Actions:
         list   - Show all guidelines (optionally filtered by scope)
         set    - Create or update a guideline (requires name + rule)
-        delete - Remove a guideline by name
-        get    - Get a single guideline by name
+        delete - Remove a guideline by name (+ scope when the name exists in
+                 several projects)
+        get    - Get a single guideline by name (+ scope, same rule)
 
     ⛔ GLOBAL SCOPE IS READ-ONLY THROUGH THIS TOOL. `set` and `delete` on a
     global-scope guideline are refused with an error — global rules are
@@ -124,7 +145,8 @@ async def memory_guidelines(
 
     Args:
         action: One of: list, set, delete, get
-        name: Guideline name (e.g., "freshness_check", "function_registry")
+        name: Guideline name (e.g., "freshness_check", "function_registry").
+            Unique per scope: the same name can be set once in each project.
         rule: The behavioral rule text. Be explicit — agents will follow this literally.
         scope: "global" (all projects) or a project name for project-specific rules
         priority: 1-100, lower = shown first. Default 50.
@@ -160,10 +182,13 @@ async def memory_guidelines(
             return json.dumps({"error": "Both 'name' and 'rule' are required for set action"})
 
         now = utc_now_iso()
-        existing = db.guidelines.find_one({"name": name})
+        # Keyed on (name, scope): the same rule name can exist once per project
+        # (e.g. park_on_idle_nudge in nimbus + junto). Name-only keying moved
+        # the row between scopes on 2026-10-26.
+        existing = db.guidelines.find_one({"name": name, "scope": normalized_scope})
 
         db.guidelines.update_one(
-            {"name": name},
+            {"name": name, "scope": normalized_scope},
             {"$set": {
                 "name": name,
                 "rule": rule,
@@ -192,23 +217,29 @@ async def memory_guidelines(
         # Guard on the TARGET's actual scope, not the (default-global) scope param:
         # a caller deleting a project rule need not pass scope, so we must not
         # infer intent from it. A global row is code-managed and undeletable here.
-        target = db.guidelines.find_one({"name": name})
+        # With a project scope passed, delete exactly that row; without one,
+        # the name must be unambiguous among project rows.
+        target, err = _resolve_named(db, name, normalized_scope)
+        if err:
+            return json.dumps(err)
         if target and target.get("scope") == "global":
             return json.dumps({"error": GLOBAL_WRITE_REFUSAL, "scope": "global", "rejected": True})
-        result = db.guidelines.delete_one({"name": name})
-        if result.deleted_count:
+        result = db.guidelines.delete_one({"_id": target["_id"]}) if target else None
+        if result is not None and result.deleted_count:
             try:
                 from shared_memory.audit import log_audit
-                log_audit("guideline.deleted", "admin", "", {"name": name})
+                log_audit("guideline.deleted", "admin", target.get("scope", ""), {"name": name})
             except Exception:
                 pass
-            return json.dumps({"status": "deleted", "name": name})
+            return json.dumps({"status": "deleted", "name": name, "scope": target.get("scope")})
         return json.dumps({"error": f"Guideline '{name}' not found"})
 
     elif action == "get":
         if not name:
             return json.dumps({"error": "'name' is required for get action"})
-        doc = db.guidelines.find_one({"name": name})
+        doc, err = _resolve_named(db, name, normalized_scope)
+        if err:
+            return json.dumps(err)
         if not doc:
             return json.dumps({"error": f"Guideline '{name}' not found"})
         return json.dumps({

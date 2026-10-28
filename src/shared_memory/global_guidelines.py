@@ -161,7 +161,7 @@ def seed_global_guidelines(db) -> dict:
         code_names.add(name)
         rule = g["rule"]
         priority = max(1, min(100, int(g.get("priority", 50))))
-        existing = db.guidelines.find_one({"name": name})
+        existing = db.guidelines.find_one({"name": name, "scope": "global"})
         if (existing
                 and existing.get("rule") == rule
                 and existing.get("priority") == priority
@@ -170,7 +170,7 @@ def seed_global_guidelines(db) -> dict:
             unchanged += 1
             continue
         db.guidelines.update_one(
-            {"name": name},
+            {"name": name, "scope": "global"},
             {"$set": {
                 "name": name,
                 "rule": rule,

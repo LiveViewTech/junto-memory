@@ -307,6 +307,44 @@ def check_project_access(allowed_projects: List[str], target_project: str) -> bo
     return normalized in [p.lower().replace("-", "_").replace(" ", "_") for p in allowed_projects]
 
 
+def scoped_projects(session_info: Optional[Dict]) -> Optional[List[str]]:
+    """The session's project allow-list, or None when the session is unrestricted.
+
+    Restricted = auth on AND the session's key carries a non-empty project
+    list (interface:project-scope-enforcement-v0). Unscoped keys, keyless
+    soft-auth sessions and auth-disabled servers all return None, so every
+    caller's "is None → no filtering" branch keeps today's behavior.
+    """
+    if not AUTH_ENABLED or not session_info:
+        return None
+    allowed = session_info.get("allowed_projects") or []
+    return list(allowed) if allowed else None
+
+
+def project_allowed(session_info: Optional[Dict], project: Optional[str]) -> bool:
+    """True when the session may touch `project`. A falsy project means shared (always allowed)."""
+    scoped = scoped_projects(session_info)
+    if scoped is None or not project:
+        return True
+    return check_project_access(scoped, project)
+
+
+def collection_allowed(session_info: Optional[Dict], collection_name: str) -> bool:
+    """True when the session may see a Chroma collection: shared ones always, proj_<p> only for allowed p."""
+    from shared_memory.config import PROJECT_PREFIX
+    if collection_name.startswith(PROJECT_PREFIX):
+        return project_allowed(session_info, collection_name[len(PROJECT_PREFIX):])
+    return True
+
+
+def tenant_isolation_error(session_info: Optional[Dict], project: str) -> str:
+    """The R1/R4 rejection text (bare "ERROR:" so error_flag sets isError=True)."""
+    return (
+        f"ERROR: Tenant isolation: your API key does not have access to project '{project}'. "
+        f"Allowed projects: {scoped_projects(session_info) or []}"
+    )
+
+
 def require_auth(session_info: Dict, permission: str, project: str = None) -> Optional[str]:
     """Check auth for a session. Returns error string or None if OK.
 

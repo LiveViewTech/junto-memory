@@ -20,24 +20,34 @@ import shared_memory.tools.guidelines as gl
 
 class FakeGuidelines:
     def __init__(self, docs=None):
-        self.docs = list(docs or [])
+        self.docs = []
+        self._next_id = 0
+        for d in docs or []:
+            self._add(d)
         self.writes = 0
         self.deletes = 0
 
+    def _add(self, d):
+        d = dict(d)
+        d.setdefault("_id", self._next_id)
+        self._next_id += 1
+        self.docs.append(d)
+
+    def find(self, q):
+        return [d for d in self.docs if all(d.get(k) == v for k, v in q.items())]
+
     def find_one(self, q):
-        for d in self.docs:
-            if all(d.get(k) == v for k, v in q.items()):
-                return d
-        return None
+        rows = self.find(q)
+        return rows[0] if rows else None
 
     def update_one(self, q, update, upsert=False):
         self.writes += 1
         vals = update.get("$set", {})
-        existing = self.find_one({"name": vals.get("name")})
+        existing = self.find_one(q)
         if existing:
             existing.update(vals)
         elif upsert:
-            self.docs.append(dict(vals))
+            self._add({**q, **vals})
 
     def delete_one(self, q):
         before = len(self.docs)
@@ -106,3 +116,75 @@ def test_delete_project_scope_without_scope_param_still_works(monkeypatch):
     assert res.get("status") == "deleted"
     assert col.deletes == 1
     assert col.find_one({"name": "nimbus_rule"}) is None
+
+
+# --- Project rules are keyed on (name, scope) ---
+# memory_guidelines keys project rules on (name, scope).
+#
+# 2026-10-26: setting park_on_idle_nudge for nimbus, junto, cerebro and ha in a
+# row left ONE row (scope=ha): `set` upserted on name only, so each call moved
+# the row to the next project and nimbus silently lost its idle policy. The
+# same name must be settable once per project, and get/delete must not pick an
+# arbitrary project's row.
+
+
+def test_same_name_in_two_projects_keeps_both(monkeypatch):
+    col = FakeGuidelines()
+    db = FakeDB(col)
+    r1 = _run(db, monkeypatch, action="set", name="park_on_idle_nudge", rule="A", scope="nimbus")
+    r2 = _run(db, monkeypatch, action="set", name="park_on_idle_nudge", rule="B", scope="junto")
+    assert r1["status"] == "created" and r2["status"] == "created"
+    assert col.find_one({"name": "park_on_idle_nudge", "scope": "nimbus"})["rule"] == "A"
+    assert col.find_one({"name": "park_on_idle_nudge", "scope": "junto"})["rule"] == "B"
+    assert len(col.docs) == 2
+
+
+def test_set_again_updates_only_that_project(monkeypatch):
+    col = FakeGuidelines([
+        {"name": "r", "scope": "nimbus", "rule": "A"},
+        {"name": "r", "scope": "junto", "rule": "B"},
+    ])
+    db = FakeDB(col)
+    res = _run(db, monkeypatch, action="set", name="r", rule="B2", scope="junto")
+    assert res["status"] == "updated"
+    assert col.find_one({"name": "r", "scope": "nimbus"})["rule"] == "A"
+    assert col.find_one({"name": "r", "scope": "junto"})["rule"] == "B2"
+
+
+def test_get_with_scope_returns_that_project(monkeypatch):
+    col = FakeGuidelines([
+        {"name": "r", "scope": "nimbus", "rule": "A"},
+        {"name": "r", "scope": "junto", "rule": "B"},
+    ])
+    res = _run(FakeDB(col), monkeypatch, action="get", name="r", scope="junto")
+    assert res["scope"] == "junto" and res["rule"] == "B"
+
+
+def test_get_without_scope_is_ambiguous_across_projects(monkeypatch):
+    col = FakeGuidelines([
+        {"name": "r", "scope": "nimbus", "rule": "A"},
+        {"name": "r", "scope": "junto", "rule": "B"},
+    ])
+    res = _run(FakeDB(col), monkeypatch, action="get", name="r")
+    assert "error" in res and res["scopes"] == ["junto", "nimbus"]
+
+
+def test_delete_with_scope_removes_only_that_project(monkeypatch):
+    col = FakeGuidelines([
+        {"name": "r", "scope": "nimbus", "rule": "A"},
+        {"name": "r", "scope": "junto", "rule": "B"},
+    ])
+    res = _run(FakeDB(col), monkeypatch, action="delete", name="r", scope="junto")
+    assert res["status"] == "deleted" and res["scope"] == "junto"
+    assert col.find_one({"name": "r", "scope": "nimbus"}) is not None
+    assert col.find_one({"name": "r", "scope": "junto"}) is None
+
+
+def test_delete_without_scope_refuses_when_ambiguous(monkeypatch):
+    col = FakeGuidelines([
+        {"name": "r", "scope": "nimbus", "rule": "A"},
+        {"name": "r", "scope": "junto", "rule": "B"},
+    ])
+    res = _run(FakeDB(col), monkeypatch, action="delete", name="r")
+    assert "error" in res
+    assert col.deletes == 0 and len(col.docs) == 2

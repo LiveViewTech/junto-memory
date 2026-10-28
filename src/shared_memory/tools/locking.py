@@ -6,6 +6,7 @@ from typing import List
 from mcp.server.fastmcp import Context
 
 from shared_memory.app import mcp
+from shared_memory.auth import project_allowed, scoped_projects
 from shared_memory.helpers import (
     is_lock_stale,
     normalize_path,
@@ -216,6 +217,12 @@ async def memory_get_locks(
         # Filter by pattern if specified
         if path_pattern and not path_matches_pattern(file_path, path_pattern):
             continue
+        # A scoped key lists only locks held by its own projects' sessions
+        # (tenant isolation R5). Conflict checks in lock_files still see all.
+        if scoped_projects(active_sessions[session_id]) is not None:
+            holder = active_sessions.get(lock_info.get("session_id")) or {}
+            if not holder.get("project") or not project_allowed(active_sessions[session_id], holder["project"]):
+                continue
 
         lock_data = {
             "file": file_path,

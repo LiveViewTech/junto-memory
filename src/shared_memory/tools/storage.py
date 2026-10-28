@@ -552,4 +552,6 @@ async def memory_record_learning(
         get_mongo(), collection, doc_id, title, details
     ):
         result["facets"] = "extraction scheduled"
+    from shared_memory.context_stamp import stamp as _context_stamp
+    _context_stamp(get_mongo(), session_id, "learning", doc_id)
     return json.dumps(result)

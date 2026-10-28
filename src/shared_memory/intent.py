@@ -16,11 +16,19 @@ the call, so they never appear in per-tool argument schemas.
   (server-team thread 2026-07-30; session_id stamping is the coarse
   fallback). Absent or malformed values are silently dropped — instrumenting
   a write must never block it.
+
+Also here: the `junto_session` → `session_id` ALIAS (msg_50ff99f0ead1). Claude
+desktop / Cowork strips any tool argument named exactly `session_id` before it
+reaches us (anthropics/claude-code#77248); an unknown name passes intact. So
+the discussion profile advertises `junto_session` instead (tool_profiles.py)
+and build_call_tool_handler_with_session_alias renames it back before any
+validation. Every route accepts it; `session_id` itself is unchanged.
 """
 
 import contextvars
 
 INTENT_ID_KWARG = "__intent_id"
+SESSION_ALIAS_KWARG = "junto_session"
 CONTEXT_TOKENS_KWARG = "__context_tokens"
 
 _intent_id_ctx: contextvars.ContextVar[str | None] = contextvars.ContextVar(
@@ -91,5 +99,22 @@ def build_call_tool_handler_with_intent(orig_handler):
         finally:
             _context_tokens_ctx.reset(ctx_token)
             _reset_intent_id(token)
+
+    return wrapped
+
+
+def build_call_tool_handler_with_session_alias(orig_handler):
+    """Rename `junto_session` to `session_id` in incoming arguments.
+
+    Must sit OUTSIDE every wrapper that reads session_id (idle_park). An
+    explicit session_id wins: the alias is then dropped, never merged."""
+
+    async def wrapped(req):
+        args = getattr(req.params, "arguments", None)
+        if isinstance(args, dict) and SESSION_ALIAS_KWARG in args:
+            alias = args.pop(SESSION_ALIAS_KWARG)
+            if not args.get("session_id") and isinstance(alias, str) and alias:
+                args["session_id"] = alias
+        return await orig_handler(req)
 
     return wrapped

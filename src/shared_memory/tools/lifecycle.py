@@ -6,6 +6,7 @@ from typing import List
 from mcp.server.fastmcp import Context
 
 from shared_memory.app import mcp
+from shared_memory.auth import collection_allowed
 from shared_memory.clients import get_chroma, get_mongo
 from shared_memory.config import DOC_STATUSES, WORK_STATUSES
 from shared_memory.helpers import (
@@ -220,6 +221,8 @@ async def memory_change_status(
                 _name = getattr(_c, "name", str(_c))
                 if _name in _searched_names:
                     continue
+                if not collection_allowed(active_sessions.get(session_id), _name):
+                    continue  # never reveal another project's doc (tenant isolation R4)
                 _probe = await _c.get(ids=[doc_id], include=["metadatas"])
                 if _probe.get("ids"):
                     _m = (_probe.get("metadatas") or [{}])[0] or {}
@@ -289,6 +292,10 @@ async def memory_change_status(
     except Exception:
         pass
 
+    # Corrections/retractions mark the actual mistakes (context_stamp.py).
+    from shared_memory.context_stamp import stamp as _context_stamp
+    _context_stamp(None, session_id, "status_change", doc_id, new_status=new_status)
+
     return json.dumps({
         "status": "updated",
         "doc_id": doc_id,
@@ -349,8 +356,9 @@ async def memory_archive_by_tag(
             if col.name == f"{PROJECT_PREFIX}{normalize_project(project)}":
                 target_collections.append(col)
         else:
-            # All project and shared collections
-            if col.name.startswith(PROJECT_PREFIX) or col.name.startswith(SHARED_PREFIX):
+            # All project and shared collections (scoped key: its own + shared, R3)
+            if ((col.name.startswith(PROJECT_PREFIX) or col.name.startswith(SHARED_PREFIX))
+                    and collection_allowed(session_info, col.name)):
                 target_collections.append(col)
 
     for col in target_collections:
@@ -370,12 +378,13 @@ async def memory_archive_by_tag(
                 if meta.get("status") == "archived":
                     continue
 
-                # Archive it
+                # Archive it. previous_status is read BEFORE status is
+                # overwritten, or restore_by_tag would restore to "archived".
+                meta["previous_status"] = meta.get("status", "active")
                 meta["status"] = "archived"
                 meta["archived_at"] = now
                 meta["archived_by"] = session_id
                 meta["archive_reason"] = reason or f"Bulk archive by tag: {tag}"
-                meta["previous_status"] = meta.get("status", "active")
 
                 await col.update(ids=[doc_id], metadatas=[meta])
 
@@ -462,7 +471,8 @@ async def memory_restore_by_tag(
             if col.name == f"{PROJECT_PREFIX}{normalize_project(project)}":
                 target_collections.append(col)
         else:
-            if col.name.startswith(PROJECT_PREFIX) or col.name.startswith(SHARED_PREFIX):
+            if ((col.name.startswith(PROJECT_PREFIX) or col.name.startswith(SHARED_PREFIX))
+                    and collection_allowed(session_info, col.name)):  # tenant isolation R3
                 target_collections.append(col)
 
     for col in target_collections:

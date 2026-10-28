@@ -338,3 +338,32 @@ async def test_record_learning_contradiction_note(monkeypatch):
     assert resp["similar_prior"][0]["relationship"] == "CONTRADICTS"
     assert "CONTRADICTION" in resp["note"]
     assert "learning_prior" in resp["note"]
+
+
+# ---------------------------------------------------------------------------
+# extract vs judge model split (bake-off 2026-10-27, learning_85ee50137127e19c)
+# ---------------------------------------------------------------------------
+
+async def test_extract_and_judge_use_separate_models(monkeypatch):
+    monkeypatch.setenv("JUNTO_CLAIM_GATE_MODEL", "phi4:14b")
+    monkeypatch.setenv("JUNTO_CLAIM_GATE_EXTRACT_MODEL", "qwen3.8:27b")
+    monkeypatch.setenv("JUNTO_CLAIM_GATE_EXTRACT_REASONING", "none")
+    client = _FakeClient(["a claim", "CONSISTENT"])
+    assert await claim_gate.extract_claim(client, "T", "body") == "a claim"
+    await claim_gate.classify_pair(client, "A", "x", "B", "y")
+    extract, judge = (r["json"] for r in client.requests)
+    assert extract["model"] == "qwen3.8:27b"
+    assert extract["reasoning_effort"] == "none"
+    assert judge["model"] == "phi4:14b"
+    assert "reasoning_effort" not in judge
+
+
+async def test_extract_model_defaults_to_gate_model(monkeypatch):
+    monkeypatch.setenv("JUNTO_CLAIM_GATE_MODEL", "phi4:14b")
+    monkeypatch.delenv("JUNTO_CLAIM_GATE_EXTRACT_MODEL", raising=False)
+    monkeypatch.delenv("JUNTO_CLAIM_GATE_EXTRACT_REASONING", raising=False)
+    client = _FakeClient(["a claim"])
+    await claim_gate.extract_claim(client, "T", "body")
+    body = client.requests[0]["json"]
+    assert body["model"] == "phi4:14b"
+    assert "reasoning_effort" not in body

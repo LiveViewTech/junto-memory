@@ -65,7 +65,7 @@ class _FakeChroma:
 def _scripted_chat(responses):
     """Monkeypatch replacement for claim_gate._chat: pops scripted responses
     keyed by the system prompt."""
-    async def chat(client, system, user, max_tokens):
+    async def chat(client, system, user, max_tokens, **kw):
         return responses[system].pop(0)
     return chat
 
@@ -180,7 +180,7 @@ def test_gate_cached_claim_is_reused_not_reextracted(monkeypatch, enabled):
 
 
 def test_model_failure_degrades_to_no_row(monkeypatch, enabled):
-    async def boom(client, system, user, max_tokens):
+    async def boom(client, system, user, max_tokens, **kw):
         raise RuntimeError("endpoint down")
     monkeypatch.setattr(claim_gate, "_chat", boom)
     db, chroma = _FakeMongo(), _FakeChroma()

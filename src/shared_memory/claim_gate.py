@@ -33,7 +33,16 @@ Config (env):
   JUNTO_CLAIM_GATE_URL      OpenAI-compatible base, default
                             http://host.docker.internal:11434/v1 (sage Ollama
                             via the compose host-gateway extra_host).
-  JUNTO_CLAIM_GATE_MODEL    default phi4:14b (contract reference model).
+  JUNTO_CLAIM_GATE_MODEL    default phi4:14b (contract reference model). The
+                            CLASSIFY judge, and the extractor unless overridden.
+  JUNTO_CLAIM_GATE_EXTRACT_MODEL      optional model for claim EXTRACT and the
+                            facets (operation / shelf_life / trigger); unset →
+                            JUNTO_CLAIM_GATE_MODEL. The judge stays on
+                            JUNTO_CLAIM_GATE_MODEL (precision-decisive, see above).
+  JUNTO_CLAIM_GATE_EXTRACT_REASONING  optional reasoning_effort sent with the
+                            extract calls (e.g. "none"). Thinking models (qwen3.x,
+                            gemma4) think by default and spend the whole 8/150/400
+                            token budget on it, returning empty content.
 """
 
 import logging
@@ -102,22 +111,31 @@ def _gate_model() -> str:
     return os.environ.get("JUNTO_CLAIM_GATE_MODEL", "phi4:14b")
 
 
-async def _chat(client, system: str, user: str, max_tokens: int) -> str:
+def _extract_model() -> str:
+    """Model for claim extraction + facets. Bake-off 2026-10-27 (n=150,
+    learning_85ee50137127e19c): qwen3.8:27b beat phi4 on all three; the judge
+    was not tested, so it stays on _gate_model()."""
+    return os.environ.get("JUNTO_CLAIM_GATE_EXTRACT_MODEL") or _gate_model()
+
+
+async def _chat(client, system: str, user: str, max_tokens: int,
+                extract: bool = False) -> str:
     """One /chat/completions call, temperature 0. Returns content ('' on a
     shape surprise); transport errors propagate to the orchestrator's
-    fail-quiet boundary."""
-    resp = await client.post(
-        f"{_gate_url()}/chat/completions",
-        json={
-            "model": _gate_model(),
-            "temperature": 0,
-            "max_tokens": max_tokens,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-        },
-    )
+    fail-quiet boundary. extract=True uses the extraction model/reasoning."""
+    body = {
+        "model": _extract_model() if extract else _gate_model(),
+        "temperature": 0,
+        "max_tokens": max_tokens,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+    }
+    reasoning = os.environ.get("JUNTO_CLAIM_GATE_EXTRACT_REASONING")
+    if extract and reasoning:
+        body["reasoning_effort"] = reasoning
+    resp = await client.post(f"{_gate_url()}/chat/completions", json=body)
     resp.raise_for_status()
     data = resp.json()
     try:
@@ -132,7 +150,7 @@ async def extract_claim(client, title: str, content: str) -> Optional[str]:
     result means this pair is skipped, e.g. a think-mode model ate the
     budget)."""
     user = f"{title}\n\n{content[:CONTENT_HEAD_CHARS]}"
-    raw = await _chat(client, EXTRACT_SYSTEM, user, EXTRACT_MAX_TOKENS)
+    raw = await _chat(client, EXTRACT_SYSTEM, user, EXTRACT_MAX_TOKENS, extract=True)
     claim = " ".join(raw.split())
     return claim or None
 
@@ -189,7 +207,7 @@ def _cache_claim(db, doc_id: str, claim: str) -> None:
         {"$set": {
             "claim": claim,
             "recipe_version": RECIPE_VERSION,
-            "model": _gate_model(),
+            "model": _extract_model(),
             "extracted_at": utc_now_iso(),
         }},
         upsert=True,
