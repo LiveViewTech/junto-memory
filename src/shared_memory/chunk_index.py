@@ -91,7 +91,7 @@ def _get_tokenizer():
 
 def chunk_text(text: str, size: int = CHUNK_SIZE, stride: int = STRIDE) -> List[str]:
     """256-MiniLM-token windows, stride 224 — byte-identical to the measured
-    bake-off (scripts/embed_bakeoff.py _chunks). Short docs are one chunk."""
+    bake-off (maintainer embed bake-off script, not shipped). Short docs are one chunk."""
     if not text:
         return []
     # add_special_tokens=False: [CLS]/[SEP] carry offset (0,0), so a window

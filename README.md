@@ -468,6 +468,7 @@ Agents never handle credentials. An agent **requests** a connection (`memory_run
 - Revoking a connection deletes the ciphertext and cancels queued runs. A run already claimed finishes within its 10-minute lease.
 - Every request, activation, rotation and revocation is in the connection audit (`/admin` → Connections).
 - `JUNTO_VAULT_KEY` lives in `.env`, not in the Mongo backups. A backup holds ciphertext only; losing the key means re-entering the secrets.
+- `JUNTO_DEFAULT_RUNNER_HOSTS` (comma list) sets which runner hosts a newly requested connection may run on. Unset means none: assign hosts in /admin before activating.
 
 ### Running a runner
 
@@ -606,7 +607,7 @@ Server configuration comes from environment variables; `.env.example` documents 
 | `MCP_AUTH_ENABLED` | `false` | Enable API key authentication. When true, keys are validated and scoped and an invalid key is rejected, but a keyless session still falls back to `agent` tier unless `JUNTO_REQUIRE_KEY` is set. Keys are passed either as the `api_key` tool argument or via an `Authorization: Bearer <key>` HTTP header (see [Security](#security)). |
 | `JUNTO_REQUIRE_KEY` | `false` | Reject every keyless session. Use on any server reachable beyond a trusted LAN (see [Auth modes](#auth-modes)). |
 | `JUNTO_TUNNEL_REQUIRES_KEY` | `true` (compose: `false`) | Reject keyless sessions that arrive through a Cloudflare tunnel (`CF-Connecting-IP` header). |
-| `JUNTO_MCP_LAN_IP` | maintainer's LAN IP | IP that port 8080 binds to besides 127.0.0.1 (read by `docker-compose.yml`). Set yours. |
+| `JUNTO_MCP_LAN_IP` | **required, no default** | IP that port 8080 binds to besides 127.0.0.1 (read by `docker-compose.yml`). Compose refuses to start until it is set. |
 | `JUNTO_LOG_QUERY_TEXT` | `true` | Store the text of searches in the metrics collections (90-day TTL). `false` keeps ids/scores but drops the text. |
 | `JUNTO_SESSION_IDLE_HOURS` | `6` | Expire sessions idle this long with no live inbox subscription. `0` disables. |
 | `JUNTO_SESSION_PERSIST` | `true` | Keep session ids valid across a server restart (mirrored to Mongo). |
@@ -626,6 +627,14 @@ Server configuration comes from environment variables; `.env.example` documents 
 | `DB_<NAME>_READONLY` | `true` | Enforce read-only queries. |
 | `DB_<NAME>_TIMEOUT` | `30` | Query timeout in seconds. |
 | `DB_<NAME>_MAX_ROWS` | `500` | Maximum rows returned per query. |
+
+### Host-side tools (not read by the server)
+
+These have **no default**, and each tool exits with a clear message when its variable is unset, so nothing silently targets someone else's machine:
+
+| Variable | Used by |
+|----------|---------|
+| `JUNTO_OLLAMA_URL` | `contrib/local-inference/li.py` (or `--url`); http/https only. |
 
 ---
 

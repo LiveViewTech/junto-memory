@@ -6,6 +6,41 @@ version via `memory_health` (`server_version`).
 
 ## [Unreleased]
 
+## [1.41.3] - 2026-10-28
+
+A lean public tree: personal/home operations material is no longer shipped. Server behaviour is unchanged except one default (delegation runner hosts, below).
+
+### Removed from the shipped tree (moved to the maintainer's private ops repo)
+- `infra/sage/` (sage backup verify + alert units and scripts).
+- `contrib/backup/sync-to-storm.sh` (offsite sync to the maintainer's receiver). Offsite copying of the `contrib/backup` archives is now left to the operator (AGENT_INSTALL step 8).
+- `scripts/check_usage.py` (read a personal Claude credentials path).
+- One-off/maintainer scripts: `weekend_wave_driver.sh`, `envelope_backfill.py`, `restore_oplog_backlog_20260807.py`, `validate_phase_1d/1f/1h.py`, `validate_token_opt_c.py`, `guideline_trim_flip.py` (superseded by `retire_orphan_globals.py`, which stays), `facets_bulk_prep.py`, `facets_wave_instructions.txt`, `librarian_review_prompt.txt`.
+- Retrieval research harnesses: `embed_bakeoff.py`, `rerank_replay.py`, `lane_replay.py`, `retrieval_eval.py`, `chunk_index.py`.
+- `docs/workjunto-pilot-setup.md` (organisation-specific pilot guide).
+- `data/` is no longer tracked (wave outputs/ledgers derived from knowledge-base content) and is now in `.gitignore`.
+- Docs no longer name the maintainer's or the work deployment's hosts/IPs (`junto-server`, `<tailnet-ip>` placeholders).
+
+### Security
+- **Removed a real credential from the tree:** `contrib/test/inbox_resource_smoke.py` and `contrib/test/mcp_stress_harness.py` carried the maintainer's live MongoDB password as an env-var fallback (since 2026-04-26). Both now require `MONGO_PASSWORD` and exit if it is unset. The value remains in git history: treat it as exposed and rotate it (MongoDB was bound to 127.0.0.1 only, which limits but does not remove the exposure).
+- `contrib/runner/junto-runner.py` and `contrib/local-inference/li.py` only pass **http/https** URLs to `urlopen` (a configurable URL could otherwise be `file://`; Semgrep dynamic-urllib-use-detected). The runner's `server` and `ollama` config keys are now **required** (no localhost default).
+
+### Changed
+- **Delegation: new connections no longer default to runner host `sage`.** The default runner hosts for `request_connection` come from `JUNTO_DEFAULT_RUNNER_HOSTS` (comma list). Unset = none: assign hosts in /admin before activating. Set `JUNTO_DEFAULT_RUNNER_HOSTS=<your runner host>` to keep the old one-step flow.
+
+## [1.41.2] - 2026-10-28
+
+### Changed
+- **No home-network defaults in the shipped tree.** Nothing in `src/` changed, so server behaviour is unchanged. Every endpoint that used to fall back to the maintainer's LAN now comes from an env var or argument, and the tool stops with a clear message when it is unset:
+  - `docker-compose.yml`: **`JUNTO_MCP_LAN_IP` is now required** (no default; it used to fall back to the maintainer's home LAN IP and gave other hosts a confusing bind error). Compose stops with "set JUNTO_MCP_LAN_IP in .env". Deployments that already set it (e.g. the work box) are unaffected. Comments no longer name home hosts.
+  - `contrib/local-inference/li.py`: `--url` or **`JUNTO_OLLAMA_URL`** (`DEFAULT_URL` removed).
+  - `scripts/retrieval_eval.py`, `lane_replay.py`, `rerank_replay.py`, `embed_bakeoff.py` (maintainer research scripts): **`JUNTO_OLLAMA_URL`**, checked only when an Ollama call is made. `rerank_replay.py` also reads `JUNTO_RERANK_URL` (default `http://127.0.0.1:8091`, localhost).
+  - `scripts/chunk_index.py`: **`JUNTO_EMBED_URL`** is required for `status`/`sync` (it used to `setdefault` a home address).
+  - `contrib/backup/sync-to-storm.sh`, `infra/sage/junto-backup/junto-backup-verify.sh`: **`OFFSITE_HOST`** (legacy alias `STORM_HOST`), from the environment or `~/.config/junto-backup/offsite.env` (override the path with `JUNTO_OFFSITE_ENV`). Missing → exit 2. sage keeps working through that file.
+  - `contrib/test/{supervisor_pattern_validate,transport_loss_repro}.py`: usage examples say `<peer-host>` (both already required env).
+  - `contrib/context-report/junto-context-report.py` docstring: `<server-host>`.
+  - Tests: fixture hosts are RFC 5737 documentation addresses (`192.0.2.x`).
+  - `.env.example` placeholder `JUNTO_MCP_LAN_IP=192.0.2.10`, plus a "Host-side tools" section. The README gains the matching table.
+
 ## [1.41.1] - 2026-10-28
 
 ### Security

@@ -34,8 +34,8 @@ The `junto` project's first-class agents:
 
 | Agent | Role | Working dir |
 |-------|------|-------------|
-| `memory` | This server. Maintains and improves the MCP shared-memory codebase. | `/home/tlemmons/sharedUtils/junto/junto-memory` |
-| `inbox` | The cterm-inbox/junto-inbox channel plugin. Lives in claudeTerminal repo. | `C:\code\claudeTerminal` (Windows) — formerly `main@claude_terminal` |
+| `memory` | This server. Maintains and improves the MCP shared-memory codebase. | this repo |
+| `inbox` | The cterm-inbox/junto-inbox channel plugin. Lives in claudeTerminal repo. | claudeTerminal repo (Windows host) — formerly `main@claude_terminal` |
 | `control` | The junto-control web UI for human-in-the-loop messaging. | `~/sharedUtils/junto/junto-control` — formerly `claude-control@claudecontrol` |
 | `sub` | RETIRED 2026-10-27 (Tom) — junto-sub kept, not running; do not relaunch without Tom. | `~/sharedUtils/junto/junto-sub` |
 

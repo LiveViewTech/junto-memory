@@ -130,7 +130,7 @@ services:
       # the edge (401 before the request reaches this server) AND claude.ai
       # connectors cannot send a Bearer key — true would hard-block every
       # cloud connector (tom-assistant/advisor/research/DeeAnn). Flip to true
-      # ONLY if the CF Access app on mcp.lemmons.net is ever removed.
+      # ONLY if the CF Access app on the public tunnel hostname is ever removed.
       - JUNTO_TUNNEL_REQUIRES_KEY=${JUNTO_TUNNEL_REQUIRES_KEY:-false}
       # Write-time contradiction gate, classifier stage (claim_gate.py,
       # interface:claim-extraction-v0). Advisory + fail-quiet: with the
@@ -156,14 +156,16 @@ services:
       # where host.docker.internal is not automatic.
       - "host.docker.internal:host-gateway"
     ports:
-      # Bind to loopback + the home LAN IP only — NOT 0.0.0.0 (design:auth-
-      # origin-trust-v0). cloudflared connects locally (127.0.0.1) so the public
-      # tunnel still works; LAN agents reach the LAN IP and stay keyless. This
-      # removes the tailnet (100.89.194.85) and OVH-wg (10.100.0.4) exposure.
-      # Adopters: override JUNTO_MCP_LAN_IP, or drop the second mapping for a
-      # loopback-only (tunnel-only) deployment.
+      # Bind to loopback + one LAN/tailnet IP only — NOT 0.0.0.0 (design:auth-
+      # origin-trust-v0). A local tunnel client (cloudflared) connects via
+      # 127.0.0.1, so a public tunnel still works; agents on that network reach
+      # the IP below. Nothing listens on other interfaces (VPNs, other tailnets).
+      # JUNTO_MCP_LAN_IP is REQUIRED (no default): set it in .env to this host's
+      # LAN or Tailscale IP. Compose refuses to start without it rather than
+      # trying to bind someone else's address. For a loopback-only (tunnel-only)
+      # deployment, drop the second mapping.
       - "127.0.0.1:8080:8080"
-      - "${JUNTO_MCP_LAN_IP:-192.168.15.240}:8080:8080"
+      - "${JUNTO_MCP_LAN_IP:?set JUNTO_MCP_LAN_IP in .env to this host's LAN or Tailscale IP}:8080:8080"
     ulimits:
       nofile:
         soft: 65536

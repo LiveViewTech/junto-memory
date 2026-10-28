@@ -31,6 +31,12 @@ ROUTES = [
 ]
 
 
+@pytest.fixture(autouse=True)
+def _runner_host_default(monkeypatch):
+    # request_connection's default runner hosts come from env (no built-in host).
+    monkeypatch.setenv("JUNTO_DEFAULT_RUNNER_HOSTS", "sage")
+
+
 @pytest.fixture
 def db():
     """A throwaway database on a TEST mongo (JUNTO_TEST_MONGO_URL), never production.
@@ -485,3 +491,12 @@ def test_list_all_tasks_scoped_by_role(db):
     assert ids(di.list_tasks(db, f"{project}/coord", False, all_tasks=True)) == set()
     assert ids(di.list_tasks(db, f"{project}/coord", False, True, project_admin=True)) == {mine}
     assert ids(di.list_tasks(db, f"{project}/coord", True, all_tasks=True)) == {mine, "task_other"}
+
+
+def test_request_connection_default_runner_hosts_from_env(db, monkeypatch):
+    monkeypatch.delenv("JUNTO_DEFAULT_RUNNER_HOSTS", raising=False)
+    di.request_connection(db, OWNER, "mail:nohost", IMAP_CONN)
+    assert db.di_scopes.find_one({"_id": "mail:nohost"})["runner_hosts_allowed"] == []
+    monkeypatch.setenv("JUNTO_DEFAULT_RUNNER_HOSTS", "gpu-a, gpu-b")
+    di.request_connection(db, OWNER, "mail:twohost", IMAP_CONN)
+    assert db.di_scopes.find_one({"_id": "mail:twohost"})["runner_hosts_allowed"] == ["gpu-a", "gpu-b"]

@@ -26,6 +26,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import re
 import secrets
 import uuid
@@ -329,6 +330,15 @@ def validate_task_fields(fields: Dict[str, Any], scope: Dict[str, Any]) -> List[
 
 # ── scopes ─────────────────────────────────────────────────────────────────
 
+def _default_runner_hosts() -> list:
+    """Runner hosts a newly requested connection may run on, from env
+    JUNTO_DEFAULT_RUNNER_HOSTS (comma-separated, e.g. "gpu-box-1"). Unset =
+    none: an operator assigns hosts in /admin before activating. No built-in
+    host name, so a deployment never defaults to someone else's machine."""
+    raw = os.environ.get("JUNTO_DEFAULT_RUNNER_HOSTS", "")
+    return [h.strip() for h in raw.split(",") if h.strip()]
+
+
 SCOPE_FIELDS = {"adapter", "adapter_config", "tools", "runner_hosts_allowed", "grants", "content_visible_to",
                 "restricted", "approval", "notes", "secret_kind"}
 
@@ -435,10 +445,10 @@ def request_connection(db, who: str, name: str, conn: Dict[str, Any]) -> Dict[st
     if secret_kind not in SECRET_KINDS:
         return {"error": f"connection.secret: one of {sorted(SECRET_KINDS)}"}
     if ctype == "gmail" and secret_kind != "oauth":
-        return {"error": "gmail connections use secret 'oauth' (Tom's Google sign-in, gmail.readonly)"}
+        return {"error": "gmail connections use secret 'oauth' (the owner's Google sign-in, gmail.readonly)"}
     doc = {
         "_id": name, "adapter": ctype, "adapter_config": params, "secret_kind": secret_kind,
-        "runner_hosts_allowed": ["sage"], "grants": [who], "content_visible_to": [who],
+        "runner_hosts_allowed": _default_runner_hosts(), "grants": [who], "content_visible_to": [who],
         "restricted": False, "approval": "none", "notes": str(conn.get("notes") or "")[:1000],
         "status": "pending_secret" if secret_kind != "none" else "pending_approval",
         "requested_by": who, "created_at": _now(), "created_by": who,

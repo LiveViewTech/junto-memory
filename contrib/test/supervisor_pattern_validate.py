@@ -9,10 +9,10 @@ and (c) build a fresh HTTPMCPClient + run another inner task.
 If this passes, the supervisor pattern is the right structure for the
 sync_engine fix.
 
-Usage (from sage):
-    JUNTO_PEER_URL=http://192.168.15.66:8080/mcp \
+Usage (from the primary host):
+    JUNTO_PEER_URL=http://<peer-host>:8080/mcp \
     JUNTO_PEER_KEY=<peer-admin-key> \
-    PEER_SSH_HOST=192.168.15.66 \
+    PEER_SSH_HOST=<peer-host> \
     python contrib/test/supervisor_pattern_validate.py
 """
 

@@ -7,7 +7,7 @@ is no longer in GLOBAL_GUIDELINES. A server upgraded from an older build (e.g.
 the June 0e2a7ce work box: 15 pre-trim globals) would otherwise serve the old
 and the new rule sets side by side. memory_guidelines refuses global edits
 (321808d), so this is the supported cleanup. It supersedes
-guideline_trim_flip.py for upgrades: it inserts nothing (the seed does that,
+guideline_trim_flip.py (maintainer-only, no longer shipped) for upgrades: it inserts nothing (the seed does that,
 with the CURRENT text) and works before or after the first boot.
 
 What it does (dry-run unless --execute):

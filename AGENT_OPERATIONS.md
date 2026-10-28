@@ -89,7 +89,7 @@ ls -la ~/mongo-backups/  | tail -20
 # Recent activity in the backup logs
 tail -50 /tmp/chroma-backup.log
 tail -50 /tmp/mongo-backup.log
-tail -50 /tmp/storm-sync-backup.log     # if offsite is configured
+# plus your offsite copy's log, if you set one up
 
 # Cron schedule
 crontab -l | grep backup

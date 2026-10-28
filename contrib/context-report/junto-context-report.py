@@ -10,7 +10,7 @@ memory_report_context over MCP at JUNTO_SHARED_MEMORY_URL.
 Uses MCP (not direct Mongo) because the Mongo port is localhost-only on the server box
 while :8080/mcp is reachable fleet-wide — so this same script works on madrox, HA, etc.
 On the server box the default localhost URL is correct; off-box set
-JUNTO_SHARED_MEMORY_URL=http://sage:8080/mcp (or 192.168.15.240) in the service env.
+JUNTO_SHARED_MEMORY_URL=http://<server-host>:8080/mcp in the service env.
 
 (Filename kept as sage-context-report.py so the existing sage service/timer are unchanged;
 the script itself is box-agnostic.) interface:context-tokens-sideband-v0.
@@ -32,6 +32,8 @@ import subprocess
 import time
 
 try:
+    # Pin mcp==1.30.0 (venv on minimal boxes): the 2.x SDK renamed
+    # streamablehttp_client and this import then fails (learning_6126ed75e9ab0d29).
     from mcp import ClientSession
     from mcp.client.streamable_http import streamablehttp_client
 except ImportError:
@@ -59,6 +61,7 @@ GAP_RE = re.compile(r"\s{8,}")  # right-aligned hint text sharing the input row
 
 
 _pids = {}  # agent -> every local pid carrying JUNTO_AGENT (for the tmux pane lookup)
+_homes = {}  # (agent, cwd) -> the claude process's HOME (transcripts live under it)
 
 
 def running_agents():
@@ -80,31 +83,129 @@ def running_agents():
         except OSError:
             continue
         _pids.setdefault(agent, []).append(int(pid))
+        _homes.setdefault((agent, cwd), env.get("CLAUDE_CONFIG_DIR") or
+                          os.path.join(env.get("HOME") or os.path.expanduser("~"), ".claude"))
         yield agent, cwd
 
 
-def collect():
+# --- transcript fallback ------------------------------------------------------------
+# Claude Code runs the statusLine command only while a client renders the TUI.
+# With no tmux client attached (an unattended agent), context-metrics.json
+# goes stale, and after an idle-park auto-reset (/clear + go) it keeps the OLD
+# large context, so the server's >=200K gate nudges the fresh agent again
+# every hour (msg_52b595b1e603). The session transcript is written on every
+# turn regardless of rendering, so it is the fallback source.
+
+TAIL_CHUNK = 64 * 1024
+TAIL_MAX = 4 * 1024 * 1024  # never read more than this from the end of a transcript
+
+
+def transcript_dir(config_dir, cwd):
+    """~/.claude/projects/<slug>: CC's slug replaces every non-alphanumeric
+    character of the cwd with '-' (/tmp/claude-1000/-home-x -> -tmp-claude-1000--home-x)."""
+    return os.path.join(config_dir, "projects", re.sub(r"[^A-Za-z0-9]", "-", cwd))
+
+
+def _last_usage(path):
+    """(usage, timestamp) of the last assistant entry with message.usage, read
+    backwards in chunks from the end of the file. (None, None) if not found."""
+    with open(path, "rb") as fh:
+        fh.seek(0, os.SEEK_END)
+        end = fh.tell()
+        pos, buf = end, b""
+        while pos > 0 and end - pos < TAIL_MAX:
+            step = min(TAIL_CHUNK, pos)
+            pos -= step
+            fh.seek(pos)
+            buf = fh.read(step) + buf
+            lines = buf.split(b"\n")
+            buf = lines[0] if pos > 0 else b""   # keep a partial first line for the next chunk
+            for raw in reversed(lines[1:] if pos > 0 else lines):
+                if b'"usage"' not in raw or b'"assistant"' not in raw:
+                    continue
+                try:
+                    entry = json.loads(raw)
+                except ValueError:
+                    continue
+                if entry.get("type") != "assistant":
+                    continue
+                usage = (entry.get("message") or {}).get("usage")
+                if isinstance(usage, dict):
+                    return usage, entry.get("timestamp")
+    return None, None
+
+
+def transcript_context(config_dir, cwd):
+    """{context_tokens, written_at, session_id} from the newest transcript for
+    cwd, or None. Matches statusline.sh: total input (incl. cache read and
+    creation) + output of the last turn."""
+    d = transcript_dir(config_dir, cwd)
+    files = glob.glob(os.path.join(d, "*.jsonl"))
+    if not files:
+        return None
+    newest = max(files, key=os.path.getmtime)
+    usage, ts = _last_usage(newest)
+    if not usage:
+        return None
+    tokens = sum(int(usage.get(k) or 0) for k in (
+        "input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens", "output_tokens"))
+    if tokens <= 0:
+        return None
+    if not ts:
+        ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(os.path.getmtime(newest)))
+    return {"context_tokens": tokens, "written_at": ts,
+            "session_id": os.path.basename(newest)[:-len(".jsonl")]}
+
+
+def _ts_key(ts):
+    """Comparable key for ISO timestamps with or without fractional seconds / Z."""
+    if not ts:
+        return ""
+    return str(ts).replace("Z", "").replace("+00:00", "").split(".")[0]
+
+
+def collect(details=None):
+    """One report per agent from the fresher of its statusline sideband file
+    and its newest session transcript. `details`, if a dict, receives
+    agent -> {metrics, transcript, chosen} (used by --dry-run)."""
     freshest = {}
     for agent, cwd in running_agents():
-        path = os.path.join(cwd, ".claude", "context-metrics.json")
+        m = None
         try:
-            with open(path) as fh:
+            with open(os.path.join(cwd, ".claude", "context-metrics.json")) as fh:
                 m = json.load(fh)
-        except (OSError, ValueError):
+            if not isinstance(m.get("context_tokens"), int):
+                m = None
+        except (OSError, ValueError, AttributeError):
+            m = None
+        t = None
+        try:
+            t = transcript_context(_homes.get((agent, cwd)) or os.path.expanduser("~/.claude"), cwd)
+        except Exception:  # fail soft: the sideband file alone, as before
+            t = None
+        if m and (not t or _ts_key(m.get("written_at")) >= _ts_key(t["written_at"])):
+            chosen = dict(m, source="statusline")
+        elif t:
+            chosen = {"context_tokens": t["context_tokens"],
+                      "context_window": (m or {}).get("context_window"),
+                      "written_at": t["written_at"], "source": "transcript"}
+            if chosen["context_window"]:
+                chosen["context_pct"] = chosen["context_tokens"] * 100 // chosen["context_window"]
+        else:
             continue
-        if agent not in freshest or m.get("written_at", "") > freshest[agent].get("written_at", ""):
-            freshest[agent] = m
+        if details is not None:
+            details[agent] = {"cwd": cwd, "metrics": m, "transcript": t, "chosen": chosen}
+        if agent not in freshest or _ts_key(chosen.get("written_at")) > _ts_key(freshest[agent].get("written_at")):
+            freshest[agent] = chosen
     reports = []
     for agent, m in freshest.items():
-        tokens = m.get("context_tokens")
-        if not isinstance(tokens, int):
-            continue
         reports.append({
             "instance": agent,
-            "context_tokens": tokens,
+            "context_tokens": m["context_tokens"],
             "context_window": m.get("context_window"),
             "context_pct": m.get("context_pct"),
             "written_at": m.get("written_at"),
+            "source": m.get("source"),
         })
     return reports
 
@@ -360,4 +461,10 @@ RUN_DEADLINE_SECONDS = int(os.environ.get("JUNTO_CTX_REPORT_DEADLINE", "40"))
 
 if __name__ == "__main__":
     signal.alarm(RUN_DEADLINE_SECONDS)
+    if "--dry-run" in sys.argv[1:]:
+        # Print each agent's sources and the chosen report; no server calls.
+        info = {}
+        collect(info)
+        print(json.dumps(info, indent=2, default=str))
+        sys.exit(0)
     asyncio.run(run())

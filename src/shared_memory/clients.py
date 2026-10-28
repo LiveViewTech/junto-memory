@@ -255,7 +255,7 @@ def get_mongo():
         # to MONGO_DB and authentication fails on fresh installs — server
         # comes up but every mongo-backed call (guidelines, agent_directory,
         # messages, audit_log, op_log) silently returns empty.
-        # See PR #1 / Issue tlemmons-lvt for the install-time repro.
+        # See PR #1 for the install-time repro.
         # URL-escape credentials: a password from a password manager routinely
         # carries reserved URI chars (/ @ + % :) that a plain f-string would
         # mangle into a malformed URI -> silent auth failure on fresh installs.

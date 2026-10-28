@@ -392,7 +392,7 @@ async def memory_query(
         results.sort(key=_sort_key)
     results = results[:limit]
 
-    # Eval-set seeding (recall_metrics.query_events; scripts/retrieval_eval.py).
+    # Eval-set seeding (recall_metrics.query_events; maintainer retrieval-eval harness, not shipped).
     try:
         from shared_memory.recall_metrics import log_query_event
         log_query_event(

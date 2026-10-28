@@ -40,12 +40,12 @@ def audit_sink(monkeypatch):
 @pytest.fixture
 def registry(monkeypatch):
     monkeypatch.setitem(db_mod.DB_REGISTRY, "stg_ro", {
-        "type": "mysql", "host": "192.168.15.75", "port": 3306,
+        "type": "mysql", "host": "192.0.2.75", "port": 3306,
         "database": "picFrame", "user": "junto_staging_ro", "password": "x",
         "read_only": True, "query_timeout": 30, "max_rows": 1000,
     })
     monkeypatch.setitem(db_mod.DB_REGISTRY, "stg_rw", {
-        "type": "mysql", "host": "192.168.15.75", "port": 3306,
+        "type": "mysql", "host": "192.0.2.75", "port": 3306,
         "database": "picFrame", "user": "junto_staging_rw", "password": "x",
         "read_only": False, "query_timeout": 30, "max_rows": 1000,
     })

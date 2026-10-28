@@ -524,7 +524,7 @@ Then restart WSL (`wsl --shutdown` from PowerShell). Without this, WSL2 cannot r
 
 Before running setup, you need from the server admin (Tom or whoever manages the server):
 - Your API key: `smk_...` (shown once at provisioning — if lost, admin must create a new one)
-- The server URL: `http://<hostname>:8080/mcp` (e.g., `http://spg-junto-central:8080/mcp`)
+- The server URL: `http://<hostname>:8080/mcp` (e.g., `http://junto-server:8080/mcp`)
 - Your project name (lowercase): e.g., `awareness`, `ispy`, `junto`
 
 ### 8.3 Clone the Launcher
@@ -611,7 +611,7 @@ Then in Claude, type `go`. Your agent will check in with the server, load contex
 
 A healthy startup looks like:
 ```
-junto: launching agentName@projectname → http://spg-junto-central:8080/mcp
+junto: launching agentName@projectname → http://junto-server:8080/mcp
 junto: push plugin enabled
 ```
 
@@ -709,8 +709,8 @@ Edit `.env`. Required fields:
 | `MCP_AUTH_ENABLED` | `true` for any non-localhost deployment |
 | `JUNTO_REQUIRE_KEY` | `true` — rejects all keyless sessions (recommended when clients have provisioned keys) |
 | `JUNTO_TUNNEL_REQUIRES_KEY` | `true` — rejects keyless sessions arriving via tunnel |
-| `JUNTO_MCP_LAN_IP` | The IP address clients will connect to (Tailscale IP or LAN IP). **Required** — if unset, the server tries to bind `192.168.15.240` (the home server's IP) and will fail. |
-| `ORIGIN_SERVER_ID` | A unique identifier for this deployment (e.g., `spg-central`, `acme-central`). Not `central` — that is the home server's value. |
+| `JUNTO_MCP_LAN_IP` | The IP address clients will connect to (Tailscale IP or LAN IP). **Required** — if unset, `docker compose` refuses to start with "set JUNTO_MCP_LAN_IP in .env". |
+| `ORIGIN_SERVER_ID` | A unique identifier for this deployment (e.g., `acme-central`). Not `central` — that is the home server's value. |
 
 Leave `ANTHROPIC_API_KEY` commented unless you want the librarian enrichment daemon.
 
@@ -878,7 +878,7 @@ crontab -e
 
 After 24 hours, verify: `ls -la ~/chroma-backups/ ~/mongo-backups/`
 
-Optionally set up offsite sync via `contrib/backup/sync-to-storm.sh` (SSH to a backup host).
+Copying the archives offsite (rsync/sftp to another host, or your backup tool) is left to the operator.
 
 ### 10.13 Docker Auto-Restart on Host Reboot
 
@@ -1034,7 +1034,7 @@ Current Claude Code requires `"type": "http"` in the junto MCP entry. Omitting i
   "mcpServers": {
     "junto": {
       "type": "http",
-      "url": "http://spg-junto-central:8080/mcp",
+      "url": "http://junto-server:8080/mcp",
       "headers": { "Authorization": "Bearer smk_..." }
     }
   }
@@ -1069,7 +1069,7 @@ These variables are set by junto-launch.sh from `~/.junto/config` and exported t
 | `JUNTO_PROJECT` | launcher (from CLAUDE.md) | Project namespace |
 | `JUNTO_COMPONENT` | launcher (from CLAUDE.md, optional) | Sub-group within project |
 | `JUNTO_ROLE` | `~/.junto/config` | One-line role description for the system prompt |
-| `JUNTO_MEMORY_URL` | `~/.junto/config` | MCP server URL (e.g., `http://spg-junto-central:8080/mcp`) |
+| `JUNTO_MEMORY_URL` | `~/.junto/config` | MCP server URL (e.g., `http://junto-server:8080/mcp`) |
 | `JUNTO_SHARED_MEMORY_URL` | launcher (bridges JUNTO_MEMORY_URL) | Same as JUNTO_MEMORY_URL; plugin reads this name |
 | `JUNTO_API_KEY` | `~/.junto/config` | Bearer auth key for the server |
 | `JUNTO_CHANNEL_DELAY` | `~/.junto/config` | Delay (ms) before first push delivery. Set to 15000 if messages arrive in mailbox but not as live push. |
@@ -1144,7 +1144,7 @@ Every server variable, with its code default, is documented in `.env.example`. R
 | `tlemmons/junto-inbox` | https://github.com/tlemmons/junto-inbox | Claude Code channel plugin (SSE push) |
 | `tlemmons/junto-control` | https://github.com/tlemmons/junto-control | Optional web dashboard |
 
-For LVT teams: fork `tlemmons/junto` and `tlemmons/junto-memory` to your GitHub org. Set up a GitHub Actions upstream-sync workflow to get a PR when the public repo advances. Review the diff before merging — this is how security tooling maintains visibility over what code is running.
+For teams in another GitHub org: fork `tlemmons/junto` and `tlemmons/junto-memory` to your GitHub org. Set up a GitHub Actions upstream-sync workflow to get a PR when the public repo advances. Review the diff before merging — this is how security tooling maintains visibility over what code is running.
 
 ---
 

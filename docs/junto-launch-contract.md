@@ -96,7 +96,7 @@ successful `memory_start_session`).
 ```json
 { "mcpServers": { "junto": {
   "type": "http",
-  "url": "http://spg-junto-central:8080/mcp",
+  "url": "http://junto-server:8080/mcp",
   "headers": { "Authorization": "Bearer smk_…" }
 }}}
 ```
@@ -122,7 +122,7 @@ registry, or any file. So the launch MUST export, into the plugin's launch envir
 
 - `JUNTO_SHARED_MEMORY_URL` — the server URL. **Mandatory for any non-localhost server.** The
   plugin's built-in default is `http://localhost:8080/mcp`; if you don't set this, the plugin
-  silently tries localhost and never reaches a remote server (e.g. spg-junto-central). This is
+  silently tries localhost and never reaches a remote server (e.g. junto-server). This is
   the #1 work-box footgun.
 - `JUNTO_API_KEY` — **required whenever the server runs `MCP_AUTH_ENABLED=true` / `JUNTO_REQUIRE_KEY=true`** (work). Omitted-if-unset is correct only for a keyless server (home).
 - `JUNTO_AGENT`, `JUNTO_PROJECT` — bind the right inbox. Optional: `JUNTO_COMPONENT`,
@@ -204,10 +204,10 @@ host is managed. Use this as the per-environment setup checklist.
 |---|---|---|
 | R1 forcing | Required (via global `~/.claude/CLAUDE.md`) | Required (rendered prompt or CLAUDE.md) |
 | R2 identity | Required | Required |
-| R3 MCP URL | Required — hardcoded in `.mcp.json` (`sage.lemmons.net:8080`) | Required — `spg-junto-central:8080` (or tailnet `100.83.241.96`) |
+| R3 MCP URL | Required — hardcoded in `.mcp.json` (`<home-server>:8080`) | Required — `junto-server:8080` (or tailnet `<tailnet-ip>`) |
 | R3 Bearer key | **Omit** — server runs `MCP_AUTH_ENABLED=false` | **Required** — `JUNTO_REQUIRE_KEY=true` rejects keyless |
 | R4a `channelsEnabled` + plugin allowlist | Already set globally (one-time, done) | **One-time CC-settings step on each new machine** — without it the plugin silently won't load (≠ per-launch; do it once at setup) |
-| R4b `JUNTO_SHARED_MEMORY_URL` | Must be set if plugin host ≠ server¹ | **Required** — localhost default won't reach `spg-junto-central` |
+| R4b `JUNTO_SHARED_MEMORY_URL` | Must be set if plugin host ≠ server¹ | **Required** — localhost default won't reach `junto-server` |
 | R4b `JUNTO_API_KEY` | **Omit** — keyless server | **Required** — auth on; scope to the launch env only |
 | R4 prerequisite | `bun` on PATH (plugin spawns `bun server.ts`) | `bun` on PATH |
 | R5 MDM persistence | **Not needed** — unmanaged | Needed **only** on a corporate-managed machine |

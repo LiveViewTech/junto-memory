@@ -16,10 +16,10 @@ Mail is opened read-only (IMAP EXAMINE + BODY.PEEK).
 
 Config (JSON, mode 600), default ~/.config/junto-runner/config.json:
 {
-  "server": "http://localhost:8080",
-  "runner_id": "sage-1",
+  "server": "http://<junto-server>:8080",
+  "runner_id": "gpu-1",
   "key_file": "~/.config/junto-runner/runner.key",
-  "ollama": "http://localhost:11434",
+  "ollama": "http://<ollama-host>:11434",
   "poll_seconds": 20,
   "num_ctx_buckets": [8192, 16384],      (optional; see run_context)
   "num_ctx_max": {"qwen2.5:72b": 4096},  (optional per-model cap)
@@ -51,6 +51,7 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from html.parser import HTMLParser
 
@@ -60,12 +61,28 @@ log = logging.getLogger("junto-runner")
 
 # ── config + HTTP ──────────────────────────────────────────────────────────
 
+def _require_http(url, what="URL"):
+    """Only http(s) may reach urlopen: a configurable URL could otherwise be
+    file:// or another urllib scheme (Semgrep dynamic-urllib-use-detected)."""
+    scheme = urllib.parse.urlsplit(str(url)).scheme.lower()
+    if scheme not in ("http", "https"):
+        raise ValueError(f"{what} must be http:// or https://, got {url!r}")
+    return url
+
+
 def load_config(path):
     path = os.path.expanduser(path)
     with open(path) as fh:
         cfg = json.load(fh)
-    cfg.setdefault("server", "http://localhost:8080")
-    cfg.setdefault("ollama", "http://localhost:11434")
+    # No defaults for the two endpoints: the runner may live on a different box
+    # from both the junto server and Ollama, so a guess is worse than an error.
+    for k in ("server", "ollama"):
+        if not cfg.get(k):
+            raise SystemExit(f"config {path}: '{k}' is required (e.g. \"http://<host>:{8080 if k == 'server' else 11434}\")")
+        try:
+            _require_http(cfg[k], f"config '{k}'")
+        except ValueError as e:
+            raise SystemExit(f"config {path}: {e}")
     cfg.setdefault("poll_seconds", 20)
     cfg.setdefault("scopes", {})
     cfg.setdefault("workers", 1)
@@ -115,6 +132,7 @@ def open_sealed(cfg, sealed):
 
 def _post(url, body, headers=None, timeout=60):
     data = json.dumps(body).encode()
+    _require_http(url)
     req = urllib.request.Request(url, data=data, method="POST",
                                  headers={"Content-Type": "application/json", **(headers or {})})
     try:
@@ -128,6 +146,7 @@ def _post(url, body, headers=None, timeout=60):
 
 
 def _get(url, timeout=10):
+    _require_http(url)
     with urllib.request.urlopen(url, timeout=timeout) as resp:
         return json.loads(resp.read() or b"{}")
 

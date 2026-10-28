@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""li.py — one-shot local inference on sage's Ollama (stdlib only; Linux/Windows).
+"""li.py — one-shot local inference on an Ollama box (stdlib only; Linux/Windows).
+
+Endpoint: --url or env JUNTO_OLLAMA_URL (Ollama base URL, e.g. http://<host>:11434).
+There is no default; the script exits if neither is set.
 
   python li.py -i "Classify each line as error|warn|noise" -f app.log --per-line \
       --schema '{"type":"object","properties":{"label":{"enum":["error","warn","noise"]}},"required":["label"]}'
@@ -12,11 +15,12 @@ Use the model for labels and names; COUNT with grep/sort/uniq — model counts a
 """
 import argparse
 import json
+import os
 import sys
 import time
+import urllib.parse
 import urllib.request
 
-DEFAULT_URL = "http://192.168.15.240:11434"
 MAX_CHARS = 60_000       # whole-text cap (~15K tokens; fits the 16K context)
 MAX_LINES = 500          # --per-line cap
 
@@ -56,6 +60,8 @@ def call(url, model, instructions, text, schema, timeout, think="auto"):
     t = think_for(model, think)
     if t is not None:
         body["think"] = t
+    if urllib.parse.urlsplit(url).scheme.lower() not in ("http", "https"):
+        raise ValueError(f"Ollama URL must be http:// or https://, got {url!r}")
     req = urllib.request.Request(url.rstrip("/") + "/api/chat", data=json.dumps(body).encode(),
                                  headers={"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -72,12 +78,15 @@ def main():
     ap.add_argument("--schema", help="JSON schema string or @path for structured output")
     ap.add_argument("--per-line", action="store_true", help="one call per non-empty line")
     ap.add_argument("-m", "--model", default="gpt-oss:20b")
-    ap.add_argument("--url", default=DEFAULT_URL)
+    ap.add_argument("--url", default=os.environ.get("JUNTO_OLLAMA_URL"),
+                    help="Ollama base URL (default: env JUNTO_OLLAMA_URL; required)")
     ap.add_argument("--timeout", type=int, default=240)
     ap.add_argument("--think", default="auto", choices=["auto", "off", "low", "medium", "high"],
                     help="reasoning effort; auto = low for gpt-oss, off for qwen3")
     ap.add_argument("-o", "--out", help="write JSON here instead of stdout")
     a = ap.parse_args()
+    if not a.url:
+        sys.exit("no Ollama URL: pass --url http://<host>:11434 or set JUNTO_OLLAMA_URL")
 
     if a.file:
         with open(a.file, encoding="utf-8", errors="replace") as fh:
@@ -113,7 +122,7 @@ def main():
         try:
             output = call(a.url, a.model, a.instructions, text, schema, a.timeout, a.think)
         except TimeoutError:
-            sys.exit(f"timed out after {a.timeout}s: sage is busy or the input is too big; "
+            sys.exit(f"timed out after {a.timeout}s: the Ollama box is busy or the input is too big; "
                      "try -m phi4:14b, a smaller input, or --timeout")
         out = {"output": output, "chars": len(text)}
     out.update({"model": a.model, "seconds": round(time.time() - t0, 1)})

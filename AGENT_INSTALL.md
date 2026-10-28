@@ -213,10 +213,10 @@ Backups are NOT enabled by first-time install. Without them, `docker volume rm` 
 
 ```bash
 ls contrib/backup/
-# backup-chroma.sh  backup-mongo.sh  sync-to-storm.sh
+# backup-chroma.sh  backup-mongo.sh
 ```
 
-The first two dump local archives to `~/chroma-backups/` and `~/mongo-backups/` with 14-backup rotation. The third syncs them to a remote host over SSH (optional, requires SSH key setup).
+They dump local archives to `~/chroma-backups/` and `~/mongo-backups/` with 14-backup rotation. Copying those archives offsite (rsync/sftp to another host, or your backup tool) is left to the operator; junto does not ship an offsite sync script.
 
 To wire them into cron:
 
@@ -225,8 +225,6 @@ crontab -e
 # Add:
 0 3 * * * /full/path/to/contrib/backup/backup-chroma.sh
 15 3 * * * /full/path/to/contrib/backup/backup-mongo.sh
-# (Optional offsite, only if SSH to a backup host is configured)
-0 4 * * * /full/path/to/contrib/backup/sync-to-storm.sh
 ```
 
 `[CONFIRM]` paths with the human — `crontab -e` opens in their `$EDITOR`.

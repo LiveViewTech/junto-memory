@@ -8,7 +8,7 @@ so the join lives here:
   recall_events  one row per /recall response with count>0:
                  {ts, project, agent, ids, floor, scores, matches, query}.
                  TTL 90d (was 7d; raised 2026-10-24 so the retrieval eval
-                 harness can seed real queries — scripts/retrieval_eval.py).
+                 harness can seed real queries — the maintainer retrieval-eval harness, not shipped).
   recall_pulls   one row per memory_get_by_id fetch of a doc that was
                  injected to the SAME project within the last 24h:
                  {ts, doc_id, agent, project, event_ts}. TTL 90d.

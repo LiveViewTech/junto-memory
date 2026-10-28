@@ -31,7 +31,7 @@ operation; the classification is not.
 Config (env):
   JUNTO_CLAIM_GATE_ENABLED  "true" to enable (default false — dormant).
   JUNTO_CLAIM_GATE_URL      OpenAI-compatible base, default
-                            http://host.docker.internal:11434/v1 (sage Ollama
+                            http://host.docker.internal:11434/v1 (the host's Ollama
                             via the compose host-gateway extra_host).
   JUNTO_CLAIM_GATE_MODEL    default phi4:14b (contract reference model). The
                             CLASSIFY judge, and the extractor unless overridden.
