@@ -4,6 +4,8 @@
 
 A human is welcome to follow this too — it's just denser than they're used to.
 
+> **Fastest path — use [`junto-stack`](https://github.com/tlemmons/junto-stack) instead.** It wraps this server in a compose file that **self-bootstraps** the Mongo replica set: `docker compose up -d` and you're done, no keyfile or `rs.initiate()` steps. Use THIS document only to run junto-memory standalone from its own repo — it covers the two manual DB-bootstrap steps (Steps 2.5 and 3) that junto-stack automates for you.
+
 ---
 
 ## What you are installing
@@ -45,11 +47,11 @@ Ports needed on the host: `8080` (MCP), `8001` (Chroma), `27019` (Mongo). If any
 
 ```bash
 cd ~  # or wherever the human prefers
-git clone https://github.com/tlemmons/mcp-shared-memory.git
-cd mcp-shared-memory
+git clone https://github.com/tlemmons/junto-memory.git
+cd junto-memory
 ```
 
-`[CONFIRM]` if the human wants the install rooted somewhere other than `~/mcp-shared-memory`.
+`[CONFIRM]` if the human wants the install rooted somewhere other than `~/junto-memory`.
 
 ---
 
@@ -77,6 +79,21 @@ Ignore the `DB_*_*` external-database section in `.env.example` unless the human
 
 ---
 
+## Step 2.5 — Generate the Mongo keyfile
+
+The server runs Mongo as a single-node **replica set** (it needs multi-document transactions + change streams). Replica-set + auth together require an internal-auth **keyfile**, which is deliberately NOT in the repo (it's a secret; `.gitignore` excludes `secrets/`). Generate it before first start:
+
+```bash
+mkdir -p secrets
+openssl rand -base64 756 > secrets/mongo-keyfile
+chmod 400 secrets/mongo-keyfile
+sudo chown 999:999 secrets/mongo-keyfile   # 999 = the mongo user inside the container
+```
+
+Without this file the `mongodb` container will not start. (junto-stack generates it for you automatically.)
+
+---
+
 ## Step 3 — Start the services
 
 ```bash
@@ -84,6 +101,17 @@ docker compose up -d
 ```
 
 This builds the `mcp-server` image and starts all three containers. Expect 1–3 minutes the first time (image build + first-run init).
+
+**Then initiate the replica set (one-time, required).** The mongo image starts the daemon with `--replSet rs0` but never runs `rs.initiate()`; until it does there is no primary and every write fails with "No primary exists" — *even though the mongo container's own healthcheck reports healthy*. Run this once (idempotent — safe to re-run):
+
+```bash
+set -a; source .env; set +a
+docker exec mcp-mongodb mongosh --quiet --norc \
+  "mongodb://$MONGO_USER:$MONGO_PASSWORD@localhost:27017/?directConnection=true&authSource=admin" \
+  --eval 'try { const s = rs.status(); if (s.ok && s.members && s.members.some(m => m.stateStr === "PRIMARY")) { print("rs0 already initialized"); quit(0); } } catch (e) { const r = rs.initiate({_id:"rs0",members:[{_id:0,host:"mongodb:27017"}]}); if(!r.ok){print("initiate failed: "+JSON.stringify(r));quit(1);} print("rs0 initiated"); } for (let i=0;i<30;i++){ try{ if(db.hello().isWritablePrimary){print("primary elected");quit(0);} }catch(e){} sleep(1000);} print("no primary"); quit(1);'
+```
+
+Expect `rs0 initiated` then `primary elected` (or `rs0 already initialized` on a re-run). (junto-stack runs this for you via a one-shot init service.)
 
 While it runs, you can watch logs:
 
@@ -101,7 +129,7 @@ When you see `Uvicorn running on http://0.0.0.0:8080`, the server is up. Press `
 curl -s http://localhost:8080/health
 ```
 
-Expected: an HTTP 200 with a small JSON body. Any other response means something is wrong — see "If health check fails" below.
+Expected: `{"status":"healthy","chroma":"healthy","mongo":"healthy",...}`. `"status":"healthy"` means **both** stores are up AND Mongo has a writable primary — so on this standalone path it stays `"degraded"` (HTTP 503, with `"mongo":"no primary..."`) until you've run the `rs.initiate()` step in Step 3. Any non-`healthy` status means something is wrong — see "If health check fails" below.
 
 Also verify all three containers are running:
 
@@ -124,7 +152,7 @@ Add to `~/.claude.json` (Claude Code, global) **or** to `.mcp.json` in a specifi
 ```json
 {
   "mcpServers": {
-    "shared-memory": {
+    "junto": {
       "type": "http",
       "url": "http://localhost:8080/mcp"
     }
@@ -138,7 +166,7 @@ For non-localhost installs (other host on the LAN, Tailscale, etc.), replace `lo
 
 `[CONFIRM]` with the human which MCP client(s) they're using and whether the config should be global or per-project.
 
-After config, the human restarts their MCP client. They should now see the `shared-memory` server with ~47 tools available (`memory_*`).
+After config, the human restarts their MCP client. They should now see the `junto` server with 50+ tools available (`memory_*`).
 
 ---
 
@@ -151,7 +179,7 @@ memory_start_session(project="test", claude_instance="install-test",
     role_description="One-shot smoke test agent")
 ```
 
-Expected: a JSON response with a `session_id`, an empty (or near-empty) `learnings` list, and a `guidelines` block with about 13 rules.
+Expected: a JSON response with a `session_id`, an empty (or near-empty) `learnings` list, and a `guidelines` block (a handful of server-managed rules; the exact set evolves — don't treat the count as fixed).
 
 If you get an MCP transport error, the client config is wrong. If you get a Python traceback in the response, the server is running but something is broken — capture the traceback and surface it to the human.
 
@@ -175,7 +203,7 @@ If you get an MCP transport error, the client config is wrong. If you get a Pyth
 
 6. Provide the key to the MCP client by adding `"headers": {"X-API-Key": "<value>"}` to the client's MCP config block.
 
-The auth model has four tiers: `owner` (full admin + can create keys), `admin` (manage one project), `user` (human-tier, autopilot bypass), `agent` (default tier). When `MCP_AUTH_ENABLED=true`, missing keys fall back to `agent` tier (this is "soft auth" — see the architecture spec for the full security posture). Hardening the default beyond soft auth is a separate decision.
+The auth model has four tiers: `owner` (full admin + can create keys), `admin` (manage one project), `user` (human-tier — messages sent from it are forced to chain_depth 0), `agent` (default tier). When `MCP_AUTH_ENABLED=true`, missing keys fall back to `agent` tier (this is "soft auth" — see the architecture spec for the full security posture). Hardening the default beyond soft auth is a separate decision.
 
 ---
 
@@ -214,9 +242,9 @@ After 24 hours, verify the backups are landing: `ls -la ~/{chroma,mongo}-backups
 You can declare the install successful when ALL of these are true:
 
 - [ ] `docker compose ps` shows three containers, all `Up` or `Up (healthy)`.
-- [ ] `curl -s http://localhost:8080/health` returns 200.
-- [ ] The human's MCP client lists `shared-memory` with ~47 tools.
-- [ ] `memory_start_session(project="test", ...)` returns a session_id.
+- [ ] `curl -s http://localhost:8080/health` returns `"status":"healthy"` (both `chroma` and `mongo` healthy — a 503/`degraded` means you skipped `rs.initiate()`).
+- [ ] The human's MCP client lists `junto` with 50+ tools.
+- [ ] **The real proof:** `memory_start_session(...)` then `memory_record_learning(...)` then read it back with `memory_query(...)` — a persisted write is the authoritative "it works", not the health check.
 - [ ] If auth was enabled: the owner key is stored somewhere durable, NOT in the conversation.
 - [ ] If non-localhost install: auth is enabled.
 
@@ -230,9 +258,9 @@ Report all six results to the human.
 
 The server isn't up yet. `docker compose ps` — is `mcp-server` running? If `Restarting`, check its logs.
 
-If logs show `pymongo.errors.ServerSelectionTimeoutError`: Mongo isn't ready or auth is wrong. Check `MONGO_USER`/`MONGO_PASSWORD` in `.env` match what compose sees: `docker compose config | grep MONGO`. Restart: `docker compose down && docker compose up -d`.
+If logs show `pymongo.errors.ServerSelectionTimeoutError`: the server can't reach a Mongo **primary**. In order of likelihood: (1) you skipped the `rs.initiate()` step (Step 3) — run it; the replica set has no primary until you do. (2) The `mongodb` container isn't `Up` — a missing `secrets/mongo-keyfile` (Step 2.5) stops it; `docker compose ps` and `docker compose logs mongodb`. (3) `MONGO_USER`/`MONGO_PASSWORD` in `.env` don't match what compose sees: `docker compose config | grep MONGO`. (Auth errors surface distinctly as `Authentication failed`, not a selection timeout.)
 
-If logs show `chromadb.errors.ChromaError` or similar: Chroma volume mount is wrong. **This is the bug that caused the April 2026 data loss.** The `docker-compose.yml` mounts `chroma-persistent:/data`. Do not change to `/chroma/chroma`. If you're seeing this on a fresh install with the unchanged compose file, surface to the human — something else is wrong.
+If logs show `chromadb.errors.ChromaError` or similar: Chroma volume mount is wrong. **This is the bug that caused the April 2026 data loss.** The `docker-compose.yml` mounts the `chroma-data` volume at `/data` inside the container. Do not change the `/data` path (e.g. to `/chroma/chroma`). If you're seeing this on a fresh install with the unchanged compose file, surface to the human — something else is wrong.
 
 ### Port already in use
 

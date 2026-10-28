@@ -215,7 +215,7 @@ Every reply increments a **chain depth**. Once a conversation chain exceeds the 
 messages in that chain.
 
 - This cap is **unconditional** — it does not consult whether a human is present. A deep
-  autopilot loop gets quietly contained regardless.
+  automated reply loop gets quietly contained regardless.
 - It is **silent containment, not an alarm**: the message still **persists** and is still
   **pullable** by the recipient. Nothing is lost. There's just no push, and no operator
   alert — a depth-cap trip is considered normal conversation shape, not an incident.
@@ -236,14 +236,11 @@ Two limits cap how much any single agent can push in a rolling hour:
   directions), and fires an out-of-band webhook to the operator dashboard. Suspension is
   the bounded "this agent is misbehaving, a human should look" state.
 
-(There is a separate, recipient-side rate limit on how fast an agent will *auto-process*
-inbound messages on autopilot — distinct from the sender-side push budget above. It
-exists so a flood of inbound work can't drive unbounded automatic replies.)
 
 ### 7.4 Destructive-content gate
 If an **automated** (non-human, mid-chain) message's body contains a destructive pattern
 — `DELETE FROM`, `DROP TABLE/DATABASE/…`, `TRUNCATE TABLE`, `git push --force`, `rm -rf`
-— the system flags it **require_human**. The recipient's autopilot then refuses to act on
+— the system flags it **require_human**. The recipient's client then refuses to act on
 it automatically; it surfaces to a human to approve, reject, or rewrite.
 
 - The patterns are matched **case-sensitively on the dangerous forms** (real destructive

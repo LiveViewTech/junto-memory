@@ -6,6 +6,8 @@ Component of the Junto suite. The shared-memory MCP server — persistent knowle
 
 **Your name is: `memory`** (project: `junto`).
 
+**Override:** if a `.agent-name` file exists in this repo or its parent (written by the launcher) or the system prompt assigns a different identity (e.g. `juntoTom`), that identity wins. Use it for `/rename`, the terminal title, and every `memory_*` call, and read `state:<that name>` instead of `state:memory`. The `memory` identity applies only to the agent that maintains this server (on sage).
+
 **IMMEDIATELY on session start, run these commands IN ORDER:**
 
 1. Rename this session (for resume list):
@@ -131,6 +133,8 @@ The "near-verbatim, do not paraphrase" rule is load-bearing. Summarizing the spe
 
 Complete every step before `memory_end_session`. The state spec is the load-bearing artifact.
 
+Baseline: invoke the junto `park` skill (canonical checklist, includes the Jira-update step). The steps below are the junto-memory-specific format and remain in force; if they differ from the skill, the skill wins on the common steps.
+
 1. **Register functions.** Every new or significantly modified function:
    ```
    memory_register_function(name, file="src/shared_memory/...:LINE", purpose, gotchas, project="junto")
@@ -241,7 +245,7 @@ This applies doubly to junto-memory itself: you're the project that owns the rec
 1. **Use Task subagents for research, not your main context.** Every file read stays in context permanently. `Task(subagent_type="Explore")` for finding/exploring; direct reads only when you know the file + line range.
 2. **Find before read.** `memory_find_function` before opening source.
 3. **Filter memory queries.** `assigned_to`, `limit`, specific queries.
-4. **Park before you die.** Quality degrades gradually. Park around ~100 exchanges or when you notice quality dropping. Clean restart from state spec beats limping with degraded context.
+4. **Park on evidence, not vibes.** On 1M-context models use the server-guideline bands: <500K tokens = keep working (do NOT park mid-task "to preserve context"); 500–800K = watch for degradation symptoms (re-reading known files, re-asking settled questions, contradicting earlier decisions), park at the next clean stopping point; >800K = park even mid-task with detailed handoff. Any park recommendation must cite the actual token count and/or named symptoms (learning_11048dc8b45c1bfc). The old "~100 exchanges" rule was calibrated to 200K contexts and is superseded. Parking is not free — unrecorded texture dies at park; clean restart beats limping ONLY when degradation is real.
 
 ---
 

@@ -62,6 +62,11 @@ async def memory_add_backlog_item(
     if priority not in BACKLOG_PRIORITIES:
         return json.dumps({"error": f"Invalid priority. Must be one of: {BACKLOG_PRIORITIES}"})
 
+    # Write-lint parity (backlog_8d33a63e2626): strip a leaked tool-call envelope
+    # and re-route swallowed params before description enters the doc / op-log.
+    from shared_memory.write_lint import recover_envelope_leak
+    description, project, _lint_notes = recover_envelope_leak(description, "description", project)
+
     tags = tags or []
     chroma = await get_chroma()
     session_info = active_sessions[session_id]
@@ -130,8 +135,8 @@ async def memory_add_backlog_item(
         },
     )
 
-    return json.dumps({
-        "status": "added",
+    result = {
+        "status": "added_with_recovery" if _lint_notes else "added",
         "id": backlog_id,
         "title": title,
         "priority": priority,
@@ -139,7 +144,16 @@ async def memory_add_backlog_item(
         "assigned_to": assigned_to,
         "target_version": target_version,
         "deferred_reason": deferred_reason
-    })
+    }
+    if _lint_notes:
+        result["write_lint"] = _lint_notes
+        result["action_required"] = (
+            "Your tool-call emission is malformed — it serialized the call's own "
+            "XML envelope into `description`. The server repaired this write, but "
+            "it cannot repair the client. Fix the emission; see write_lint above "
+            "for what was recovered."
+        )
+    return json.dumps(result)
 
 
 @mcp.tool()
@@ -160,6 +174,10 @@ async def memory_list_backlog(
 ) -> str:
     """
     List backlog items with optional filters.
+
+    ALWAYS pass project and/or assigned_to — an unfiltered call returns many
+    items and floods your context (typical: project=YOUR_PROJECT,
+    assigned_to=YOUR_NAME).
 
     Args:
         session_id: Your session ID
@@ -387,18 +405,51 @@ async def memory_update_backlog_item(
                 meta["edit_count"] = meta.get("edit_count", 0) + 1
 
                 # Move to different project if requested
+                moved = False
                 if project:
                     project = normalize_project(project)
-                    meta["project"] = project
                     new_collection = await get_project_collection(chroma, project)
-                    await new_collection.add(
-                        ids=[item_id],
-                        documents=[doc],
-                        metadatas=[meta]
-                    )
-                    await col.delete(ids=[item_id])
-                    op_collection_name = f"{PROJECT_PREFIX}{project}"
-                    op_collection = new_collection
+                    if new_collection.name == col.name:
+                        # SAME-PROJECT "move" is identity — treat as a plain
+                        # update. Before this guard (pipeline msg_39a8771d8721,
+                        # DATA LOSS 2026-08-07): add(existing-id) on the same
+                        # collection silently skipped, the delete then
+                        # DESTROYED the item, and the response said "moved"
+                        # with the item's own metadata echoed back. Passing
+                        # project=<current> reads as scoping (it IS scoping on
+                        # get_by_id/get_spec) — the safe-looking call must be
+                        # safe.
+                        meta["project"] = project
+                        await col.update(
+                            ids=[item_id],
+                            documents=[doc] if (title or description) else None,
+                            metadatas=[meta]
+                        )
+                        op_collection_name = col.name
+                        op_collection = col
+                    else:
+                        meta["project"] = project
+                        await new_collection.add(
+                            ids=[item_id],
+                            documents=[doc],
+                            metadatas=[meta]
+                        )
+                        # Verify the item LANDED before deleting the source —
+                        # a half-failed move must leave the original intact,
+                        # never a deleted item and a success response.
+                        _landed = await new_collection.get(ids=[item_id], include=[])
+                        if not (_landed.get("ids") or []):
+                            return json.dumps({
+                                "error": (
+                                    f"Move failed: item did not land in project "
+                                    f"'{project}'. Source item untouched."
+                                ),
+                                "id": item_id,
+                            })
+                        await col.delete(ids=[item_id])
+                        moved = True
+                        op_collection_name = f"{PROJECT_PREFIX}{project}"
+                        op_collection = new_collection
                 else:
                     await col.update(
                         ids=[item_id],
@@ -430,7 +481,7 @@ async def memory_update_backlog_item(
                         "assigned_to": meta.get("assigned_to") or "",
                         "target_version": meta.get("target_version") or "",
                         "deferred_reason": meta.get("deferred_reason") or "",
-                        "moved_from_collection": col.name if project else None,
+                        "moved_from_collection": col.name if moved else None,
                         "edit_count": meta.get("edit_count"),
                         "updated": now,
                         "embedding": embedding,
@@ -439,7 +490,7 @@ async def memory_update_backlog_item(
 
                 found = True
                 return json.dumps({
-                    "status": "moved" if project else "updated",
+                    "status": "moved" if moved else "updated",
                     "id": item_id,
                     "title": meta["title"],
                     "project": project if project else meta.get("project", ""),

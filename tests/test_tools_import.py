@@ -2,16 +2,17 @@
 
 
 def test_all_tools_register():
-    """All 64 tools are registered with the MCP server.
+    """All 58 tools are registered with the MCP server.
 
-    (57 + 6 skill-registry tools + memory_ack_directive.)
+    (51 + 6 skill-registry tools + memory_ack_directive; the 6 autopilot
+    tools were deleted in design:autopilot-removal-v0 Phase 2.)
     """
     from shared_memory.app import create_app
 
     mcp = create_app()
     tools = mcp._tool_manager._tools
 
-    assert len(tools) == 64, f"Expected 64 tools, got {len(tools)}: {sorted(tools.keys())}"
+    assert len(tools) == 58, f"Expected 58 tools, got {len(tools)}: {sorted(tools.keys())}"
 
 
 def test_expected_tools_present():
@@ -37,13 +38,6 @@ def test_expected_tools_present():
         "memory_list_skills", "memory_pin_skill", "memory_export_skills",
         "memory_ack_directive",
         "memory_admin", "memory_standup",
-        # Phase C1
-        "memory_set_autopilot", "memory_pause_autopilot",
-        "memory_autopilot_status", "memory_autopilot_digest",
-        # Phase C2 (budget enforcement)
-        "memory_autopilot_check_budget",
-        # Phase C2.1 (read-only observability counterpart)
-        "memory_autopilot_count",
         # Phase 0 local-first band-aid (no-session diagnostic)
         "memory_health",
         # Phase 2 replication endpoints (sync_push is a stub until the

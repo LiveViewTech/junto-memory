@@ -158,7 +158,6 @@ PERMISSIONS: Dict[str, List[str]] = {
     "lifecycle":        ["agent", "admin", "owner"],
     "checklists":       ["agent", "user", "admin", "owner"],
     "database":         ["agent", "user", "admin", "owner"],
-    "autopilot":        ["user", "admin", "owner"],
     "guidelines":       ["admin", "owner"],
     "admin":            ["admin", "owner"],
     "admin.write":      ["owner"],

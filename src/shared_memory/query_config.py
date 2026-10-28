@@ -23,12 +23,18 @@ log = logging.getLogger(__name__)
 DEFAULT_EXPAND = True
 DEFAULT_EXPAND_TOP = 0
 DEFAULT_SNIPPET_LENGTH = 200
+# POST /recall similarity floor (interface:recall-v0 §Floor). Ships
+# CONSERVATIVE (cry-wolf-averse): deliberately above memory_query's
+# MIN_RELEVANCE_THRESHOLD=0.3. Lower per-project only on A2(ii)
+# pull-through evidence.
+DEFAULT_RECALL_FLOOR = 0.6
 
 # Allowed config keys + their types (used by set_config_value).
 CONFIG_KEYS = {
     "default_expand": bool,
     "default_expand_top": int,
     "default_snippet_length": int,
+    "recall_floor": float,
 }
 
 DEFAULT_SCOPE = "__default__"
@@ -48,6 +54,7 @@ def _default_config_dict() -> Dict[str, Any]:
         "default_expand": DEFAULT_EXPAND,
         "default_expand_top": DEFAULT_EXPAND_TOP,
         "default_snippet_length": DEFAULT_SNIPPET_LENGTH,
+        "recall_floor": DEFAULT_RECALL_FLOOR,
     }
 
 
@@ -111,6 +118,9 @@ def set_config_value(db, project: Optional[str], key: str, value: Any, actor: st
     if key == "default_expand_top" and isinstance(value, int):
         if value < 0 or value > 50:
             return {"error": "default_expand_top must be between 0 and 50"}
+    if key == "recall_floor" and isinstance(value, float):
+        if value < 0.0 or value > 1.0:
+            return {"error": "recall_floor must be between 0.0 and 1.0"}
 
     if db is None:
         return {"error": "MongoDB unavailable"}

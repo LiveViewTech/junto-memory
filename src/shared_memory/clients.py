@@ -3,6 +3,7 @@
 import asyncio
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from urllib.parse import quote_plus
 
 import chromadb
 from chromadb.config import Settings
@@ -218,10 +219,16 @@ def get_mongo():
         # of MONGO_INITDB_DATABASE. Without this, PyMongo defaults authSource
         # to MONGO_DB and authentication fails on fresh installs — server
         # comes up but every mongo-backed call (guidelines, agent_directory,
-        # messages, audit_log, op_log, autopilot) silently returns empty.
+        # messages, audit_log, op_log) silently returns empty.
         # See PR #1 / Issue tlemmons-lvt for the install-time repro.
+        # URL-escape credentials: a password from a password manager routinely
+        # carries reserved URI chars (/ @ + % :) that a plain f-string would
+        # mangle into a malformed URI -> silent auth failure on fresh installs.
+        # junto-stack's README dodges this with an alnum-only generated password,
+        # but nothing enforces that, so escape here for the paste-your-own case.
         mongo_uri = (
-            f"mongodb://{MONGO_USER}:{MONGO_PASSWORD}@{MONGO_HOST}:{MONGO_PORT}"
+            f"mongodb://{quote_plus(MONGO_USER)}:{quote_plus(MONGO_PASSWORD)}"
+            f"@{MONGO_HOST}:{MONGO_PORT}"
             f"/{MONGO_DB}?replicaSet=rs0&authSource=admin"
         )
         _mongo_client = MongoClient(
@@ -312,23 +319,12 @@ def get_mongo():
         compact_col.create_index([("agent", 1), ("logged_at", -1)])
         compact_col.create_index("logged_at")
 
-        # Autopilot config — one doc per (project, agent), introduced in Phase C1
-        # for ClaudeTerminal channel-plugin integration.
-        autopilot_col = _mongo_db.agent_autopilot
-        autopilot_col.create_index([("project", 1), ("agent", 1)], unique=True)
-
-        # Autopilot events — Phase C2 budget enforcement. One doc per
-        # auto-processed message. TTL of 1 hour means rolling-window count
-        # is just a count_documents call. Mongo's TTL monitor reaps expired
-        # docs every ~60s so the count is approximate at the second-by-second
-        # level; that's fine for budget gating.
-        autopilot_events_col = _mongo_db.autopilot_events
-        autopilot_events_col.create_index(
-            "logged_at", expireAfterSeconds=3600
-        )
-        autopilot_events_col.create_index(
-            [("project", 1), ("agent", 1), ("logged_at", -1)]
-        )
+        # Autopilot removal migration (design:autopilot-removal-v0 Phase 2):
+        # the feature and its collections are gone; push-control is the sole
+        # message brake. Idempotent — drop_collection on an absent collection
+        # is a no-op, so this is safe to run every boot.
+        _mongo_db.drop_collection("agent_autopilot")
+        _mongo_db.drop_collection("autopilot_events")
 
         # New message indexes for chain semantics — chain_depth lets us enforce
         # the depth-5 hard cap efficiently; in_response_to lets us walk threads.

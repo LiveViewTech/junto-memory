@@ -1,110 +1,96 @@
 #!/usr/bin/env bash
-# Sync the latest local backups to storm (offsite Windows host).
+# Sync the latest local junto backups to the OFFSITE receiver.
 #
-# Uses scp over SSH (Windows OpenSSH doesn't include rsync by default).
-# Each backup file is a full snapshot, so scp is sufficient — no incremental
-# transfer needed.
+# 2026-08-22: repointed from the ex-storm Windows host (192.168.15.250, physical
+# box decommissioned 08-14) to LXC 212 on madrox (192.168.15.98), an SFTP-only
+# chrooted receiver (user junto-backup, jail dirs /data/chroma + /data/mongo).
+# 212 owns retention (keep-14 per modality) AND the offsite/cloud push, so this
+# script only lands tarballs — no remote rotation, no cloud step here.
+# The OFFSITE_* / "storm" names are kept as the offsite-target abstraction.
+# Ref: junto/backlog_39b05cf07539, learning (storm decom + VM250 stopgap).
 #
-# Keeps the last N backups on storm to match local rotation.
+# Transport: sftp batch (the receiver is nologin+chrooted — no shell, so no
+# scp/ssh remote commands). Atomicity: put to <f>.partial then sftp `rename`,
+# so the receiver's freshness/retention never sees a half-written file.
 #
-# Usage:
-#   ./sync-to-storm.sh
-#
-# Cron (daily at 4:00am, after local backups complete):
-#   0 4 * * * /path/to/sync-to-storm.sh
+# Cron (daily 04:00, after local backups):
+#   0 4 * * * /home/tlemmons/sharedUtils/junto/junto-memory/contrib/backup/sync-to-storm.sh >> /tmp/storm-sync.log 2>&1
 
-set -euo pipefail
+set -uo pipefail   # NOT -e: aggregate per-file results, report all faults.
 
 # ── Config ──
-STORM_HOST="${STORM_HOST:-192.168.15.250}"
-STORM_USER="${STORM_USER:-Administrator}"
-STORM_DIR="${STORM_DIR:-C:/SageBackup}"
-SSH_KEY="${SSH_KEY:-$HOME/.ssh/storm-backup}"
-KEEP_REMOTE=14
+OFFSITE_HOST="${OFFSITE_HOST:-${STORM_HOST:-192.168.15.98}}"
+OFFSITE_USER="${OFFSITE_USER:-${STORM_USER:-junto-backup}}"
+OFFSITE_KEY="${OFFSITE_KEY:-${SSH_KEY:-$HOME/.ssh/junto-offsite-212}}"
+CHROMA_REMOTE="${CHROMA_REMOTE:-/data/chroma}"
+MONGO_REMOTE="${MONGO_REMOTE:-/data/mongo}"
 
 CHROMA_LOCAL_DIR="$HOME/chroma-backups"
 MONGO_LOCAL_DIR="$HOME/mongo-backups"
 
-SSH_OPTS="-i $SSH_KEY -o BatchMode=yes -o ConnectTimeout=15"
-SSH="ssh $SSH_OPTS $STORM_USER@$STORM_HOST"
-SCP="scp $SSH_OPTS"
+SFTP_OPTS=(-i "$OFFSITE_KEY" -o BatchMode=yes -o ConnectTimeout=15 -o StrictHostKeyChecking=accept-new)
+DEST="${OFFSITE_USER}@${OFFSITE_HOST}"
 
-log() { echo "[$(date +'%Y-%m-%d %H:%M:%S')] $*"; }
+FAILURES=0
+log()  { echo "[$(date +'%Y-%m-%d %H:%M:%S')] $*"; }
+fail() { echo "[$(date +'%Y-%m-%d %H:%M:%S')] ERROR: $*" >&2; FAILURES=$(( FAILURES + 1 )); }
 
-# ── Verify storm is reachable ──
-log "Checking storm connectivity..."
-if ! $SSH 'exit 0' 2>/dev/null; then
-    log "ERROR: Cannot reach storm at $STORM_HOST. Skipping offsite sync."
+# Run a batch of sftp commands on stdin; returns sftp's exit code.
+sftp_batch() { sftp "${SFTP_OPTS[@]}" -b - "$DEST"; }
+
+# ── Verify receiver is reachable ──
+log "Checking offsite receiver ${DEST} ..."
+if ! printf 'pwd\n' | sftp_batch >/dev/null 2>&1; then
+    fail "Cannot reach offsite receiver ${DEST}. Skipping offsite sync."
     exit 1
 fi
 
-# ── Create remote subdirs ──
-$SSH "if not exist \"$STORM_DIR\\chroma\" mkdir \"$STORM_DIR\\chroma\"" >/dev/null 2>&1 || true
-$SSH "if not exist \"$STORM_DIR\\mongo\" mkdir \"$STORM_DIR\\mongo\"" >/dev/null 2>&1 || true
-
-# ── Sync Chroma backups ──
+# ── Sync one modality dir ──
+# Args: <label> <local_dir> <remote_dir> <pattern>
 sync_dir() {
-    local local_dir="$1"
-    local remote_subdir="$2"
-    local pattern="$3"
+    local label="$1" local_dir="$2" remote_dir="$3" pattern="$4"
 
     if [ ! -d "$local_dir" ]; then
-        log "Local dir $local_dir does not exist, skipping"
-        return 0
+        fail "${label}: local dir ${local_dir} missing, skipping"
+        return
     fi
 
-    # Get list of remote files to avoid re-copying
-    local remote_files
-    remote_files=$($SSH "dir /b \"$STORM_DIR\\$remote_subdir\\$pattern\" 2>nul" 2>/dev/null | tr -d '\r' || true)
+    # Remote inventory (basenames present), to skip re-uploading full snapshots.
+    local remote_names
+    remote_names=$(printf 'ls -1 %s\n' "$remote_dir" \
+        | sftp "${SFTP_OPTS[@]}" -b - "$DEST" 2>/dev/null \
+        | sed -n "s#.*/##p" | grep -E "^${pattern//\*/.*}$" || true)
 
-    local new_count=0
-    local skip_count=0
-    for local_file in "$local_dir"/$pattern; do
-        [ -f "$local_file" ] || continue
-        local basename
-        basename=$(basename "$local_file")
-        if echo "$remote_files" | grep -qx "$basename"; then
-            skip_count=$((skip_count + 1))
+    local new=0 skip=0 f base
+    for f in "$local_dir"/$pattern; do
+        [ -f "$f" ] || continue
+        base=$(basename "$f")
+        if grep -qxF "$base" <<< "$remote_names"; then
+            skip=$(( skip + 1 ))
             continue
         fi
-        log "Copying $basename ($(du -h "$local_file" | cut -f1))..."
-        $SCP "$local_file" "$STORM_USER@$STORM_HOST:$STORM_DIR/$remote_subdir/" >/dev/null
-        new_count=$((new_count + 1))
+        # Atomic: upload to .partial, then rename to the final name.
+        if printf 'put %s %s/%s.partial\nrename %s/%s.partial %s/%s\n' \
+                "$f" "$remote_dir" "$base" "$remote_dir" "$base" "$remote_dir" "$base" \
+            | sftp_batch >/dev/null 2>&1; then
+            log "${label}: uploaded ${base} ($(du -h "$f" | cut -f1))"
+            new=$(( new + 1 ))
+        else
+            fail "${label}: upload FAILED for ${base}"
+        fi
     done
-    log "  $remote_subdir: $new_count new, $skip_count already present"
+    log "${label}: ${new} new, ${skip} already present"
 }
 
-log "Syncing chroma backups..."
-sync_dir "$CHROMA_LOCAL_DIR" "chroma" "chroma-backup-*.tar.gz"
+log "=== junto offsite sync -> ${DEST} start ==="
+sync_dir "chroma" "$CHROMA_LOCAL_DIR" "$CHROMA_REMOTE" "chroma-backup-*.tar.gz"
+sync_dir "mongo"  "$MONGO_LOCAL_DIR"  "$MONGO_REMOTE"  "mongo-backup-*.archive.gz"
 
-log "Syncing mongo backups..."
-sync_dir "$MONGO_LOCAL_DIR" "mongo" "mongo-backup-*.archive.gz"
+# Retention is enforced on the receiver (212, keep-14). No remote rotation here.
 
-# ── Rotate remote ──
-rotate_remote() {
-    local remote_subdir="$1"
-    local pattern="$2"
-    local keep="$3"
-
-    # Windows 'dir /b /o-d' sorts by date descending; we take names after the Nth
-    local to_delete
-    to_delete=$($SSH "dir /b /o-d \"$STORM_DIR\\$remote_subdir\\$pattern\" 2>nul" 2>/dev/null | tr -d '\r' | awk -v n=$keep 'NR>n' || true)
-
-    if [ -n "$to_delete" ]; then
-        local count
-        count=$(echo "$to_delete" | wc -l)
-        log "Rotating $remote_subdir: removing $count old file(s)"
-        while IFS= read -r fname; do
-            [ -n "$fname" ] || continue
-            $SSH "del \"$STORM_DIR\\$remote_subdir\\$fname\"" >/dev/null 2>&1 || true
-        done <<< "$to_delete"
-    fi
-}
-
-rotate_remote "chroma" "chroma-backup-*.tar.gz" "$KEEP_REMOTE"
-rotate_remote "mongo" "mongo-backup-*.archive.gz" "$KEEP_REMOTE"
-
-# ── Summary ──
-log "Done. Remote inventory:"
-$SSH "dir /b \"$STORM_DIR\\chroma\" 2>nul | find /c /v \"\"" 2>/dev/null | tr -d '\r' | awk '{print "  chroma backups: " $1}'
-$SSH "dir /b \"$STORM_DIR\\mongo\" 2>nul | find /c /v \"\"" 2>/dev/null | tr -d '\r' | awk '{print "  mongo backups:  " $1}'
+if [ "$FAILURES" -gt 0 ]; then
+    log "=== offsite sync FINISHED with ${FAILURES} fault(s) ==="
+    exit 1
+fi
+log "=== offsite sync OK (retention owned by receiver) ==="
+exit 0

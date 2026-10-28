@@ -8,6 +8,25 @@ from shared_memory.app import mcp
 from shared_memory.clients import get_mongo
 from shared_memory.helpers import utc_now_iso
 
+# Global-scope guidelines are CODE-MANAGED: the source of truth is
+# GLOBAL_GUIDELINES in src/shared_memory/global_guidelines.py, re-asserted into
+# db.guidelines by seed_global_guidelines() on every boot. A live DB edit to a
+# global row is therefore reverted at the next restart, which used to happen
+# SILENTLY — memory_guidelines(set/delete) returned success and the change
+# vanished hours later. This tool now REFUSES to set or delete global rows so the
+# API can no longer modify them at all (Tom, 2026-08-11: "the global rules are
+# only set or changed with my approval to you" — learning_66a2a5d8bb8f13c1). The
+# boot seeder writes db.guidelines directly and does NOT route through this tool,
+# so it is unaffected by this guard.
+GLOBAL_WRITE_REFUSAL = (
+    "Global-scope guidelines are code-managed and cannot be set or deleted via "
+    "memory_guidelines. The source of truth is GLOBAL_GUIDELINES in "
+    "src/shared_memory/global_guidelines.py — edit it there and deploy (the boot "
+    "seeder re-asserts it on every server). Governance: global rules change ONLY "
+    "with Tom's approval routed through memory@junto (learning_66a2a5d8bb8f13c1). "
+    "Project-scoped guidelines (scope=<project>) are still writable here."
+)
+
 
 def get_guidelines_for_session(project: str = None) -> list:
     """Fetch all applicable guidelines for a session.
@@ -47,6 +66,35 @@ def get_guidelines_for_session(project: str = None) -> list:
     return guidelines
 
 
+def get_guidelines_version(db=None) -> int:
+    """Monotonic corpus version (design:guideline-trim-v0 instrumentation).
+
+    Bumped by any script/tool that mutates the guidelines corpus; stamped into
+    every session record at start so compliance data is attributable to the
+    exact block the agent held (trickle adoption becomes a natural experiment,
+    not a confound). 0 = pre-versioning corpus."""
+    if db is None:
+        db = get_mongo()
+    if db is None:
+        return 0
+    try:
+        doc = db.guidelines_meta.find_one({"_id": "version"})
+        return int(doc["value"]) if doc else 0
+    except Exception:
+        return 0
+
+
+def bump_guidelines_version(db, actor: str) -> int:
+    """Increment the corpus version. Call from any corpus mutation path."""
+    from shared_memory.helpers import utc_now
+    doc = db.guidelines_meta.find_one_and_update(
+        {"_id": "version"},
+        {"$inc": {"value": 1}, "$set": {"updated": utc_now(), "updated_by": actor}},
+        upsert=True, return_document=True,
+    )
+    return int(doc["value"]) if doc else 1
+
+
 @mcp.tool()
 async def memory_guidelines(
     action: str,
@@ -67,6 +115,12 @@ async def memory_guidelines(
         set    - Create or update a guideline (requires name + rule)
         delete - Remove a guideline by name
         get    - Get a single guideline by name
+
+    ⛔ GLOBAL SCOPE IS READ-ONLY THROUGH THIS TOOL. `set` and `delete` on a
+    global-scope guideline are refused with an error — global rules are
+    code-managed in src/shared_memory/global_guidelines.py and re-seeded on every
+    boot. `list`/`get` still work at every scope. Project-scoped rules
+    (scope=<project>) remain fully writable.
 
     Args:
         action: One of: list, set, delete, get
@@ -100,6 +154,8 @@ async def memory_guidelines(
         return json.dumps({"guidelines": guidelines, "count": len(guidelines)}, indent=2)
 
     elif action == "set":
+        if normalized_scope == "global":
+            return json.dumps({"error": GLOBAL_WRITE_REFUSAL, "scope": "global", "rejected": True})
         if not name or not rule:
             return json.dumps({"error": "Both 'name' and 'rule' are required for set action"})
 
@@ -133,6 +189,12 @@ async def memory_guidelines(
     elif action == "delete":
         if not name:
             return json.dumps({"error": "'name' is required for delete action"})
+        # Guard on the TARGET's actual scope, not the (default-global) scope param:
+        # a caller deleting a project rule need not pass scope, so we must not
+        # infer intent from it. A global row is code-managed and undeletable here.
+        target = db.guidelines.find_one({"name": name})
+        if target and target.get("scope") == "global":
+            return json.dumps({"error": GLOBAL_WRITE_REFUSAL, "scope": "global", "rejected": True})
         result = db.guidelines.delete_one({"name": name})
         if result.deleted_count:
             try:

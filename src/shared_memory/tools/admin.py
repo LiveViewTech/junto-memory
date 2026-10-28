@@ -138,9 +138,30 @@ async def memory_admin(
         "drain", "broadcast_restart_warning",
     }
     if action in write_actions:
-        write_error = require_auth(session_info, "admin.write")
-        if write_error:
-            return json.dumps({"error": write_error})
+        # Rename dry-run delegation (backlog_cf11cec31a94): project admins may
+        # run rename_agent DRY-RUN for their OWN project (read-shaped impact
+        # counts — converts "coordinator wants a rename" into a scoped request).
+        # Commit (dry_run=False) and cross-project renames stay owner-only:
+        # the host-side wiring a rename requires cannot be migrated server-side
+        # and its failure mode is 30-day-delayed (alias expiry).
+        _delegated_dry_run = False
+        if action == "rename_agent" and dry_run:
+            try:
+                from shared_memory.clients import get_mongo as _gm
+                _db = _gm()
+                _caller = session_info.get("claude_instance", "")
+                _fp = (from_project or "").lower().replace("-", "_").replace(" ", "_")
+                _tp = (to_project or from_project or "").lower().replace("-", "_").replace(" ", "_")
+                if _db is not None and _fp and _fp == _tp:
+                    _proj = _db.projects.find_one({"name": _fp}, {"admins": 1})
+                    if _proj and _caller in (_proj.get("admins") or []):
+                        _delegated_dry_run = True
+            except Exception:
+                pass
+        if not _delegated_dry_run:
+            write_error = require_auth(session_info, "admin.write")
+            if write_error:
+                return json.dumps({"error": write_error})
 
     # ── Graceful-restart ops ──
     if action == "drain":

@@ -1,0 +1,16 @@
+[Unit]
+Description=Verify sage junto backups (chroma+mongo local freshness/size + storm offsite freshness)
+Documentation=file:///c/code/Nimbus/infra/sage/junto-backup/README.md
+OnFailure=junto-backup-verify-alert.service
+
+[Service]
+Type=oneshot
+User=tlemmons
+Group=tlemmons
+# Backups + logs live under /home/tlemmons; run as the owning user.
+ExecStart=/usr/local/sbin/junto-backup-verify.sh
+StandardOutput=journal
+StandardError=journal
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=5

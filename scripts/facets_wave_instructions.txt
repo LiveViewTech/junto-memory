@@ -1,0 +1,56 @@
+FACET EXTRACTION WAVE AGENT — shared instructions (design:memory-facets-v0, recipe 0.4.0)
+
+You are one agent in a parallel facet-extraction wave. Your prompt gives you a SLICE FILE
+(JSONL or JSON of docs/ids) and an OUTPUT PATH. Read this whole file before starting.
+Reconstructed 2026-07-23 from the 2026-07-21 wave (learning_ae07bf36ac17dd10) + the spec;
+COMMITTED to the repo so it survives sessions — edit here, not in scratch copies.
+
+TASK
+For each doc in your slice, read title + content and emit ONE JSON line to the output path:
+  {"doc_id": ..., "claim": ..., "operation": ..., "trigger": [...], "shelf_life": ...}
+
+FACET DEFINITIONS (recipe 0.4.0 — the ratified 8-class enum)
+
+claim — ONE sentence stating the doc's core assertion, self-contained (a reader who never
+sees the doc must understand it). Include concrete names (functions, files, subsystems,
+error strings) over generic descriptions. Never empty.
+
+operation — the activity class in which this knowledge applies. Exactly one word from:
+  diagnose | deploy | config | build | query | process | decision | reference
+  decision  = a ruling/choice record, incl. standing directives and norms.
+  reference = architecture-map / survey / decision-support doc with no verdict.
+If the doc genuinely fits none, OMIT the field (do not force a fit) and note the doc_id
+in your final report line — enum-coverage evidence stays welcome.
+
+trigger — up to 3 applies-when lines, each concrete: "when <observable condition>" or
+"before <action> on <object>", naming an actual symptom, command, file, or subsystem.
+An observable condition is something an agent can watch itself doing or seeing — never a
+feeling ("when unsure") and never generic ("when working on the server").
+
+shelf_life — durable | volatile. The question: "could later evidence invalidate this
+claim?" Diagnoses, root-causes, definitive-X claims, live-state/dated snapshots,
+in-flight proposals, superseded decision records => volatile. Mechanisms, API behavior,
+code gotchas, standing norms => durable. "The code could change someday" does NOT make
+a note volatile. Known trap in both directions: gotcha-shaped workaround notes are
+usually durable (mechanism), while confident RESOLVED/root-cause framings are usually
+volatile (later evidence can overturn them).
+
+DUPLICATES (only when your slice file carries a "pairs" list)
+For each pair, fetch/read both docs and judge: duplicate | supersede-chain |
+contradiction | distinct. Append verdicts as JSON lines to the verdicts path given in
+your prompt: {"ids": [...], "verdict": ..., "canonical_or_direction": ..., "reason": ...}.
+NEVER change any doc's status — flags only.
+
+RULES
+- Write detail to FILES; your final return text is ONE line of counts
+  (e.g. "50 docs, 50 rows, 2 enum-misses, 3 pair verdicts"). Context stays flat.
+- No mongo writes unless your prompt explicitly says COMMIT mode — the orchestrator
+  applies your JSONL. In COMMIT mode the row schema is EXACTLY these fields and no
+  others (existing corpus rows have this shape; do not add doc_id or anything else):
+  {_id: <doc_id>, claim, operation, trigger, shelf_life,
+   recipe_version: "0.4.0-librarian", model: "claude-librarian", reviewed_by: "librarian",
+   reviewed_at: <iso now>, extracted_at: <iso now>} — via upsert on _id, and NEVER
+  overwrite a row already carrying reviewed_by. (The JSONL export uses doc_id instead
+  of _id; the mongo row does not carry doc_id.)
+- Work from the slice file only; do not query the memory server for extra context.
+- temp-0 mindset: same doc should get the same facets on a re-run.

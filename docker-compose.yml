@@ -120,6 +120,26 @@ services:
       # cloud connector (tom-assistant/advisor/research/DeeAnn). Flip to true
       # ONLY if the CF Access app on mcp.lemmons.net is ever removed.
       - JUNTO_TUNNEL_REQUIRES_KEY=${JUNTO_TUNNEL_REQUIRES_KEY:-false}
+      # Write-time contradiction gate, classifier stage (claim_gate.py,
+      # interface:claim-extraction-v0). Advisory + fail-quiet: with the
+      # endpoint down, memory_record_learning degrades to threshold-only
+      # pointers. Default OFF; flip in .env when the host Ollama endpoint
+      # is reachable from the container (extra_hosts below provides
+      # host.docker.internal on Linux).
+      - JUNTO_CLAIM_GATE_ENABLED=${JUNTO_CLAIM_GATE_ENABLED:-false}
+      - JUNTO_CLAIM_GATE_URL=${JUNTO_CLAIM_GATE_URL:-http://host.docker.internal:11434/v1}
+      - JUNTO_CLAIM_GATE_MODEL=${JUNTO_CLAIM_GATE_MODEL:-phi4:14b}
+      # Pending-agent GC (identity_gc.py, design:identity-lifecycle-v0
+      # Mechanism B). Reaps PENDING-tier roster ghosts idle past the grace
+      # window (never named/admin; blocked by live sessions and open inbound
+      # obligations). Default OFF — enable only after the roster's legitimate
+      # long-livers are promoted to named (done on sage 2026-07-12).
+      - JUNTO_PENDING_REAP_ENABLED=${JUNTO_PENDING_REAP_ENABLED:-false}
+      - JUNTO_PENDING_REAP_GRACE_HOURS=${JUNTO_PENDING_REAP_GRACE_HOURS:-48}
+    extra_hosts:
+      # Lets the container reach host services (Ollama :11434) on Linux,
+      # where host.docker.internal is not automatic.
+      - "host.docker.internal:host-gateway"
     ports:
       # Bind to loopback + the home LAN IP only — NOT 0.0.0.0 (design:auth-
       # origin-trust-v0). cloudflared connects locally (127.0.0.1) so the public

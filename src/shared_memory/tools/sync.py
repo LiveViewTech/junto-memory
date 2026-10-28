@@ -549,7 +549,7 @@ async def _apply_op(db, chroma, op: Dict[str, Any]) -> Dict[str, Any]:
         # Op_type is in §4.1 catalog (passed the catalog gate above) but
         # we haven't implemented apply for it yet. This happens for the
         # not-yet-instrumented internal-event op_types (session.*, agent.*,
-        # lock.*, autopilot.*, signal.*, audit.*, rename.*).
+        # lock.*, signal.*, audit.*, rename.*).
         return {
             "disposition": "rejected",
             "reason": f"apply_unimplemented: no handler for op_type {op['op_type']!r}",
@@ -1115,8 +1115,7 @@ _APPLY_HANDLERS = {
     # haven't shipped — state:memory next-step #5 lists the gap):
     #   session.started, session.ended, agent.registered, agent.heartbeat,
     #   agent.work_updated, lock.acquired, lock.released, lock.expired,
-    #   autopilot.config_changed, autopilot.event_recorded,
-    #   autopilot.auto_disabled, signal.emitted, audit.event, rename.applied
+    #   signal.emitted, audit.event, rename.applied
     # When emit canaries land, add handlers here. Until then ops of those
     # types fall through to "rejected" with apply_unimplemented reason.
 }

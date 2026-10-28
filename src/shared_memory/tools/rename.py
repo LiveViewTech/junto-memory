@@ -1,7 +1,7 @@
 """Rename agent / project tooling.
 
 Migrates state specs, function registry, learnings, message threads, backlog,
-agent directory, autopilot config, and project metadata in a single pass.
+agent directory, and project metadata in a single pass.
 
 Atomicity caveats:
 - Mongo and Chroma are separate stores; there's no real two-phase commit.
@@ -105,12 +105,6 @@ def _count_agent_impact(db, from_project: str, from_agent: str) -> Dict[str, int
     })
     counts["agent_status"] = db.agent_status.count_documents({
         "instance": from_agent,
-    })
-    counts["agent_autopilot"] = db.agent_autopilot.count_documents({
-        "project": from_project, "agent": from_agent,
-    })
-    counts["autopilot_events"] = db.autopilot_events.count_documents({
-        "project": from_project, "agent": from_agent,
     })
     counts["compaction_events"] = db.compaction_events.count_documents({
         "agent": from_agent,
@@ -267,31 +261,6 @@ def _apply_agent_renames_mongo(
     # can delete-and-let-heartbeat-rewrite. Cleaner: just delete.
     r = db.agent_status.delete_many({"instance": from_agent})
     results["agent_status_dropped"] = r.deleted_count
-
-    # agent_autopilot — (project, agent) unique
-    if cross_project:
-        old = db.agent_autopilot.find_one({"project": from_project, "agent": from_agent})
-        if old:
-            new_doc = {**old, "project": to_project, "agent": to_agent}
-            new_doc.pop("_id", None)
-            db.agent_autopilot.delete_one({"project": from_project, "agent": from_agent})
-            db.agent_autopilot.insert_one(new_doc)
-            results["agent_autopilot"] = 1
-        else:
-            results["agent_autopilot"] = 0
-    else:
-        r = db.agent_autopilot.update_one(
-            {"project": from_project, "agent": from_agent},
-            {"$set": {"agent": to_agent}},
-        )
-        results["agent_autopilot"] = r.modified_count
-
-    # autopilot_events (TTL 1h, but rewrite anyway for budget continuity)
-    r = db.autopilot_events.update_many(
-        {"project": from_project, "agent": from_agent},
-        {"$set": {"project": to_project, "agent": to_agent}},
-    )
-    results["autopilot_events"] = r.modified_count
 
     # compaction_events — agent only
     r = db.compaction_events.update_many(
@@ -479,8 +448,6 @@ def _count_project_impact(db, from_project: str) -> Dict[str, int]:
     counts["registered_agents"] = db.registered_agents.count_documents({"project": from_project})
     counts["agent_directory"] = db.agent_directory.count_documents({"project": from_project})
     counts["projects"] = db.projects.count_documents({"name": from_project})
-    counts["agent_autopilot"] = db.agent_autopilot.count_documents({"project": from_project})
-    counts["autopilot_events"] = db.autopilot_events.count_documents({"project": from_project})
     counts["checklists"] = db.checklists.count_documents({"project": from_project})
     return counts
 
@@ -497,12 +464,6 @@ def _apply_project_rename_mongo(db, from_project: str, to_project: str) -> Dict[
         {"project": from_project}, {"$set": {"project": to_project}}
     ).modified_count
     results["agent_directory"] = db.agent_directory.update_many(
-        {"project": from_project}, {"$set": {"project": to_project}}
-    ).modified_count
-    results["agent_autopilot"] = db.agent_autopilot.update_many(
-        {"project": from_project}, {"$set": {"project": to_project}}
-    ).modified_count
-    results["autopilot_events"] = db.autopilot_events.update_many(
         {"project": from_project}, {"$set": {"project": to_project}}
     ).modified_count
     results["checklists"] = db.checklists.update_many(

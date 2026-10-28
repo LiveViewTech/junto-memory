@@ -97,6 +97,18 @@ STALE_LOCK_MINUTES = 30
 # Session TTL - auto-expire sessions with no activity for this many days
 SESSION_TTL_DAYS = 14
 
+# Mid-tier idle expiry (backlog_940b9f9c66e1): sessions with no tool call for
+# this many hours AND no live inbox SSE subscription are expired. A session
+# with a live subscription is a healthy idle plugin and is never idle-expired
+# (the 14-day TTL above still applies to everything). 0 disables.
+SESSION_IDLE_HOURS = int(os.getenv("JUNTO_SESSION_IDLE_HOURS", "6"))
+
+# Per-subscriber send timeout for inbox notify pushes. A half-open socket's
+# write BLOCKS on the zero-buffer notification stream (same failure the SSE
+# keepalive guards against) — without this, one zombie subscriber wedges the
+# announce loop and live subscribers never get the push.
+NOTIFY_SEND_TIMEOUT = float(os.getenv("JUNTO_NOTIFY_SEND_TIMEOUT", "5"))
+
 # Signal retention (24 hours)
 SIGNAL_RETENTION_HOURS = 24
 

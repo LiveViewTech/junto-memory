@@ -177,25 +177,80 @@ async def memory_change_status(
     if project:
         project = normalize_project(project)
 
-    # Find the document
+    # Find the document. Scope resolution (learning_c5ea0608b8fe4c46,
+    # coordinator blocker msg_065a525bff50): when project is omitted, default
+    # to the SESSION's project first, then shared. The old shared-only
+    # fallback made an omitted arg silently narrow the search, so an
+    # in-project agent retiring its own project's doc got a hintless
+    # "not found" — indistinguishable from a missing doc, and it produced
+    # confident false conclusions fleet-wide. Cross-project writes stay
+    # explicit via project=.
+    candidates = []
     if project:
-        collection = await get_project_collection(chroma, project)
+        candidates.append((project, await get_project_collection(chroma, project)))
     else:
-        collection = None
+        session_project = active_sessions[session_id].get("project")
+        if session_project:
+            sp = normalize_project(session_project)
+            candidates.append((sp, await get_project_collection(chroma, sp)))
         for shared_name in ["patterns", "context"]:
-            shared = await get_shared_collection(chroma, shared_name)
-            result = await shared.get(ids=[doc_id])
-            if result["ids"]:
-                collection = shared
-                break
+            candidates.append((f"shared:{shared_name}",
+                               await get_shared_collection(chroma, shared_name)))
 
-        if not collection:
-            return json.dumps({"error": f"Document not found: {doc_id}"}, indent=2)
+    collection = result = None
+    searched = []
+    for label, col in candidates:
+        searched.append(label)
+        r = await col.get(ids=[doc_id], include=["documents", "metadatas"])
+        if r["ids"]:
+            collection, result = col, r
+            break
 
-    result = await collection.get(ids=[doc_id], include=["documents", "metadatas"])
-
-    if not result["ids"]:
-        return json.dumps({"error": f"Document not found: {doc_id}"}, indent=2)
+    if result is None:
+        # LOCATE-ON-MISS (legacy-team 2026-08-09). The server can see the doc
+        # in another collection, so say WHERE instead of leaving the caller to
+        # infer scope-vs-missing from a hint. Without this, a doc misfiled to
+        # shared reads as a bad ID — legacy-team nearly concluded their own
+        # doc id was wrong. Best-effort: a lookup failure degrades to the
+        # generic hint, never masks the not-found.
+        _found_in = None
+        try:
+            _searched_names = {c.name for _, c in candidates}
+            for _c in await chroma.list_collections():
+                _name = getattr(_c, "name", str(_c))
+                if _name in _searched_names:
+                    continue
+                _probe = await _c.get(ids=[doc_id], include=["metadatas"])
+                if _probe.get("ids"):
+                    _m = (_probe.get("metadatas") or [{}])[0] or {}
+                    _found_in = {"collection": _name, "project": _m.get("project", "")}
+                    break
+        except Exception:
+            pass
+        if _found_in:
+            _proj = _found_in["project"]
+            return json.dumps({
+                "error": f"Document not found in the scope you searched: {doc_id}",
+                "searched": searched,
+                "found_in": _found_in,
+                "hint": (
+                    f"The doc EXISTS in collection '{_found_in['collection']}' "
+                    f"(project={_proj!r}). Retry with "
+                    + (f"project={_proj!r}." if _proj else "project omitted.")
+                    + " A doc can land in shared with project='' when the "
+                      "project argument never reached the server (e.g. a "
+                      "malformed tool-call emission swallowed it)."
+                ),
+            }, indent=2)
+        return json.dumps({
+            "error": f"Document not found: {doc_id}",
+            "searched": searched,
+            "hint": ("Check the project parameter — an omitted or wrong "
+                     "project narrows the search and reads exactly like a "
+                     "missing doc. Pass project=<owning project> (docs are "
+                     "scoped to the project they were recorded in), or use "
+                     "memory_query() to locate the doc first."),
+        }, indent=2)
 
     # Update metadata
     meta = result["metadatas"][0]
@@ -214,9 +269,30 @@ async def memory_change_status(
         metadatas=[meta]
     )
 
+    # Facets lifecycle sync (backlog_8f304329c490): learning_facets/
+    # learning_claims carry no doc status and nothing re-checked them on
+    # supersede — a claim extracted seconds before its doc was superseded
+    # stayed servable as live knowledge forever (the 41f8f21f 5-minute-race
+    # specimen). Stamp source_status on both rows so facet-first consumers
+    # (sub's pipelines, librarian queries) can filter without a doc join.
+    # Single-writer server makes this safe; best-effort — the chroma status
+    # write above is the load-bearing op.
+    facets_synced = False
+    try:
+        from shared_memory.clients import get_mongo as _get_mongo
+        _db = _get_mongo()
+        if _db is not None:
+            _stamp = {"source_status": new_status, "source_status_updated_at": now}
+            r1 = _db.learning_facets.update_many({"_id": doc_id}, {"$set": _stamp})
+            r2 = _db.learning_claims.update_many({"_id": doc_id}, {"$set": _stamp})
+            facets_synced = bool(r1.modified_count or r2.modified_count)
+    except Exception:
+        pass
+
     return json.dumps({
         "status": "updated",
         "doc_id": doc_id,
+        "facets_synced": facets_synced,
         "old_status": old_status,
         "new_status": new_status,
         "superseded_by": superseded_by,

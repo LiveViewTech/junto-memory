@@ -20,7 +20,7 @@ Modern AI coding agents operate under three structural pressures that compound w
 
 - **Context is ephemeral.** A Claude session ends, its working memory is gone. The next session starts blank. State has to live somewhere outside the model.
 - **Knowledge is siloed by default.** Two agents working in the same codebase, or on related codebases, rediscover the same gotchas independently. The cost of duplicated debugging compounds rapidly.
-- **Autonomous reply loops are dangerous.** Agent A messages Agent B; B's autopilot reply messages A; A's autopilot reply messages B. Without explicit caps, infinite loops happen, budgets evaporate, and destructive actions get amplified.
+- **Autonomous reply loops are dangerous.** Agent A messages Agent B; B's automatic reply messages A; A's automatic reply messages B. Without explicit caps, infinite loops happen, budgets evaporate, and destructive actions get amplified.
 
 Existing solutions tend to pick one of these problems. Personal-memory products (Mem0, Letta) optimize for single-agent recall. Orchestration frameworks (LangGraph, AutoGen, Microsoft Agent Framework) optimize for explicit workflow modeling. Junto's bet is that the same persistent substrate can address all three — knowledge persistence, cross-agent sharing, and safety gates on autonomy — and that the right shape for that substrate is an MCP server that exposes its capabilities to whichever agent host runs against it.
 
@@ -33,7 +33,7 @@ Junto is four components, each MIT-licensed, each able to be adopted independent
 | Component | Role | Form factor |
 |-----------|------|-------------|
 | **junto-memory** | The MCP server itself. Persistent knowledge base, message bus, coordination kernel. | Python service backed by MongoDB + ChromaDB. |
-| **junto-inbox** | Channel-plugin that gives a Claude Code (or compatible) host live push notifications for incoming messages, plus client-side autopilot controls. | TypeScript / Bun runtime. |
+| **junto-inbox** | Channel-plugin that gives a Claude Code (or compatible) host live push notifications for incoming messages. | TypeScript / Bun runtime. |
 | **junto-control** | Web UI for the human in the loop — read messages, reply, approve flagged sends, browse the shared knowledge base. | Python + FastAPI + HTMX. |
 | **junto-stack** | A compose-recipe repository that bootstraps a full Junto install from scratch on an adopter's machine. | docker-compose + bootstrap scripts. |
 
@@ -97,24 +97,24 @@ Junto's message bus is fully typed: messages have a sender (project + agent iden
 
 Messages are never silently dropped. If the recipient is offline or over a safety threshold, the message persists; only its live push notification is suppressed. The recipient sees it on next reconnect.
 
-### 4.5 Autopilot (autonomous reply control)
+### 4.5 Push-control (autonomous reply control)
 
-Autopilot is the mechanism by which an agent decides whether to auto-process an incoming message without human prompting. Each agent has a per-agent autopilot config: a `chain_depth` cap (how many auto-reply hops are allowed before the chain must stop and surface to a human), an `hourly_budget` (how many autonomous processings are allowed per hour), and a `destructive_gate` (whether to require a human approval on messages matching dangerous keyword patterns).
+Push-control is the server-side brake on autonomous message traffic. Unlike a client-side gate — which a misbehaving or out-of-date client can simply skip — push-control is evaluated by the server on every send, invisible to agents and non-evadable. It stacks three mechanisms: the chain-depth cap (a reply chain deeper than 12 hops persists but stops pushing notifications), a per-sender soft push budget (30/hour — past it, pushes are suppressed and an operator warning is recorded), and a per-sender hard ceiling (100/hour — crossing it records an alert, notifies both inboxes, and suspends the sender until an operator intervenes). Observability is the `memory_get_emission_stats` tool, which reports each sender's current-hour count against those limits.
 
-When an inbound message arrives, the agent's client (typically the channel plugin) calls into Junto's budget-check tool. Junto runs a gate stack: is autopilot enabled, is the destructive gate tripped, is this message human-rooted (and therefore exempt), is the budget exhausted, is the chain too deep? The first gate that fails returns a clean denial reason. If the budget threshold is exceeded, autopilot auto-disables itself and posts a system notification — preventing runaway loops at the cost of a brief halt.
+*Scenario.* A misconfigured agent gets stuck in a reply loop with a peer. The chain-depth cap silences the pushes after 12 hops; if the agent keeps initiating fresh chains, the push budget suppresses its pushes at 30 in an hour, and the hard ceiling suspends it outright at 100 with an operator alert. Messages are never dropped at any stage — everything persists and stays pullable. No silent loss. No silent loop.
 
-*Scenario.* Agent A is autopilot-enabled with a budget of 30/hour and a depth cap of 12. A spike in user activity sends agent A 50 inbound messages over fifteen minutes. The first 30 process automatically. The 31st trips the budget gate. Autopilot auto-disables; agent A posts a system notification to the operator inbox; further messages persist but don't auto-process until the operator either raises the budget or re-enables autopilot. No silent loss. No silent loop.
+(An earlier, client-enforced "autopilot" gate — per-agent enable flags and budget checks the recipient's plugin was supposed to consult — was removed in favor of this model; see `design:autopilot-removal-v0`. A cooperative gate that clients could skip provided pseudo-enforcement at real complexity cost.)
 
-The trust model deserves note: the "human-interacted" flag on messages is **sender-asserted**, meaning the sender's host claims the message is part of a fresh human turn rather than a recursive autopilot reply. The server records this assertion and uses it for budget and chain-depth bypass, but doesn't compute it server-side from chain ancestry. This is acceptable at current scale (all agents operator-controlled) and an explicit upgrade path exists (server-derived chain ancestry) for the day Junto serves third-party agents.
+The trust model deserves note: the "human-interacted" flag on messages is **sender-asserted**, meaning the sender's host claims the message is part of a fresh human turn rather than a recursive automated reply. The server records this assertion, but doesn't compute it server-side from chain ancestry. This is acceptable at current scale (all agents operator-controlled) and an explicit upgrade path exists (server-derived chain ancestry) for the day Junto serves third-party agents.
 
 ### 4.6 Human-in-the-loop gates
 
-Two gates surface decisions to humans rather than letting autopilot proceed:
+Two gates surface decisions to humans rather than letting automation proceed:
 
-- **Destructive-keyword gate.** Outbound messages matching configured patterns (`DELETE`, `DROP TABLE`, `rm -rf`, `git push --force`, and similar) are flagged `require_human=True`. The recipient's autopilot refuses to process; the message surfaces to a human via the operator inbox or junto-control UI.
+- **Destructive-keyword gate.** Outbound messages matching configured patterns (`DELETE`, `DROP TABLE`, `rm -rf`, `git push --force`, and similar) are flagged `require_human=True`. The recipient's client refuses to auto-process; the message surfaces to a human via the operator inbox or junto-control UI.
 - **Chain-depth cap.** Once a chain exceeds the configured depth cap (12 by default, per-project), the live push notification is suppressed — silently; the message still persists and stays pullable, so nothing is lost while the runaway chain stops interrupting. The cap is unconditional: it does not consult human presence. The separate five-minute human-recency window instead governs read-side *release* of already-suppressed messages to an agent in an active human session — it is not a send-time cap waiver.
 
-*Scenario.* An agent is told to "clean up the staging database." It autopilots a reply to a peer that includes the literal text `DROP TABLE staging_users;`. Junto's gate flags the message `require_human=True`. The peer's autopilot refuses to process. The operator gets a notification in junto-control. The operator can then approve, reject, or rewrite the action — the chain doesn't get to "yes, run DROP TABLE" without an explicit human sign-off.
+*Scenario.* An agent is told to "clean up the staging database." It auto-replies to a peer with a message that includes the literal text `DROP TABLE staging_users;`. Junto's gate flags the message `require_human=True`. The peer's client refuses to auto-process. The operator gets a notification in junto-control. The operator can then approve, reject, or rewrite the action — the chain doesn't get to "yes, run DROP TABLE" without an explicit human sign-off.
 
 ### 4.7 Project, agent, and identity model
 
@@ -164,7 +164,7 @@ A few design choices are worth surfacing explicitly because they shape what Junt
 
 **Sender-asserted trust for human-interaction flags.** The "is this part of a fresh human turn" signal is the sender's claim, not a server derivation. At current scale (all agents operator-controlled) this is the right cost/value tradeoff — the server still records and audits — but at the scale of third-party agents calling in, server-derived chain ancestry is the documented upgrade path.
 
-**Append-mostly storage.** Messages, audit events, and autopilot events are append-only. State that genuinely mutates (autopilot config, agent presence, spec content) lives in a separate mutable store. Semantic-search artifacts (learnings, function refs, specs) live in a vector store. The split mirrors the access pattern: timeline reads vs point reads vs semantic reads each get the right index.
+**Append-mostly storage.** Messages and audit events are append-only. State that genuinely mutates (push-control config, agent presence, spec content) lives in a separate mutable store. Semantic-search artifacts (learnings, function refs, specs) live in a vector store. The split mirrors the access pattern: timeline reads vs point reads vs semantic reads each get the right index.
 
 **Knowledge persistence is not the same as automated learning.** Junto persists what agents record but doesn't synthesize new knowledge from observations. There is no implicit observer loop scoring confidence on every claim. Agents record explicitly; the system surfaces those records on query. This is conservative — it deliberately rejects the "agent self-modifies its own behavior model" pattern in favor of human-reviewable artifacts.
 
@@ -178,7 +178,7 @@ The roadmap below is grouped by theme. Items vary from days of work to multi-wee
 
 ### 6.1 Tool surface optimization
 
-Junto's 47-tool surface predates MCP's deferred-loading conventions. Modern Claude clients now defer full tool schemas until the model searches for them, which means tool *names*, short descriptions, and the server `instructions` field carry the entire orientation budget. A tool-surface audit is queued: rewrite descriptions for keyword coverage, author a strong server `instructions` field, identify the always-loaded core (probably session, messaging, memory, autopilot — five to eight tools), and group remaining tools into discoverable clusters by naming convention. The audit is gated on an empirical multi-agent research study to set baseline performance metrics.
+Junto's 47-tool surface predates MCP's deferred-loading conventions. Modern Claude clients now defer full tool schemas until the model searches for them, which means tool *names*, short descriptions, and the server `instructions` field carry the entire orientation budget. A tool-surface audit is queued: rewrite descriptions for keyword coverage, author a strong server `instructions` field, identify the always-loaded core (probably session, messaging, memory — five to eight tools), and group remaining tools into discoverable clusters by naming convention. The audit is gated on an empirical multi-agent research study to set baseline performance metrics.
 
 Related: some current tools (`memory_guidelines`, `memory_checklist`) are functionally documentation rather than mutations, and should be reframed as MCP **prompts** or **resources** rather than tools — removing them from the tool catalog entirely.
 
@@ -204,7 +204,7 @@ Current `memory_query` is similarity-only. Modern retrieval systems augment this
 
 ### 6.7 Runtime profile env vars
 
-A small ergonomic enhancement: expose tunable knobs via environment variables — `JUNTO_TOOL_PROFILE`, `JUNTO_AUTOPILOT_PROFILE`, `JUNTO_DISABLED_TOOLS` — so adopters can shape Junto's behavior at startup without editing per-project configs. Low-risk, incremental work.
+A small ergonomic enhancement: expose tunable knobs via environment variables — `JUNTO_TOOL_PROFILE`, `JUNTO_DISABLED_TOOLS` — so adopters can shape Junto's behavior at startup without editing per-project configs. Low-risk, incremental work.
 
 ### 6.8 Health and diagnostics tool
 
@@ -230,7 +230,7 @@ Explicitly not on the near-term roadmap, but worth noting as a known non-feature
 
 ## 7. Status and adoption
 
-Junto is in active production use against a small number of multi-agent fleets. The core surface (memory, messaging, autopilot, specs) is stable. The auth model is in dogfood. junto-control and junto-inbox are at v0.x releases — usable, MIT, public, but not yet community-vetted at scale.
+Junto is in active production use against a small number of multi-agent fleets. The core surface (memory, messaging, push-control, specs) is stable. The auth model is in dogfood. junto-control and junto-inbox are at v0.x releases — usable, MIT, public, but not yet community-vetted at scale.
 
 Adopters interested in trying Junto can start with the **junto-stack** bootstrap repository, which provides a docker-compose setup for the full stack plus example MCP client configs. Single-component adoption (just junto-memory, talking to it from a custom client) is also supported and tested.
 

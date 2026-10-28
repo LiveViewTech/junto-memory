@@ -115,6 +115,7 @@ async def memory_start_session(
     api_key: str = None,
     subscribed_components: List[str] = None,
     aliases: List[str] = None,
+    principal: bool = False,
     ctx: Context = None
 ) -> str:
     """
@@ -157,9 +158,38 @@ async def memory_start_session(
             per project — an alias that collides with a live agent name or
             another agent's alias is rejected (surfaced in `registry_warning`).
             None = leave existing aliases untouched; [] = clear them.
+        principal: Service-principal session mode (design:identity-lifecycle-v0
+            Mechanism A; first consumer: subConscience runtime subs). Requires a
+            VALIDATED api key (arg or Bearer header) — keyless/soft-auth
+            sessions are rejected as principals. The session authenticates and
+            scopes like any other, but is INVISIBLE BY CONSTRUCTION: no
+            registered_agents row, no agent_directory row, and it is filtered
+            from active-work / other-claudes enumeration. A principal can never
+            be a message RECIPIENT (send-validation is roster-based, and there
+            is no roster row). Lifecycle = key lifecycle (revoke to kill).
     """
     # Cleanup stale sessions on each new session start
     cleanup_stale_sessions()
+
+    # Assistant escheat sweep BEFORE the reaper (design:assistant-escheat-v0
+    # §5 ordering): idle assistants' specs transfer and open mail re-homes,
+    # which clears the obligations the reap guard would otherwise block on.
+    # Throttled internally; best-effort — never blocks a session start.
+    try:
+        from shared_memory.clients import get_chroma as _esch_chroma
+        from shared_memory.identity_gc import maybe_escheat_assistants
+        await maybe_escheat_assistants(get_mongo(), await _esch_chroma(), active_sessions)
+    except Exception as _esch_err:  # noqa: BLE001
+        print(f"[MCP] assistant escheat sweep failed (non-fatal): {_esch_err}")
+
+    # Pending-agent GC scan (design:identity-lifecycle-v0 Mechanism B).
+    # Throttled + pending-tier-scoped inside; default-disabled by env knob.
+    # Best-effort: a GC failure must never block a session start.
+    try:
+        from shared_memory.identity_gc import maybe_reap_pending_agents
+        maybe_reap_pending_agents(get_mongo(), active_sessions)
+    except Exception as _gc_err:  # noqa: BLE001
+        print(f"[MCP] pending-agent GC scan failed (non-fatal): {_gc_err}")
 
     # ── Drain gate ──
     # When an operator has set drain=true via memory_admin (typically during a
@@ -178,6 +208,7 @@ async def memory_start_session(
     # (user/admin/owner). Invalid keys remain hard-rejected.
     _auth_role = "agent"  # default when auth disabled OR soft-auth fallback
     _auth_projects = []   # empty = all projects
+    _key_validated = False  # true only when a real key passed validate_api_key
     try:
         from shared_memory.auth import AUTH_ENABLED, check_project_access, get_header_api_key, validate_api_key
         if AUTH_ENABLED:
@@ -201,6 +232,7 @@ async def memory_start_session(
 
                 _auth_role = key_info["role"]
                 _auth_projects = key_info.get("projects", [])
+                _key_validated = True
 
                 # Tenant isolation: check project access
                 if not check_project_access(_auth_projects, project):
@@ -251,6 +283,26 @@ async def memory_start_session(
     except ImportError:
         pass  # auth module not available, continue without auth
 
+    # ── Service-principal gate (design:identity-lifecycle-v0 Mechanism A) ──
+    # A principal session MUST ride a validated key: identity comes from key
+    # issuance, and revoking the key is the ONLY lifecycle exit. Letting a
+    # keyless/soft-auth caller go invisible would mean unattributable,
+    # unrevokable sessions.
+    if principal and not _key_validated:
+        try:
+            from shared_memory.audit import log_audit
+            log_audit("auth.principal_rejected", claude_instance, project,
+                      {"reason": "no_validated_key"})
+        except Exception:
+            pass
+        return json.dumps({
+            "error": (
+                "principal=True requires a validated API key (api_key arg or "
+                "Authorization: Bearer header). Keyless/soft-auth sessions "
+                "cannot be service principals."
+            ),
+        })
+
     # Normalize project name (single source of truth: helpers.normalize_project)
     normalized_project = normalize_project(project)
     project = normalized_project
@@ -296,7 +348,10 @@ async def memory_start_session(
 
     try:
         db = get_mongo()
-        if db is not None:
+        # Principals skip the ENTIRE registry block: no registered_agents
+        # auto-register, no agent_directory upsert, no aliases — invisible by
+        # construction (no row exists to filter out of any roster surface).
+        if db is not None and not principal:
             registered_project = db.projects.find_one({"name": normalized_project})
 
             # Path-to-identity: if instance is unknown and working_directory provided,
@@ -317,6 +372,20 @@ async def memory_start_session(
                     "project": normalized_project,
                     "name": claude_instance
                 })
+                if registered_agent and registered_agent.get("tier") == "retired":
+                    # Terminal identity (identity-lifecycle Mechanism C):
+                    # retired agents cannot start sessions. Deliberate
+                    # un-retire path: memory_project update_agent tier='named'.
+                    return json.dumps({"error": (
+                        f"Identity '{claude_instance}@{normalized_project}' is "
+                        f"RETIRED (decommissioned "
+                        f"{registered_agent.get('retired_at')}, by "
+                        f"{registered_agent.get('retired_by', 'unknown')}). "
+                        "Retired identities cannot start sessions. If this "
+                        "agent has a legitimate new purpose, an admin can "
+                        "un-retire it via memory_project(action='update_agent', "
+                        "tier='named'), or use a new name."
+                    ), "retired": True})
                 if registered_agent:
                     # Update last_seen on the registered agent
                     db.registered_agents.update_one(
@@ -331,15 +400,31 @@ async def memory_start_session(
                     else:
                         # Auto-register as "pending" tier — full tool access,
                         # coordinator gets notified to approve
+                        _reg_fields = {
+                            "project": normalized_project,
+                            "name": claude_instance,
+                            "tier": "pending",
+                            "last_seen": utc_now(),
+                            "auto_registered": True,
+                        }
+                        # Assistant-class classification at the front door
+                        # (design:assistant-escheat-v0 §2, RATIFIED 2026-08-07):
+                        # human-companion chats register by naming convention;
+                        # the class marks them for the escheat sweeps instead
+                        # of accumulating as permanently-unreapable ghosts.
+                        try:
+                            from shared_memory.identity_gc import classify_assistant
+                            _escheat_to = classify_assistant(
+                                db, normalized_project, claude_instance
+                            )
+                            if _escheat_to is not None:
+                                _reg_fields["agent_class"] = "assistant"
+                                _reg_fields["escheat_to"] = _escheat_to
+                        except Exception:
+                            pass
                         db.registered_agents.update_one(
                             {"project": normalized_project, "name": claude_instance},
-                            {"$set": {
-                                "project": normalized_project,
-                                "name": claude_instance,
-                                "tier": "pending",
-                                "last_seen": utc_now(),
-                                "auto_registered": True,
-                            }, "$inc": {"session_count": 1}},
+                            {"$set": _reg_fields, "$inc": {"session_count": 1}},
                             upsert=True
                         )
                         valid_agents = [a["name"] for a in db.registered_agents.find(
@@ -469,6 +554,10 @@ async def memory_start_session(
         "tmux_target": tmux_target,
         "role": _auth_role,
         "allowed_projects": _auth_projects,
+        # Mechanism A: active_sessions is the auth carrier so a principal MUST
+        # have an entry, but every session-keyed enumerator (get_active_work,
+        # the other_claudes briefing block) filters on this flag.
+        "is_principal": principal,
     }
 
     # Phase C2 inbox auth: bind this app-session to the underlying MCP
@@ -487,7 +576,9 @@ async def memory_start_session(
     # the agent is plausibly being supervised.
     try:
         db_for_recency = get_mongo()
-        if db_for_recency is not None:
+        # Principals skip the recency bump too — it upserts an agent_directory
+        # row, which would undo the registry-skip above.
+        if db_for_recency is not None and not principal:
             db_for_recency.agent_directory.update_one(
                 {"project": project, "instance": claude_instance},
                 {"$set": {"last_human_interaction": utc_now_iso(), "last_seen": utc_now_iso()}},
@@ -560,10 +651,14 @@ async def memory_start_session(
     except Exception:
         pass
 
-    # Active work by other Claudes (DYNAMIC)
+    # Active work by other Claudes (DYNAMIC). Principal sessions are filtered
+    # here — this briefing block enumerates active_sessions directly, making it
+    # the 4th enumeration surface alongside list_agents/standup/get_active_work
+    # (the spec's code map listed three; this one is session-keyed like
+    # get_active_work).
     _other_active = []
     for sid, info in active_sessions.items():
-        if sid != session_id:
+        if sid != session_id and not info.get("is_principal"):
             _other_active.append(f"{info['claude_instance']}@{info['project']}: {info['task'][:50]}")
             if len(_other_active) >= 20:
                 break
@@ -584,13 +679,38 @@ async def memory_start_session(
     # Server-managed guidelines (STABLE per-project — biggest stable block)
     _guidelines_block = None
     try:
-        from shared_memory.tools.guidelines import get_guidelines_for_session
+        from shared_memory.tools.guidelines import (
+            get_guidelines_for_session,
+            get_guidelines_version,
+        )
         guidelines = get_guidelines_for_session(project)
         if guidelines:
+            _gv = get_guidelines_version()
             _guidelines_block = {
                 "instructions": "MANDATORY: Follow these rules for the entire session. They are authoritative.",
+                "version": _gv,
                 "rules": [g["rule"] for g in guidelines],
             }
+            # Stamp the corpus version the agent actually received. Sessions
+            # are otherwise in-process only, so this is a small append-only
+            # mongo log (TTL 30d) — the join surface for compliance canaries:
+            # (project, instance, ts) → which guideline block was held
+            # (design:guideline-trim-v0).
+            try:
+                active_sessions[session_id]["guidelines_version"] = _gv
+                _db = get_mongo()
+                if _db is not None:
+                    _db.session_starts.create_index(
+                        "ts", expireAfterSeconds=30 * 24 * 3600)
+                    _db.session_starts.insert_one({
+                        "session_id": session_id,
+                        "project": project,
+                        "instance": claude_instance,
+                        "ts": utc_now(),
+                        "guidelines_version": _gv,
+                    })
+            except Exception:
+                pass
     except Exception as e:
         print(f"[MCP] Guidelines fetch failed (non-fatal): {e}")
 
@@ -666,6 +786,19 @@ async def memory_start_session(
         output["skills"] = _skills_block
     if _patterns_titles:
         output["patterns"] = _patterns_titles
+    # Volatile-snapshot framing (backlog_940b9f9c66e1, coordinator@nimbus
+    # msg_56ca0826b5e9): live-state sections preloaded here read as knowledge
+    # rather than as a point-in-time snapshot, and get re-asserted as current
+    # hours later. Label them so the consuming agent knows to re-pull.
+    _has_volatile = bool(_other_active or _component_peers or _relevant_locks
+                         or _signals or _blocking)
+    if _has_volatile:
+        output["volatile_snapshot_note"] = (
+            f"SNAPSHOT AS OF {utc_now_iso()} — other_claudes, component_peers, "
+            "relevant_locks, signals, and blocking_others are LIVE STATE, not "
+            "knowledge. Re-pull (memory_get_active_work / memory_get_locks) "
+            "before asserting any of them later in your session."
+        )
     if _other_active:
         output["other_claudes"] = _other_active
     if _component_peers:
@@ -685,7 +818,8 @@ async def memory_start_session(
     try:
         from shared_memory.audit import log_audit
         log_audit("session.start", claude_instance, project,
-                  {"task": task_description, "worker": _is_worker, "role": _auth_role},
+                  {"task": task_description, "worker": _is_worker, "role": _auth_role,
+                   "principal": principal},
                   session_id)
     except Exception:
         pass
@@ -726,6 +860,69 @@ async def memory_end_session(
     session_info = active_sessions[session_id]
     now = utc_now_iso()
 
+    # Write-lint (backlog_1115f9fe35f7): malformed client emissions serialize
+    # the call's own XML envelope into the learnings param, swallowing the
+    # handoff_notes that follow (8 confirmed docs, 3 callers). Strip the
+    # markup and RE-ROUTE the captured handoff to its proper field BEFORE
+    # either doc is written — never reject; every observed leak carried
+    # substantive content. Runs on both text params defensively.
+    lint_notes = []
+    try:
+        from shared_memory.write_lint import strip_envelope_leak
+        # summary is the DOMINANT leak surface — a malformed end_session emission
+        # serializes the whole call into `summary`, swallowing files_modified /
+        # handoff_notes / learnings after a bare `</summary>` (shape (c),
+        # learning_08dfd3f8cbf6f0ce). It was previously UNLINTED, so it leaked
+        # into both the rendered handoff and the work-item doc (documents=[summary]).
+        # Strip it and RE-ROUTE the swallowed text params to their real fields
+        # (when those are empty) so they render in their proper sections; keep
+        # anything else in-summary under a recovered heading. Never reject.
+        if summary:
+            summary, s_extracted, s_leaked = strip_envelope_leak(summary, "summary")
+            if s_leaked:
+                lint_notes.append("envelope leak stripped from summary")
+                _rehn = s_extracted.pop("handoff_notes", None)
+                if _rehn:
+                    if not handoff_notes:
+                        handoff_notes = _rehn
+                        lint_notes.append("re-routed swallowed handoff_notes to its field")
+                    else:
+                        s_extracted["handoff_notes"] = _rehn  # both present: keep, don't drop
+                _rel = s_extracted.pop("learnings", None)
+                if _rel:
+                    if not learnings:
+                        learnings = _rel
+                        lint_notes.append("re-routed swallowed learnings to its field")
+                    else:
+                        s_extracted["learnings"] = _rel
+                for pname, ptext in s_extracted.items():
+                    summary += f"\n\n## [write-lint] recovered {pname}\n{ptext}"
+                    lint_notes.append(f"recovered '{pname}' block kept in summary")
+        if learnings:
+            learnings, extracted, leaked = strip_envelope_leak(learnings, "learnings")
+            if leaked:
+                recovered_handoff = extracted.pop("handoff_notes", None)
+                if recovered_handoff:
+                    handoff_notes = (
+                        f"{handoff_notes}\n\n{recovered_handoff}"
+                        if handoff_notes else recovered_handoff
+                    )
+                for pname, ptext in extracted.items():
+                    lint_notes.append(f"recovered '{pname}' block ({len(ptext)} chars) appended to handoff")
+                    handoff_notes = (
+                        f"{handoff_notes}\n\n## [write-lint] recovered {pname}\n{ptext}"
+                        if handoff_notes else ptext
+                    )
+                lint_notes.insert(0, "envelope leak stripped from learnings; handoff re-routed")
+        if handoff_notes:
+            handoff_notes, h_extracted, h_leaked = strip_envelope_leak(handoff_notes, "handoff_notes")
+            if h_leaked:
+                lint_notes.append("envelope debris stripped from handoff_notes")
+                for pname, ptext in h_extracted.items():
+                    handoff_notes += f"\n\n## [write-lint] recovered {pname}\n{ptext}"
+    except Exception:
+        pass  # lint is best-effort; the park writes are the load-bearing ops
+
     # Store handoff note
     proj_collection = await get_project_collection(chroma, session_info["project"])
 
@@ -760,17 +957,26 @@ async def memory_end_session(
         }]
     )
 
-    # Store learning if provided
+    # Store learning if provided. Metadata defaulted from park context
+    # (backlog_1115f9fe35f7 adjacent win): generic "Learning from X" titles
+    # with no tags/instance made even CLEAN parks near-unfindable — the
+    # findability gap is part of why orphaned content stayed orphaned.
     if learnings:
         learning_id = generate_doc_id(learnings, "learning")
+        _task_hint = (session_info.get("task") or "").strip()[:60]
         await proj_collection.add(
             ids=[learning_id],
             documents=[learnings],
             metadatas=[{
-                "title": f"Learning from {session_info['claude_instance']}",
+                "title": (
+                    f"Learning from {session_info['claude_instance']}"
+                    + (f": {_task_hint}" if _task_hint else "")
+                ),
                 "type": "learning",
                 "status": "active",
+                "tags": json.dumps(["park-summary", session_info["claude_instance"]]),
                 "session_id": session_id,
+                "claude_instance": session_info["claude_instance"],
                 "created": now,
                 "updated": now
             }]
@@ -827,5 +1033,7 @@ async def memory_end_session(
     result = {"status": "ended"}
     if released_locks:
         result["released_locks"] = released_locks
+    if lint_notes:
+        result["write_lint"] = lint_notes
 
     return json.dumps(result)

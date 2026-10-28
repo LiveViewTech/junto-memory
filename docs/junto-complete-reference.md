@@ -97,7 +97,7 @@ The developer's `claude` process connects to the junto-memory server via HTTP (M
 - Keys are provisioned by an admin via `memory_admin(action="create_key")`.
 - Auth is Bearer header: `Authorization: Bearer smk_...` in `~/.mcp.json`. The key does not need to be passed as a tool argument.
 - When `JUNTO_REQUIRE_KEY=true` (recommended for non-localhost deployments), keyless sessions are rejected outright.
-- Four key tiers: `owner` (full admin + key management), `admin` (project-scoped admin), `user` (human-tier, bypasses some autopilot gates), `agent` (default, project-scoped access).
+- Four key tiers: `owner` (full admin + key management), `admin` (project-scoped admin), `user` (human-tier — its messages start fresh chains at depth 0), `agent` (default, project-scoped access).
 
 **Network isolation:**
 - The server binds MCP (8080) to `127.0.0.1` + the tailnet/LAN IP. It does NOT bind to `0.0.0.0`.
@@ -388,6 +388,8 @@ Type `park` before closing the window. The park checklist (mandatory):
 6. **End session** — `memory_end_session(summary, files_modified, handoff_notes)`.
 
 **If you close without parking**, the next session starts without state context. Three minutes of parking saves twenty minutes of re-orientation.
+
+**When to park.** The park signal is task completion at a clean stopping point — not a token or exchange count. On 1M-context models: keep working **< 500K** tokens (do not park early "to preserve context"); watch for real degradation **500–800K** (re-reading known files, re-asking settled questions, contradicting earlier decisions) and park at the next clean stop; park even mid-task **> 800K**. Coordinators shift these bands ~150–200K lower (channel messages and spec pulls are large). Any park should cite a token count or a named symptom — "feels long" is not evidence. These bands live in the server's **global guidelines** (`memory_guidelines`), which are **authoritative and supersede any older context/session heuristic still written in a project's `CLAUDE.md`** — this is how a fleet reconciles: update the guideline once, and every agent on every machine picks it up at its next `go`, regardless of what its local `CLAUDE.md` says.
 
 ### 6.3 The State Spec
 

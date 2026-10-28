@@ -2,22 +2,27 @@
 # Helper Functions - All async for use with AsyncHttpClient
 # =============================================================================
 
+import asyncio
 import fnmatch
 import hashlib
 import json
+import logging
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from shared_memory.config import (
     DEFAULT_EXPIRY_DAYS,
     OVERLAP_WINDOW_HOURS,
     PROJECT_PREFIX,
+    SESSION_IDLE_HOURS,
     SESSION_TTL_DAYS,
     SHARED_PREFIX,
     SIGNAL_RETENTION_HOURS,
     STALE_LOCK_MINUTES,
 )
 from shared_memory.state import active_sessions, active_signals, file_locks
+
+logger = logging.getLogger(__name__)
 
 MIN_RELEVANCE_THRESHOLD = 0.3  # 30% minimum relevance
 
@@ -87,6 +92,80 @@ async def get_project_collection(client, project: str):
 async def get_shared_collection(client, collection_type: str):
     """Get a shared collection (patterns, context, work) (async)."""
     return await client.get_or_create_collection(name=f"{SHARED_PREFIX}{collection_type}")
+
+
+async def embed_query_once(collection, text: str) -> Optional[List[Any]]:
+    """Embed `text` ONCE, OFF the event loop, so the caller can reuse the vector
+    across every collection it scans.
+
+    ⚠️ THE EMBEDDING IS CLIENT-SIDE, IN THIS PROCESS. `AsyncHttpClient`
+    collections carry a `DefaultEmbeddingFunction` (ONNX MiniLM, 384-dim) and
+    `query_texts=[...]` runs it HERE, not in the chromadb container. Two
+    consequences that together were the whole performance story
+    (learning_faca6ab430b48cbc, measured 2026-08-11):
+
+    1. **It was run once PER COLLECTION.** memory_query scans project + shared
+       patterns + shared context, and `/recall` does the same — so one request
+       embedded the identical text THREE times at ~96-138 ms each, ~300-400 ms
+       of pure duplicate work.
+    2. **It ran ON the event loop.** ONNX inference is a blocking C call, so
+       while one agent embedded, every other agent's request queued behind it —
+       including 2 ms calls. Measured: `memory_query` 1-2 ms at rest vs 167 ms
+       median (331 ms max) under 6 concurrent `/recall` clients, recovering
+       instantly when load stopped. The server was never slow; it serialised.
+
+    `asyncio.to_thread` fixes (2) because ONNX releases the GIL during
+    inference; reusing the returned vector fixes (1).
+
+    SAFE TO SHARE ONE VECTOR ACROSS COLLECTIONS because every collection in
+    this server is created by `get_project_collection` / `get_shared_collection`,
+    neither of which passes an `embedding_function` — so all of them use the
+    same default. ⚠️ If a collection is ever created with a custom embedding
+    function, it MUST embed its own query text or its distances become garbage.
+
+    FAILS OPEN: returns None on any problem (private attribute missing, model
+    error). Callers must fall back to `query_texts=[...]`, which is exactly the
+    previous behaviour — a perf optimisation must never cost a result.
+    """
+    try:
+        ef = getattr(collection, "_embedding_function", None)
+        if ef is None:
+            return None
+        vectors = await asyncio.to_thread(ef, [text])
+        if vectors is None or len(vectors) == 0:
+            return None
+        vector = vectors[0]
+        return vector.tolist() if hasattr(vector, "tolist") else list(vector)
+    except Exception as e:  # noqa: BLE001 - optimisation path, degrade to query_texts
+        logger.warning("embed_query_once failed (%s) — falling back to query_texts", e)
+        return None
+
+
+def query_kwargs(text: str, vector: Optional[List[Any]]) -> Dict:
+    """Chroma query kwargs: the precomputed vector when we have one, else the
+    raw text (the pre-2026-08-11 path). Keeps the fallback in ONE place so a
+    caller cannot half-adopt it."""
+    return {"query_embeddings": [vector]} if vector else {"query_texts": [text]}
+
+
+def project_from_collection(collection_name: str) -> str:
+    """Derive the owning project from a Chroma collection name.
+
+    THE COLLECTION IS THE AUTHORITY ON SCOPE, not the `project` metadata key.
+    Routing has always been by collection; the metadata field is a copy — and
+    for learnings it was a MISSING copy: `memory_record_learning` never wrote
+    the key at all, so 4374 of 4397 learnings (99.5%, every project, since day
+    one) reported `project: ""` on the get_by_id / query surfaces despite being
+    correctly filed. Reported by coordinator@nimbus 2026-08-10 (msg_b91f7992752a).
+
+    Read surfaces call this as a FALLBACK so every historical doc reads
+    correctly without a backfill migration — a migration can half-apply and
+    then nobody knows which half they are looking at. Shared collections have
+    no project by construction and return "".
+    """
+    if collection_name and collection_name.startswith(PROJECT_PREFIX):
+        return collection_name[len(PROJECT_PREFIX):]
+    return ""
 
 
 def generate_doc_id(content: str, doc_type: str) -> str:
@@ -194,11 +273,17 @@ def check_session(session_id: str) -> bool:
 
 
 def require_session(session_id: Optional[str]) -> str:
-    """Validate session exists, return error message if not."""
+    """Validate session exists, return error message if not.
+
+    On success, touches the session's last_activity so idle-expiry
+    (cleanup_stale_sessions) measures real inactivity — any authenticated
+    tool call counts as activity, not just update_work/heartbeat.
+    """
     if not session_id:
         return "ERROR: No session_id provided. You must call memory_start_session first and include the returned session_id in all subsequent calls."
     if not check_session(session_id):
         return f"ERROR: Session '{session_id}' not found. Call memory_start_session first to register your session."
+    active_sessions[session_id]["last_activity"] = utc_now_iso()
     return ""
 
 
@@ -389,13 +474,57 @@ def release_session_locks(session_id: str) -> List[str]:
     return released
 
 
+def _sids_with_live_subscription() -> set:
+    """App session ids that hold at least one live inbox SSE subscription.
+
+    Inverts mcp_session_to_app against the union of inbox_subscriptions
+    buckets. Best-effort: any failure returns the empty set, which only makes
+    idle-expiry MORE conservative callers-side when paired with `discard`
+    semantics — callers must treat membership as \"do not idle-expire\".
+    """
+    subscribed = set()
+    try:
+        from shared_memory.state import mcp_session_to_app
+        from shared_memory.tools.messaging import inbox_subscriptions
+        live_transports = set()
+        for bucket in inbox_subscriptions.values():
+            live_transports.update(bucket)
+        for transport, sid in mcp_session_to_app.items():
+            if transport in live_transports:
+                subscribed.add(sid)
+    except Exception:
+        pass
+    return subscribed
+
+
 def cleanup_stale_sessions():
-    """Remove sessions with no activity for SESSION_TTL_DAYS."""
+    """Expire stale sessions on two tiers (backlog_940b9f9c66e1):
+
+    1. Hard TTL: no activity for SESSION_TTL_DAYS (14d) — unconditional.
+    2. Idle expiry: no tool call for SESSION_IDLE_HOURS (default 6h, env
+       JUNTO_SESSION_IDLE_HOURS, 0 disables) AND no live inbox SSE
+       subscription. A subscribed-but-quiet plugin session is healthy and is
+       never idle-expired; a session whose process died (or whose socket
+       half-opened and got keepalive-pruned) has no subscription and goes.
+       require_session touches last_activity on every tool call, so tier 2
+       measures real inactivity.
+    """
     cutoff = utc_now() - timedelta(days=SESSION_TTL_DAYS)
+    idle_cutoff = (
+        utc_now() - timedelta(hours=SESSION_IDLE_HOURS)
+        if SESSION_IDLE_HOURS > 0 else None
+    )
+    subscribed_sids = _sids_with_live_subscription() if idle_cutoff else set()
     to_remove = []
     for sid, info in active_sessions.items():
         last_activity = parse_timestamp(info.get("last_activity", ""))
-        if last_activity and last_activity < cutoff:
+        if not last_activity:
+            continue
+        if last_activity < cutoff:
+            to_remove.append(sid)
+        elif (idle_cutoff is not None
+                and last_activity < idle_cutoff
+                and sid not in subscribed_sids):
             to_remove.append(sid)
     for sid in to_remove:
         # Release any locks held by this session
@@ -420,7 +549,8 @@ def cleanup_stale_sessions():
             pass
         del active_sessions[sid]
     if to_remove:
-        print(f"[MCP] Auto-expired {len(to_remove)} stale sessions (>{SESSION_TTL_DAYS} days idle)")
+        print(f"[MCP] Auto-expired {len(to_remove)} stale sessions "
+              f"(>{SESSION_TTL_DAYS}d TTL or >{SESSION_IDLE_HOURS}h idle with no live subscription)")
     return to_remove
 
 

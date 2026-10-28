@@ -76,10 +76,21 @@ switches. ALL persistent knowledge goes to the MCP shared memory server:
 - `memory_register_function` for code
 
 ### Session Length Discipline
-Park after completing focused work units (1-3 related tasks). Do NOT run
-marathon sessions. Long sessions cause context window degradation — you start
-forgetting instructions and making mistakes as the window fills. When in doubt,
-park early and leave good handoff notes.
+Run longer sessions. On 1M-context models the park signal is TASK COMPLETION at
+a clean stopping point — not a task count, not "feels long." Parking early costs
+more than it saves: the unrecorded *why* behind small decisions dies at park.
+Context-usage bands (the server's global guidelines are authoritative and
+override this template if they differ):
+- **< 500K tokens:** keep working. Do NOT park mid-task "to preserve context."
+  The old "1-3 tasks" / "~100 exchanges" heuristics were calibrated to 200K
+  windows and no longer apply.
+- **500–800K:** watch for real degradation — re-reading files you already read,
+  re-asking settled questions, contradicting earlier decisions — and park at the
+  next clean stop.
+- **> 800K:** park even mid-task, with handoff notes.
+
+Any park recommendation must cite a token count or a named symptom. If the user
+says park, park.
 
 ### Topic-Scoped Parking
 Do NOT dump everything into one monolith state:{AGENT_NAME} spec. The goal is

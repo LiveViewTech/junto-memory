@@ -13,8 +13,9 @@ Three defects, all here:
 
 Fix: when project is omitted, get_spec tries the caller's OWN project first,
 then shared; skips non-active docs; and falls back to the live doc when an
-explicit version request matches the current version. define_spec rejects the
-malformed-content signature.
+explicit version request matches the current version. define_spec no longer
+rejects the malformed-content signature — reconciled 2026-08-26 to the shared
+strip-and-recover posture every free-text writer uses (backlog_8d33a63e2626).
 """
 
 import json
@@ -250,9 +251,13 @@ async def test_list_specs_include_versions_finds_intact_history(monkeypatch):
     assert av >= {"1.2.27", "1.2.28", "1.2.29", "1.2.30"}, av
 
 
-async def test_define_spec_rejects_malformed_xml_leak(monkeypatch):
-    """define_spec must reject content where a tool-call serialization leaked in
-    (the class that created the original ghost)."""
+async def test_define_spec_recovers_malformed_xml_leak(monkeypatch):
+    """define_spec used to REJECT content where a tool-call serialization leaked
+    in (the class that created the original ghost). Reconciled 2026-08-26
+    (backlog_8d33a63e2626) to the shared RECOVERY posture every free-text writer
+    uses: strip + re-route + warn, so no work is lost and no retry is needed."""
+    collections = {}
+    _patch_chroma(monkeypatch, collections)
     _install()
     bad = ('## Current Task\nreal content...\n</content>'
            '<parameter name="spec_type">agent_state</parameter>'
@@ -260,4 +265,12 @@ async def test_define_spec_rejects_malformed_xml_leak(monkeypatch):
     res = json.loads(await specs.memory_define_spec(
         session_id="s1", name="state:frames-team", content=bad,
         spec_type="agent_state", project="nimbus", owner="frames-team"))
-    assert "error" in res and "malformed" in res["error"].lower(), res
+    # Recovery, not rejection: the write succeeds and flags the malformed client.
+    assert "error" not in res, res
+    assert res["status"].endswith("_with_recovery"), res
+    assert res.get("write_lint"), res
+    # The stored doc is clean — the envelope tail is gone.
+    stored_doc, _meta = collections["proj_nimbus"].docs["spec_state_frames-team"]
+    assert "</content>" not in stored_doc and "</invoke>" not in stored_doc, stored_doc
+    # A swallowed non-project param (spec_type) is preserved in-doc, not lost.
+    assert "agent_state" in stored_doc, stored_doc

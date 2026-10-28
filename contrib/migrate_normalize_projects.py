@@ -11,6 +11,7 @@ Usage:
 """
 
 import argparse
+import os
 import sys
 from typing import Dict, List
 
@@ -81,7 +82,15 @@ def migrate_checklists_id(coll: Collection, dry_run: bool) -> Dict[str, int]:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dry-run", action="store_true", help="report only, do not write")
-    ap.add_argument("--mongo-uri", default="mongodb://mcp_orch:changeme@mongodb:27017/mcp_orchestrator?authSource=admin")
+    ap.add_argument(
+        "--mongo-uri",
+        default=os.environ.get(
+            "MONGO_URI",
+            # Matches the MONGO_PASSWORD:-changeme convention in docker-compose.yml /
+            # .env.example — not a real credential. See README.md's MONGO_PASSWORD note.
+            f"mongodb://mcp_orch:{os.environ.get('MONGO_PASSWORD', 'changeme')}@mongodb:27017/mcp_orchestrator?authSource=admin",
+        ),
+    )
     ap.add_argument("--db", default="mcp_orchestrator")
     args = ap.parse_args()
 

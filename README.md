@@ -10,11 +10,16 @@
 
 **A shared memory and coordination server for multiple AI coding agents, built on the Model Context Protocol (MCP).**
 
+> 📋 **Running a server already?** See [`CHANGELOG.md`](CHANGELOG.md) for release notes — the current release (1.39.0) changes how global guidelines are seeded and generalizes the `execute-don't-ask` default; each has an upgrade note.
+
+> [!IMPORTANT]
+> **This is meant to be set up by an AI agent, not installed by hand.** Junto exists to coordinate fleets of coding agents, so the install is written for one of those agents to read and run — clone the repo and hand it to a Claude Code (or any MCP-capable) session, and let it drive. The commands in this README and in [`AGENT_INSTALL.md`](AGENT_INSTALL.md) are there so you can follow along and so the agent has something exact to execute; they are **not** a hand-tuned human tutorial, and reading them straight through isn't the intended path. You stay in control — the agent pauses for every real decision (passwords, ports, auth). If handing setup to an agent isn't something you'd want to do, this probably isn't the tool for you.
+
 When you run multiple AI agents on the same codebase, three things break fast:
 
 1. **They forget everything between sessions.** Agent parks, knowledge dies. The next agent re-reads the same code, re-discovers the same bugs, re-learns the same gotchas.
 2. **They step on each other.** Two agents modify the same file. Nobody knows what anyone else is doing or has locked.
-3. **They get dumber as sessions get long.** Research calls this "context rot" — model performance degrades as the context window fills up, even well below capacity. Longer sessions don't mean better work.
+3. **They get dumber as sessions get long.** Research calls this "context rot" — model performance degrades as the context window fills up. Eventually every agent has to hand off; without a shared brain that handoff throws away everything it learned.
 
 This server fixes all three. It gives your agents a shared brain that persists across sessions, coordinates work across agents, and lets them record what they learn so the next agent starts where the last one left off.
 
@@ -50,7 +55,7 @@ There are 370+ MCP memory servers listed on PulseMCP. Most give a single agent p
 | External database access | No | Yes — Read-only SQL queries (MSSQL, MySQL) against your project databases |
 | Checklists | No | Yes — Shared launch readiness, deploy steps, etc. |
 
-40 tools across 14 categories. Not a toy — a coordination system.
+57 tools across 20 categories. Not a toy — a coordination system.
 
 ---
 
@@ -92,8 +97,8 @@ The server runs as a single Docker Compose stack. AI agents connect over MCP (st
 This server is designed for AI coding agents, so the install procedure is too. Clone the repo, then ask your agent to install it for you:
 
 ```bash
-git clone https://github.com/tlemmons/mcp-shared-memory.git
-cd mcp-shared-memory
+git clone https://github.com/tlemmons/junto-memory.git
+cd junto-memory
 # Now hand the prompt below to your AI agent in a fresh session.
 ```
 
@@ -105,7 +110,7 @@ The agent walks through prerequisites, env-file configuration, container start, 
 
 **Why this way?** The install has accumulated enough operational gotchas — Chroma volume mount path, Mongo init credentials, the auth env-var with soft-fallback, the difference between localhost and remote-host trust models — that a 6-line quickstart misleads more often than it helps. `AGENT_INSTALL.md` is dense, branchy, and tested against the actual current code; an agent reads and executes it in a few minutes. If you don't trust an AI agent to run the install, this server is probably not for you — its whole purpose is to coordinate fleets of AI agents working on real codebases.
 
-**Manual install:** `AGENT_INSTALL.md` is human-readable too. It's denser than typical README prose, but follow it the same way and the install works.
+**Doing it by hand anyway?** `AGENT_INSTALL.md` is legible to a person and the install works if you follow it carefully — but it's written for an agent to execute, so it's dense, branchy, and light on the hand-holding a human tutorial would give. The agent-driven path above is the supported one.
 
 After install, MongoDB listens on `localhost:27019`, ChromaDB on `localhost:8001`, and the MCP server on `localhost:8080`.
 
@@ -215,7 +220,7 @@ No API keys or authentication tokens are required for local use (see [Security](
 
 ## Tool Reference
 
-48 tools organized into 14 categories. (For the canonical, current list with grouping and end-to-end flows, see the architecture spec inside the server: `memory_get_spec(name="architecture:shared-memory-v1", project="shared_memory")`.)
+57 tools organized into 20 categories. (For the canonical, current list with grouping and end-to-end flows, see the architecture spec inside the server: `memory_get_spec(name="architecture:shared-memory-v1", project="junto")`.)
 
 ### Session Management (2)
 
@@ -325,6 +330,71 @@ No API keys or authentication tokens are required for local use (see [Security](
 | `memory_change_status` | Change a document's status: active, deprecated, superseded, archived. Preserves history. |
 | `memory_archive_by_tag` | Bulk archive all documents matching a tag (e.g., end-of-version cleanup). |
 | `memory_restore_by_tag` | Bulk restore previously archived documents by tag. |
+
+### Coordination & Activity (2)
+
+| Tool | Description |
+|------|-------------|
+| `memory_get_active_work` | See what other agents are currently working on — tasks, files touched, timestamps. Avoid overlap. |
+| `memory_claim_message` | Claim a message so exactly one agent in a group handles it (multi-consumer coordination). |
+
+### Reminders & Scheduling (3)
+
+| Tool | Description |
+|------|-------------|
+| `memory_set_reminder` | Schedule a message to your future self (or a peer) at a specific time — deadlines, follow-ups, "ping me after X". |
+| `memory_cancel_reminder` | Cancel a previously scheduled reminder. |
+| `memory_list_reminders` | List your pending scheduled reminders. |
+
+### Skills (6)
+
+Reusable, task-invoked how-to procedures. Authored as `draft`, promoted to `active` through a trust gate, and materialized into `.claude/skills/` by a launcher so the client's native matcher fires them mid-task.
+
+| Tool | Description |
+|------|-------------|
+| `memory_register_skill` | Author a reusable skill (trigger + steps + gotchas + preconditions). Always creates a `draft`. |
+| `memory_confirm_skill` | Promote a draft skill to `active` — the trust gate. Owner/human only. |
+| `memory_get_skill` | Fetch one skill's full body by id or name. |
+| `memory_list_skills` | List skills (headers) scoped by project/role/directory/status. Pinned first, then active. |
+| `memory_pin_skill` | Pin/unpin a skill so it ranks first in surfacing. |
+| `memory_export_skills` | Export active, scope-matched skills as ready-to-write `SKILL.md` payloads for a launcher to materialize. |
+
+### Behavioral Directives (1)
+
+| Tool | Description |
+|------|-------------|
+| `memory_ack_directive` | Acknowledge a server-issued directive (e.g. a park or behavioral instruction) so it clears. |
+
+### Push-Control, Alerts & Telemetry (2)
+
+Operator visibility into the messaging rate-limit / push-control subsystem (chain-depth caps, per-agent hourly budgets, silent suppression).
+
+| Tool | Description |
+|------|-------------|
+| `memory_list_alerts` | List push-control alerts — budget warnings, budget breaches, hard-ceiling trips — for an operator dashboard or polling fallback. |
+| `memory_get_emission_stats` | Per-agent message-emission counters and budget usage. |
+
+### Team Status & Health (2)
+
+| Tool | Description |
+|------|-------------|
+| `memory_standup` | Auto-compiled team standup for a project — every agent's current task, blockers, stale state specs, and an aggregated decision queue. Read-only, needs no agent to produce it. |
+| `memory_health` | Server health — MongoDB + ChromaDB status and active session/lock/signal counts. No session required. |
+
+### Replication / Sync (2, server-to-server)
+
+Phase-2 local-first replication endpoints (`admin`/`owner` tier). A LAN-local junto-memory reconciles with a central instance by shipping op-log entries — peers never re-embed text.
+
+| Tool | Description |
+|------|-------------|
+| `memory_sync_pull` | Pull op-log entries newer than the caller's per-origin cursor. |
+| `memory_sync_push` | Apply a batch of op-log entries received from a peer (seq-monotonic, intent-deduped). |
+
+### Backlog — bulk (1)
+
+| Tool | Description |
+|------|-------------|
+| `memory_batch_backlog` | Create or update many backlog items in one call. |
 
 ---
 
@@ -532,7 +602,15 @@ This server includes tools to fight that drift:
 
 ### Server-managed guidelines
 
-Set rules once via `memory_guidelines`, every agent receives them at session start. Rules like "never write to local files," "record learnings immediately," "park after 1-3 tasks." Update once — every agent on every machine picks it up on their next `memory_start_session`.
+Every agent receives a set of behavioral rules at session start (in the `memory_start_session` response). There are two tiers:
+
+**Built-in global defaults (shipped, universal).** Junto ships a set of `scope="global"` rules in code — [`src/shared_memory/global_guidelines.py`](src/shared_memory/global_guidelines.py) — that are re-seeded into the DB on every server boot. So a fresh server (yours, or an isolated peer/work box) gets sane defaults with **zero manual setup**, and updating a default travels with the deploy. These are deliberately **universal process** — memory-first querying, running longer sessions and parking at a clean stop, accuracy over agreement, persisting knowledge to the server, recording learnings immediately, session discipline, message semantics, pointers-not-summaries, contracts-before-code, freshness checks, concise output, and reading the source before asserting. Nothing team- or deployment-specific lives here. Global scope is **code-managed and read-only through the tool** — change a default by editing that file and deploying (the seeder re-asserts it), not with a live edit.
+
+**Your own rules (project-scoped, runtime).** Add rules specific to your team or project with `memory_guidelines(action="set", scope="<project>", name=..., rule=...)` — these are writable at runtime and served only to agents in that project. This is where deployment specifics go.
+
+**Approval boundaries.** The built-in "execute, don't ask" rule is intentionally generic — it states the principle (do reversible work; only a human approves the irreversible) and **defers the exact boundaries to your fleet's own approval contract**. Define yours as a spec (e.g. `memory_define_spec(name="approval-contract", spec_type="interface", ...)`) or a project-scoped guideline; agents pull it when an action's reversibility is in question. Don't bake one fleet's staging/prod/merge policy into the shipped defaults.
+
+Server guidelines are authoritative for the process they cover — they override any stale context/session heuristic still sitting in a project's `CLAUDE.md`.
 
 ### Staleness management
 
@@ -562,7 +640,7 @@ Don't want to run your own server? A hosted version is available — you get a d
 
 - No server setup — connect your agents in minutes
 - Automatic backups
-- Same 40 tools, same features
+- Same 57 tools, same features
 - Multi-project isolation
 
 **Interested?** Open an issue or reach out for details.

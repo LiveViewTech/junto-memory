@@ -1,0 +1,14 @@
+[Unit]
+Description=Run junto-backup-verify.service daily at 05:00 local
+Documentation=file:///c/code/Nimbus/infra/sage/junto-backup/README.md
+
+[Timer]
+# Backup crons (local time): chroma 03:00, mongo 03:15, sync-to-storm 04:00.
+# Verify at 05:00 local — after all three, with an hour of slack.
+OnCalendar=*-*-* 05:00:00
+Persistent=true
+AccuracySec=1m
+Unit=junto-backup-verify.service
+
+[Install]
+WantedBy=timers.target

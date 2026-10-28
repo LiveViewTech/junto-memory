@@ -248,9 +248,9 @@ The agent is now **federated** in v0.6.0 terminology. Pinned-to-peer per
 §7.5: if the peer drops, the agent fails loudly. No silent fallback to the
 primary.
 
-Generate the agent's API key on the peer (NOT the primary). Per §7.3,
-autopilot config is primary-write only, but everything else routes through
-the peer.
+Generate the agent's API key on the peer (NOT the primary). Everything
+routes through the peer. (The §7.3 primary-write-only carve-out applied to
+autopilot config, which was removed in design:autopilot-removal-v0.)
 
 ## 9. Verify round-trip
 
