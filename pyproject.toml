@@ -22,12 +22,18 @@ classifiers = [
 ]
 
 dependencies = [
-    "mcp[cli]>=1.0.0",
-    "chromadb>=0.4.0",
+    # <2 pin is load-bearing: MCP SDK v2 (2026-07-28 spec) renames FastMCP->MCPServer
+    # and our app.py chokepoint patches target v1 internals. Migration is
+    # backlog-tracked; v1 receives fixes >=6 months post-v2-stable.
+    "mcp[cli]>=1.0.0,<2",
+    "chromadb==1.5.9",
     "pydantic>=2.0.0",
     "uvicorn>=0.30.0",
     "starlette>=0.38.0",
     "pymongo>=4.0.0",
+    "croniter>=2.0.0",
+    "jsonschema>=4.0.0",
+    "cryptography>=41.0.0",
 ]
 
 [project.optional-dependencies]
@@ -40,7 +46,7 @@ dev = [
 ]
 
 [project.urls]
-Repository = "https://github.com/tlemmons/mcp-shared-memory"
+Repository = "https://github.com/tlemmons/junto-memory"
 
 [project.scripts]
 junto-sync-engine = "shared_memory.sync_engine:cli_main"

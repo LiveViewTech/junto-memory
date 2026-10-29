@@ -261,9 +261,11 @@ def test_emit_op_log_monotonic_across_three_canary_types():
 
 
 def test_op_types_catalog_size_is_v1_locked():
-    """§4.1 is closed at 26 entries for MVP. Adding a 27th requires a
-    documented amendment. This guards against silent catalog drift."""
-    assert len(op_log.OP_TYPES) == 26
+    """§4.1 was closed at 26 entries for MVP; the 3 autopilot.* entries were
+    removed by documented amendment (design:autopilot-removal-v0 Phase 2),
+    closing it at 23. Adding a 24th requires a documented amendment. This
+    guards against silent catalog drift."""
+    assert len(op_log.OP_TYPES) == 23
     assert "store.created" in op_log.OP_TYPES
     assert "learning.recorded" in op_log.OP_TYPES
     assert "message.sent" in op_log.OP_TYPES

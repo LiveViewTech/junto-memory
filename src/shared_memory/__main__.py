@@ -12,8 +12,472 @@ from shared_memory.app import create_app
 from shared_memory.auth import AUTH_ENABLED
 from shared_memory.clients import get_chroma, get_mongo
 from shared_memory.config import CHROMA_HOST, CHROMA_PORT, PROJECT_PREFIX, SHARED_PREFIX
-from shared_memory.helpers import utc_now
+from shared_memory.facets import SHAPE_LABELS, modality_shape
+from shared_memory.helpers import embed_query_once, query_kwargs, utc_now
 from shared_memory.state import active_sessions, active_signals, file_locks
+
+
+async def _export_skills_payload(body, api_key, via_tunnel=False):
+    """Pure request→response logic for POST /export-skills, split out from the
+    Starlette route so it is unit-testable without a live server. Returns
+    (status_code, dict).
+
+    `body` is the parsed JSON (any type — validated here). `api_key` is the
+    Bearer token parsed from the header by the ASGI middleware (None if absent);
+    `via_tunnel` is that middleware's CF-Connecting-IP flag.
+
+    Auth MIRRORS memory_start_session's Path B soft-auth (sessions.py) exactly —
+    do not invent a stricter policy here or the keyless-home launcher path
+    (which the whole endpoint exists for) breaks:
+      - AUTH disabled → open.
+      - valid key → tenant check (403 if the key lacks the project).
+      - invalid key → hard reject (401).
+      - NO key → soft-fall to agent tier (export allowed), UNLESS a rejection
+        gate fires: REQUIRE_KEY (reject every keyless) or TUNNEL_REQUIRES_KEY
+        and this request is tunnel-origin.
+    The launcher prunes SKILL.md files by footer, so a DB outage MUST fail loud
+    (503/500) rather than return an empty 200 that would wipe every materialized
+    skill — see build_skill_export's strict path."""
+    from shared_memory.auth import (
+        AUTH_ENABLED,
+        REQUIRE_KEY,
+        TUNNEL_REQUIRES_KEY,
+        check_project_access,
+        validate_api_key,
+    )
+    from shared_memory.tools.skills import build_skill_export
+
+    if not isinstance(body, dict):
+        return 400, {"error": "JSON body must be an object"}
+
+    project = (body.get("project") or "").strip()
+    if not project:
+        return 400, {"error": "'project' is required"}
+
+    if AUTH_ENABLED:
+        if api_key:
+            key_info = validate_api_key(api_key)
+            if not key_info:
+                return 401, {"error": "invalid or revoked API key"}
+            if not check_project_access(key_info.get("projects", []), project):
+                return 403, {
+                    "error": f"API key lacks access to project '{project}'",
+                    "allowed_projects": key_info.get("projects", []),
+                }
+        elif REQUIRE_KEY or (TUNNEL_REQUIRES_KEY and via_tunnel):
+            # Keyless rejected by an origin-trust gate (design:auth-origin-trust-v0).
+            return 401, {
+                "error": ("This server requires an API key. Provide an "
+                          "'Authorization: Bearer <key>' header."),
+                "auth_required": True,
+            }
+        # else: keyless LAN/local → agent tier, export allowed (no tenant gate).
+
+    # Clamp limit defensively — this is an unauthenticated-from-bash surface on
+    # keyless home; a bad/huge value must not become a giant query.
+    try:
+        limit = int(body.get("limit", 25))
+    except (TypeError, ValueError):
+        limit = 25
+    limit = max(1, min(limit, 100))
+
+    # Fast, clear 503 for the common outage (cold Mongo). A mid-life query error
+    # surfaces as 500 via build_skill_export's strict matcher; either way the
+    # launcher sees a non-2xx and holds off pruning.
+    if get_mongo() is None:
+        return 503, {"error": "MongoDB unavailable"}
+
+    try:
+        result = build_skill_export(
+            project,
+            role=body.get("role"),
+            role_description=body.get("role_description"),
+            working_directory=body.get("working_directory"),
+            limit=limit,
+        )
+    except Exception as e:
+        return 500, {"error": f"skill export failed: {e}"}
+    return 200, result
+
+
+# Server-side cap on /recall query text (~2k tokens). Launcher windows should
+# stay under this; longer bodies are truncated, never rejected (contract).
+RECALL_QUERY_CAP_CHARS = 8000
+RECALL_SCOPE_TYPES = {
+    "all": None,
+    "learnings": ["learning"],
+    "specs": ["spec", "architecture"],
+    "functions": ["function_ref"],
+}
+
+
+def _recall_where(scope_types):
+    """Chroma where-clause for /recall. Multiple top-level keys in a Chroma
+    where dict are unreliable across versions (the 28570d4 family of silent
+    empty results) — always compose multi-condition filters with an explicit
+    $and."""
+    conds = [{"status": "active"}]
+    if scope_types:
+        conds.append({"type": {"$in": scope_types}})
+    return conds[0] if len(conds) == 1 else {"$and": conds}
+
+
+# Handoffs older than this never surface in /recall. The hygiene guideline
+# already declares >14d handoffs noise; the first junto dogfood day confirmed
+# it empirically (5 stale-handoff injections on a routine coordination turn,
+# 0 pulled — backlog_4c670062534c). Fresh handoffs still surface: "what was
+# the last session doing" is a legitimate recall hit.
+RECALL_HANDOFF_MAX_AGE_DAYS = 14
+
+
+def _recall_stale_handoff(meta):
+    if meta.get("type") != "handoff":
+        return False
+    from shared_memory.helpers import parse_timestamp, utc_now
+    ts = parse_timestamp(meta.get("updated") or meta.get("created"))
+    if ts is None:
+        return True  # undateable handoff — treat as stale
+    from datetime import timedelta
+    return (utc_now() - ts) > timedelta(days=RECALL_HANDOFF_MAX_AGE_DAYS)
+
+
+def _recall_age_days(updated):
+    """Whole days since `updated` (interface:recall-v0 1.4.0), None if undateable.
+    Lets a hook show "· 143d" so a stale header looks stale."""
+    from shared_memory.helpers import parse_timestamp, utc_now
+    ts = parse_timestamp(updated) if updated else None
+    if ts is None:
+        return None
+    return max(0, (utc_now() - ts).days)
+
+
+def _recall_foreign_digest(meta, agent):
+    """Another agent's session digest: a handoff, or an end_session
+    park-summary learning (a list of pointers to that session's learnings).
+    Measured 10-05..10-12 on nimbus: 414 handoff headers served, 1 body
+    pulled; learnings 1,856 served, 32 pulled. The nimbus fleet survey
+    (msg_171e9f2de967) asked for exactly this de-weighting. A digest only
+    summarises; the learnings it points at surface on their own. The
+    requester's OWN digests still surface ("what was my last session doing")."""
+    if meta.get("type") != "handoff":
+        from shared_memory.facets import is_park_summary
+        if not is_park_summary(meta.get("tags")):
+            return False
+    return not agent or meta.get("claude_instance") != agent
+
+
+# Self-echo suppression window: a doc authored by the REQUESTING agent this
+# recently is context it already holds — injecting it back is waste by
+# construction (nimbus first-day case: an agent served its own 10-minute-old
+# learning at 0.71 as a "discovery"). Older own-docs still surface: agents
+# forget their own month-old gotchas, that's recall working.
+RECALL_SELF_ECHO_HOURS = 48
+
+
+def _recall_excluded(doc_id, meta, agent):
+    """Type-aware exclusions (nimbus first-day read, msg_53e467692779 —
+    score tracks lexical mass, TYPE tracks usefulness):
+    - agent state specs (spec_state_*): read at `go` by protocol; re-injection
+      is 100% redundant at ANY age — a fresh one is the worst case.
+      Interface/design/runbook specs are NOT excluded.
+    - stale handoffs (>14d, see above).
+    - other agents' session digests (handoffs, park-summary learnings).
+    - self-echo: requester's own docs updated within 48h (only when the
+      request identifies the agent)."""
+    if str(doc_id).startswith("spec_state_"):
+        return True
+    if _recall_stale_handoff(meta):
+        return True
+    if _recall_foreign_digest(meta, agent):
+        return True
+    if agent and meta.get("claude_instance") == agent:
+        from datetime import timedelta
+
+        from shared_memory.helpers import parse_timestamp, utc_now
+        ts = parse_timestamp(meta.get("updated") or meta.get("created"))
+        if ts is not None and (utc_now() - ts) <= timedelta(hours=RECALL_SELF_ECHO_HOURS):
+            return True
+    return False
+
+
+def _recall_one_line(claim, content, shape=None):
+    """Header summary for a /recall snippet: claim facet when the doc has one
+    (the better assertion surface), else the content head. <= ~120 chars,
+    single line, never the body (contract: HEADERS ONLY).
+
+    `shape` (facets.modality_shape) prefixes an OPEN-THE-BODY marker. It goes
+    INSIDE one_line rather than only into a sibling key on purpose: sub's T1
+    rater sees `"[{type}] {title} — {one_line}"` as its ONLY view of a
+    candidate (msg_2fc9301c8663), so a sibling key would require consumer code
+    changes to have any effect, while a prefix reaches every consumer that
+    exists today — including human readers — with none. The sibling key ships
+    too, for consumers that later want to branch on it.
+
+    The prefix eats into the 120-char budget rather than extending it: the
+    flag matters more than the last dozen characters of a claim, and growing
+    the cap would break the contract's header-size expectation.
+    """
+    src = (claim or "").strip() or " ".join((content or "").split())
+    src = " ".join(src.split())
+    prefix = f"⚠{SHAPE_LABELS[shape]} — open body · " if shape else ""
+    budget = 120 - len(prefix)
+    if len(src) > budget:
+        src = src[:max(0, budget - 3)] + "..."
+    return prefix + src
+
+
+async def _recall_payload(body, api_key, via_tunnel=False):
+    """Pure request→response logic for POST /recall (interface:recall-v0
+    v1.1.2), split from the Starlette route for unit-testability — same
+    pattern as _export_skills_payload above. Returns (status_code, dict).
+
+    Auth mirrors Path B soft-auth exactly (see _export_skills_payload's
+    docstring; same gates, same order). The optional `agent` field is accepted
+    per contract but carries no extra tier data in soft-auth v0 — the key's
+    project list is the tenant gate.
+
+    Fail-loud split (contract §Errors): CHROMA is the load-bearing store —
+    any chroma failure is a 503/500, NEVER a 200 count:0 (a consumer cannot
+    tell "nothing relevant" from "backend down"). Mongo is best-effort here:
+    it only enriches one_line (claim facets) and resolves the floor config;
+    mongo-down degrades to content-head one_lines + code-default floor without
+    faking emptiness.
+
+    Deliberate non-behavior: no access-stat updates (recall fires every user
+    turn; inflating access_count from ambient scans would poison the stats the
+    pull path keeps)."""
+    import time as _time
+
+    from shared_memory import query_config
+    from shared_memory.auth import (
+        AUTH_ENABLED,
+        REQUIRE_KEY,
+        TUNNEL_REQUIRES_KEY,
+        check_project_access,
+        validate_api_key,
+    )
+    from shared_memory.helpers import (
+        get_project_collection,
+        get_shared_collection,
+        is_expired,
+        normalize_project,
+    )
+    from shared_memory.tools.query import calculate_relevance
+
+    t0 = _time.monotonic()
+
+    if not isinstance(body, dict):
+        return 400, {"error": "JSON body must be an object"}
+    project = (body.get("project") or "").strip()
+    if not project:
+        return 400, {"error": "'project' is required"}
+    qtext = (body.get("query") or "").strip()
+    if not qtext:
+        return 400, {"error": "'query' is required"}
+    qtext = qtext[:RECALL_QUERY_CAP_CHARS]
+
+    scope = body.get("scope") or "all"
+    if scope not in RECALL_SCOPE_TYPES:
+        return 400, {"error": f"'scope' must be one of {sorted(RECALL_SCOPE_TYPES)}"}
+    agent = (body.get("agent") or "").strip() or None
+
+    k_raw = body.get("k")
+    try:
+        k = 5 if k_raw is None else int(k_raw)
+    except (TypeError, ValueError):
+        return 400, {"error": "'k' must be an integer"}
+    k = max(1, min(k, 15))
+
+    threshold = body.get("threshold")
+    if threshold is not None:
+        try:
+            threshold = float(threshold)
+        except (TypeError, ValueError):
+            return 400, {"error": "'threshold' must be a number"}
+        if not 0.0 <= threshold <= 1.0:
+            return 400, {"error": "'threshold' must be in [0, 1]"}
+
+    if AUTH_ENABLED:
+        if api_key:
+            key_info = validate_api_key(api_key)
+            if not key_info:
+                return 401, {"error": "invalid or revoked API key"}
+            if not check_project_access(key_info.get("projects", []), project):
+                return 403, {
+                    "error": f"API key lacks access to project '{project}'",
+                    "allowed_projects": key_info.get("projects", []),
+                }
+        elif REQUIRE_KEY or (TUNNEL_REQUIRES_KEY and via_tunnel):
+            return 401, {
+                "error": ("This server requires an API key. Provide an "
+                          "'Authorization: Bearer <key>' header."),
+                "auth_required": True,
+            }
+
+    project = normalize_project(project)
+
+    # One mongo resolution per request — it's consulted twice (floor config +
+    # claim facets) and a mongo outage must cost at most ONE connect timeout
+    # on this per-turn hot path.
+    mongo = get_mongo()
+
+    # Floor: explicit request threshold wins; else the three-layer config
+    # merge (code default 0.6 → server doc → project override).
+    floor = threshold
+    _qcfg = query_config.get_effective_config(mongo, project)
+    if floor is None:
+        floor = float(_qcfg["recall_floor"])
+    # Chunked arctic2 lane (interface:chunk-index-v0): own floor (chunk cosine
+    # is not the MiniLM scale); an explicit request threshold still wins.
+    from shared_memory import chunk_index
+    chunk_floor = threshold if threshold is not None else float(
+        _qcfg.get("chunk_recall_floor", floor))
+    cvec = await chunk_index.embed_query(qtext) if chunk_index.enabled_for(_qcfg) else None
+    retriever = "minilm"
+
+    # Chroma is load-bearing — fail loud, never mask an outage as count:0.
+    try:
+        chroma = await get_chroma()
+        if chroma is None:
+            raise RuntimeError("chroma client unavailable")
+    except Exception as e:
+        return 503, {"error": f"ChromaDB unavailable: {e}"}
+
+    where = _recall_where(RECALL_SCOPE_TYPES[scope])
+    candidates = []
+    embed_ms = None
+
+    qvec = None
+
+    async def _scan(collection, source, n):
+        nonlocal embed_ms, qvec, retriever
+        # ONE embedding per request, computed off the event loop, reused by
+        # every later scan (backlog_c5dba6d13707). The previous comment here
+        # claimed "subsequent calls reuse chroma's per-call embed" — THAT WAS
+        # WRONG: each query_texts= call re-ran the client-side MiniLM model,
+        # so a 3-collection /recall paid ~300-400ms of duplicate CPU on the
+        # event loop and blocked every other agent. See embed_query_once().
+        if qvec is None:
+            t_e = _time.monotonic()
+            qvec = await embed_query_once(collection, qtext)
+            if qvec is not None:
+                embed_ms = int((_time.monotonic() - t_e) * 1000)
+        t_q = _time.monotonic()
+        got = await chunk_index.scan(collection, cvec, n, where) if cvec is not None else None
+        use_floor = floor
+        if got is not None:
+            use_floor, retriever = chunk_floor, "chunk"
+        else:
+            got = await collection.query(
+                **query_kwargs(qtext, qvec), n_results=n, where=where
+            )
+        if embed_ms is None:
+            # Fallback path only (embed_query_once failed → query_texts): the
+            # first query still carries the embedding, so time it as before.
+            embed_ms = int((_time.monotonic() - t_q) * 1000)
+        if not got["documents"] or not got["documents"][0]:
+            return
+        for i, (doc, meta, dist) in enumerate(zip(
+                got["documents"][0], got["metadatas"][0], got["distances"][0])):
+            if is_expired(meta):
+                continue
+            if _recall_excluded(got["ids"][0][i], meta, agent):
+                continue
+            score = calculate_relevance(dist)
+            if score < use_floor:
+                continue
+            candidates.append({
+                "id": got["ids"][0][i],
+                "type": meta.get("type"),
+                "title": meta.get("title", "Untitled"),
+                "score": round(score, 3),
+                "updated": meta.get("updated") or meta.get("created", ""),
+                "authored_by": meta.get("claude_instance"),
+                "_content": doc,
+                "_source": source,
+            })
+
+    lexical_max = 0
+    try:
+        lexical_max = int(_qcfg.get("lexical_max", 0))
+    except Exception:
+        pass
+    lexical = []
+
+    try:
+        proj_col = await get_project_collection(chroma, project)
+        await _scan(proj_col, f"project:{project}", k)
+        # Exact identifier hits (lexical.py) — kept even below the floor.
+        if lexical_max > 0 and qvec is not None:
+            from shared_memory.lexical import lexical_scan
+            for h in await lexical_scan(proj_col, qtext, qvec, where, min(lexical_max, k),
+                                        exclude_ids={c["id"] for c in candidates}):
+                if is_expired(h["meta"]) or _recall_excluded(h["id"], h["meta"], agent):
+                    continue
+                lexical.append({
+                    "id": h["id"],
+                    "type": h["meta"].get("type"),
+                    "title": h["meta"].get("title", "Untitled"),
+                    "score": round(calculate_relevance(h["dist"]), 3),
+                    "match": "exact",
+                    "updated": h["meta"].get("updated") or h["meta"].get("created", ""),
+                    "authored_by": h["meta"].get("claude_instance"),
+                    "_content": h["doc"],
+                    "_source": f"project:{project}",
+                })
+        # Shared collections ride along exactly as memory_query's do (max 2
+        # each), at the SAME floor — 0.6 already sits above memory_query's
+        # shared bump (0.4).
+        for shared_name in ("patterns", "context"):
+            await _scan(await get_shared_collection(chroma, shared_name),
+                        f"shared:{shared_name}", min(2, k))
+    except Exception as e:
+        return 500, {"error": f"recall query failed: {e}"}
+
+    candidates.sort(key=lambda c: -c["score"])
+    candidates = candidates[:max(0, k - len(lexical))] + lexical
+
+    # one_line: claim facet when present (mongo best-effort), else content head.
+    claims = {}
+    try:
+        from shared_memory.facets import get_facets_for_ids
+        claims = {
+            doc_id: f.get("claim")
+            for doc_id, f in get_facets_for_ids(
+                mongo, [c["id"] for c in candidates]).items()
+        }
+    except Exception:
+        pass
+
+    snippets = []
+    for c in candidates:
+        content = c.pop("_content")
+        c.pop("_source")
+        # Shape flag is derived from the BODY we already hold here — no extra
+        # fetch, no stored field, and it therefore covers the whole historical
+        # corpus without a backfill.
+        shape = modality_shape(c.get("title", ""), content)
+        c["one_line"] = _recall_one_line(claims.get(c["id"]), content, shape)
+        c["age_days"] = _recall_age_days(c.get("updated"))
+        if shape:
+            c["shape"] = shape
+        snippets.append(c)
+
+    if snippets:
+        from shared_memory.recall_metrics import log_recall_event
+        log_recall_event(mongo, project, agent, [s["id"] for s in snippets], floor,
+                         scores=[s["score"] for s in snippets], query=qtext,
+                         matches=[s.get("match") for s in snippets],
+                         retriever=retriever)
+
+    return 200, {
+        "project": project,
+        "count": len(snippets),
+        "floor": floor,
+        "took_ms": int((_time.monotonic() - t0) * 1000),
+        "embed_ms": embed_ms if embed_ms is not None else 0,
+        "snippets": snippets,
+    }
 
 
 def main():
@@ -87,14 +551,45 @@ def main():
         except Exception as e:
             chroma_status = f"unhealthy: {str(e)}"
 
-        status = "healthy" if chroma_status == "healthy" else "degraded"
+        # Mongo must have a WRITABLE PRIMARY, not just be reachable — the server
+        # runs Mongo as replica set rs0 for transactions, and every knowledge
+        # write needs a primary. A fresh install that hasn't run rs.initiate()
+        # has no primary; without this check /health would report "healthy" off
+        # Chroma alone while the first write fails. So health is only green when
+        # Mongo is actually writable. (isWritablePrimary is the hello/isMaster
+        # flag; on an uninitiated set server-selection times out -> caught here.)
+        try:
+            db = get_mongo()
+            if db is None:
+                mongo_status = "unhealthy: not initialized"
+            else:
+                hello = db.client.admin.command("hello")
+                if hello.get("isWritablePrimary") or hello.get("ismaster"):
+                    mongo_status = "healthy"
+                else:
+                    mongo_status = "no primary (replica set not initiated?)"
+        except Exception as e:
+            mongo_status = f"unhealthy: {str(e)}"
+
+        status = "healthy" if (chroma_status == "healthy" and mongo_status == "healthy") else "degraded"
         return JSONResponse({
             "status": status,
             "chroma": chroma_status,
+            "mongo": mongo_status,
             "active_sessions": len(active_sessions),
             "active_locks": len(file_locks),
             "active_signals": len(active_signals)
         }, status_code=200 if status == "healthy" else 503)
+
+    # ── Junto Admin (settings / agents / alerts web UI) — admin_ui.py ──
+    from shared_memory.admin_ui import register_admin_routes, register_connection_routes, register_task_routes
+    register_admin_routes(mcp, get_mongo)
+    register_connection_routes(mcp, get_mongo)
+    register_task_routes(mcp, get_mongo)
+
+    # ── Delegated-inference runner API (runners are service principals) — runner_api.py ──
+    from shared_memory.runner_api import register_runner_routes
+    register_runner_routes(mcp, get_mongo)
 
     # ── Dashboard (read-only web UI) ──
 
@@ -112,6 +607,11 @@ def main():
     @mcp.custom_route("/dashboard/api/sessions", methods=["GET"])
     async def dashboard_sessions(request):
         from starlette.responses import JSONResponse
+
+        from shared_memory.admin_ui import _lan_only
+        blocked = _lan_only(request)
+        if blocked:
+            return blocked
         sessions = []
         for sid, info in active_sessions.items():
             sessions.append({
@@ -128,6 +628,11 @@ def main():
     @mcp.custom_route("/dashboard/api/agents", methods=["GET"])
     async def dashboard_agents(request):
         from starlette.responses import JSONResponse
+
+        from shared_memory.admin_ui import _lan_only
+        blocked = _lan_only(request)
+        if blocked:
+            return blocked
         db = get_mongo()
         if db is None:
             return JSONResponse({"error": "MongoDB unavailable", "agents": []})
@@ -153,6 +658,11 @@ def main():
     @mcp.custom_route("/dashboard/api/messages", methods=["GET"])
     async def dashboard_messages(request):
         from starlette.responses import JSONResponse
+
+        from shared_memory.admin_ui import _lan_only
+        blocked = _lan_only(request)
+        if blocked:
+            return blocked
         db = get_mongo()
         if db is None:
             return JSONResponse({"error": "MongoDB unavailable", "messages": []})
@@ -180,6 +690,11 @@ def main():
     @mcp.custom_route("/dashboard/api/backlog", methods=["GET"])
     async def dashboard_backlog(request):
         from starlette.responses import JSONResponse
+
+        from shared_memory.admin_ui import _lan_only
+        blocked = _lan_only(request)
+        if blocked:
+            return blocked
         try:
             chroma = await get_chroma()
             all_collections = await chroma.list_collections()
@@ -239,6 +754,11 @@ def main():
         Data is collected for one week to inform the v3 PostCompact decision.
         """
         from starlette.responses import JSONResponse
+
+        from shared_memory.admin_ui import _key_if_required
+        blocked = _key_if_required(request)
+        if blocked:
+            return blocked
         try:
             body = await request.json()
         except Exception:
@@ -265,6 +785,11 @@ def main():
     async def hook_compact_stats(request):
         """Read-only stats for compaction event collection."""
         from starlette.responses import JSONResponse
+
+        from shared_memory.admin_ui import _lan_only
+        blocked = _lan_only(request)
+        if blocked:
+            return blocked
         db = get_mongo()
         if db is None:
             return JSONResponse({"error": "MongoDB unavailable"}, status_code=503)
@@ -289,6 +814,69 @@ def main():
             })
         except Exception as e:
             return JSONResponse({"error": str(e)}, status_code=500)
+
+    # ── Skill export (session-less REST for the Phase-2 launcher consumer) ──
+    # Plain HTTP alongside /health — NO MCP handshake. The per-box launcher
+    # (tlemmons/junto) hand-rolling MCP initialize→Mcp-Session-Id→tools/call from
+    # bash/PowerShell proved too brittle (nimbus dry-run), so materialization
+    # pulls skills through this single POST. Same response shape as
+    # memory_export_skills. Contract: interface:skill-materialization-v0.
+    @mcp.custom_route("/export-skills", methods=["POST"])
+    async def export_skills_rest(request):
+        """Session-less SKILL.md export.
+
+        Body (JSON): {project REQUIRED, role?, role_description?,
+                      working_directory?, limit?}
+        Auth mirrors memory_start_session's Path B soft-auth: a valid Bearer key
+        is tenant-checked; an invalid key is rejected; a MISSING key soft-falls
+        to agent tier (export allowed) unless the REQUIRE_KEY / tunnel-origin
+        gates fire. So keyless LAN/local callers (home) need no header.
+        Returns 200 {project, count, skills:[{id,name,relpath,content}]}.
+        Errors: 400 missing/invalid body · 401 invalid key OR keyless-rejected
+                by an origin gate · 403 valid key lacks project access ·
+                503 MongoDB unavailable.
+        The launcher MUST prune materialized SKILL.md files ONLY on a 200 — any
+        non-2xx means "state unknown, do not prune" (a DB outage fails loud here
+        rather than returning an empty export that would wipe every skill)."""
+        from starlette.responses import JSONResponse
+
+        from shared_memory.auth import get_header_api_key, get_via_tunnel
+
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "invalid or missing JSON body"}, status_code=400)
+
+        status_code, payload = await _export_skills_payload(
+            body, get_header_api_key(), get_via_tunnel())
+        return JSONResponse(payload, status_code=status_code)
+
+    # Plain HTTP alongside /health and /export-skills — NO MCP handshake.
+    # Ambient associative recall: launcher UserPromptSubmit hooks POST the
+    # rolling conversation window each turn; response is threshold-gated
+    # HEADERS ONLY (never bodies) — the agent pulls the 0-1 that bite via
+    # memory_get_by_id. Contract: interface:recall-v0 v1.1.2 (FROZEN shape).
+    @mcp.custom_route("/recall", methods=["POST"])
+    async def recall_rest(request):
+        """Body (JSON): {project REQUIRED, query REQUIRED, agent?, k? (1-15,
+        default 5), threshold? ([0,1]; omit → recall_floor config, default
+        0.6), scope? (learnings|specs|functions|all)}.
+        Returns 200 {project, count, floor, took_ms, embed_ms, snippets:[
+        {id, type, title, one_line, score, updated, authored_by}]}.
+        Errors: 400 bad params · 401/403 per soft-auth · 503/500 backend
+        outage (fail loud — count:0 is NEVER returned on an outage)."""
+        from starlette.responses import JSONResponse
+
+        from shared_memory.auth import get_header_api_key, get_via_tunnel
+
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "invalid or missing JSON body"}, status_code=400)
+
+        status_code, payload = await _recall_payload(
+            body, get_header_api_key(), get_via_tunnel())
+        return JSONResponse(payload, status_code=status_code)
 
     # Run with the selected transport.
     # For streamable-http we go through uvicorn manually so we can install

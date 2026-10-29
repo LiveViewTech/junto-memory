@@ -1,15 +1,18 @@
 """Storage tools - store documents and record learnings."""
 
 import json
+import logging
 from typing import Dict, List
 
 from mcp.server.fastmcp import Context
 
+from shared_memory import claim_gate
 from shared_memory.app import mcp
 from shared_memory.clients import get_chroma, get_mongo
 from shared_memory.config import MAX_CONTENT_SIZE, MEMORY_TYPES
 from shared_memory.helpers import (
     calculate_expiry,
+    calculate_relevance,
     check_duplicate,
     check_overlap,
     format_overlap_warning,
@@ -17,12 +20,16 @@ from shared_memory.helpers import (
     generate_doc_id,
     get_project_collection,
     get_shared_collection,
+    is_expired,
     normalize_project,
     require_session,
     utc_now_iso,
 )
+from shared_memory.intent import get_current_context_tokens
 from shared_memory.op_log import emit_op_log_from_context, fetch_embedding_for_op_log
 from shared_memory.state import active_sessions
+
+logger = logging.getLogger(__name__)
 
 
 @mcp.tool()
@@ -91,6 +98,11 @@ async def memory_store(
             "size": f"{len(content.encode('utf-8')) // 1024}KB",
             "suggestion": "Break into smaller documents or summarize"
         })
+
+    # Write-lint parity (backlog_8d33a63e2626): strip a leaked tool-call envelope
+    # and re-route swallowed params before content is used for dedup/doc_id/op-log.
+    from shared_memory.write_lint import recover_envelope_leak
+    content, project, _lint_notes = recover_envelope_leak(content, "content", project)
 
     tags = tags or []
     files_related = files_related or []
@@ -233,7 +245,18 @@ async def memory_store(
         },
     )
 
-    result = {"status": "stored", "id": doc_id}
+    # Status prefixes "stored" so a startswith() check is unaffected; an
+    # equality check deliberately trips when the write only succeeded because
+    # the server repaired a malformed emission (mirrors record_learning).
+    result = {"status": "stored_with_recovery" if _lint_notes else "stored", "id": doc_id}
+    if _lint_notes:
+        result["write_lint"] = _lint_notes
+        result["action_required"] = (
+            "Your tool-call emission is malformed — it serialized the call's own "
+            "XML envelope into `content`. The server repaired this write, but it "
+            "cannot repair the client. Fix the emission; see write_lint above for "
+            "what was recovered."
+        )
     if memory_type == "interface" and interface_name:
         result["interface_name"] = interface_name
         result["interface_version"] = interface_version
@@ -244,6 +267,71 @@ async def memory_store(
     if duplicate_warning:
         result["duplicate_warning"] = duplicate_warning
     return json.dumps(result)
+
+
+# Write-time contradiction gate (threshold stage). When a new learning is
+# recorded, surface near-prior learnings so the author can catch a duplicate or
+# a contradiction of an existing note before it silently lands (root case:
+# 2026-07 mesh-offline — a wrong learning recorded over its contradicting prior,
+# no query). THRESHOLD-ONLY v0: embedding similarity only. It surfaces near
+# priors of ALL kinds — a true contradiction and a consistent restatement look
+# alike to a cosine floor (they can be lexically near-identical; only semantics
+# separate them). Telling the two apart needs a claim-extraction + classifier
+# layer on top (backlog_6471d8348393); this stage just says "these are close,
+# check them." Advisory only — it NEVER blocks the write.
+# TODO: promote SIMILAR_LEARNING_THRESHOLD to the three-layer query_config knob
+# once calibrated against coordinator@nimbus's expanded dataset.
+SIMILAR_LEARNING_THRESHOLD = 0.6  # normalized [0,1] similarity (helpers.calculate_relevance)
+
+
+async def _find_similar_learnings(
+    collection,
+    query_text: str,
+    exclude_id: str,
+    threshold: float = SIMILAR_LEARNING_THRESHOLD,
+    k: int = 5,
+) -> List[Dict]:
+    """Active, non-expired prior learnings whose embedding similarity to
+    query_text is >= threshold, as header pointers (id/title/score/updated, no
+    bodies) sorted by score desc.
+
+    Single-key Chroma where-filter only: multi-key filters silently return
+    nothing in this Chroma version (see the memory_list_specs gotcha, commit
+    28570d4). So filter type in the query, status/expiry in Python.
+    """
+    results = await collection.query(
+        query_texts=[query_text],
+        n_results=k + 5,  # over-fetch; Python-side filtering drops some
+        where={"type": "learning"},
+    )
+    id_rows = results.get("ids") or []
+    if not id_rows or not id_rows[0]:
+        return []
+    ids = id_rows[0]
+    metas = results["metadatas"][0]
+    dists = results["distances"][0]
+
+    hits: List[Dict] = []
+    for doc_id, meta, dist in zip(ids, metas, dists):
+        if doc_id == exclude_id:
+            continue
+        meta = meta or {}
+        if meta.get("status", "active") != "active":
+            continue
+        if is_expired(meta):
+            continue
+        score = calculate_relevance(dist)
+        if score < threshold:
+            continue
+        hits.append({
+            "id": doc_id,
+            "title": meta.get("title", ""),
+            "score": round(score, 3),
+            "updated": meta.get("updated") or meta.get("created"),
+        })
+
+    hits.sort(key=lambda h: h["score"], reverse=True)
+    return hits[:k]
 
 
 @mcp.tool()
@@ -262,6 +350,11 @@ async def memory_record_learning(
     - A non-obvious behavior
     - A gotcha or pitfall
     - A useful technique
+
+    When recording on a topic that already has an entry, UPDATE/SUPERSEDE the
+    existing one (memory_change_status) rather than creating a near-duplicate
+    — the write-time gate surfaces similar priors in this tool's response;
+    disposition them, don't ignore them.
     - Why something was done a certain way
 
     These help other Claudes avoid repeating your discovery process.
@@ -291,6 +384,17 @@ async def memory_record_learning(
     session_info = active_sessions[session_id]
     now = utc_now_iso()
 
+    # Write-lint (backlog_1115f9fe35f7 / backlog_8d33a63e2626): strip a
+    # serialized tool-call envelope if a malformed emission leaked it into the
+    # body, and re-route any swallowed params (notably `project`, whose loss
+    # otherwise misfiles the doc to shared with project=""). Uses the shared
+    # recovery helper every free-text writer now routes through, so store,
+    # add_backlog_item, define_spec and record_learning behave identically.
+    # Recovered sibling content is kept in-doc under a marked heading and
+    # flagged in the response. The helper never raises.
+    from shared_memory.write_lint import recover_envelope_leak
+    details, project, _lint_notes = recover_envelope_leak(details, "details", project)
+
     if project:
         project = normalize_project(project)
         collection = await get_project_collection(chroma, project)
@@ -300,20 +404,49 @@ async def memory_record_learning(
         chroma_collection_name = "shared_patterns"
 
     doc_id = f"learning_{generate_doc_id(title, 'learning')}"
+    document_text = f"# {title}\n\n{details}"
+
+    # Write-time contradiction gate (threshold stage): retrieve near-prior
+    # learnings BEFORE the add, so the new doc cannot match itself. Best-effort
+    # by contract — an advisory-lookup failure must NEVER block recording the
+    # learning (the write is the load-bearing operation; the surfacing is not).
+    similar_prior: List[Dict] = []
+    try:
+        similar_prior = await _find_similar_learnings(
+            collection, document_text, exclude_id=doc_id
+        )
+    except Exception as e:  # noqa: BLE001 - advisory path, degrade to no-surfacing
+        logger.warning("write-time gate similar-learning lookup failed: %s", e)
+
+    metadata = {
+        "title": title,
+        "type": "learning",
+        "status": "active",
+        "tags": json.dumps(tags),
+        "session_id": session_id,
+        "claude_instance": session_info["claude_instance"],
+        # THIS KEY WAS MISSING ENTIRELY until 2026-08-10 — memory_store wrote
+        # it, memory_record_learning never did, so 99.5% of the learning corpus
+        # reported project:"" on the read surfaces despite being filed to the
+        # right collection. Routing was never affected (it goes by collection);
+        # the derived view was. Read side falls back to project_from_collection
+        # so the historical docs read correctly without a backfill.
+        "project": project or "",
+        "created": now,
+        "updated": now
+    }
+    # Session-age axis for the correction-rate study: context depth at write
+    # time, injected client-side via the __context_tokens sideband kwarg
+    # (inbox plugin hook). Optional — absent for clients without the hook;
+    # session_id above is the coarse fallback (joins session_starts).
+    context_tokens = get_current_context_tokens()
+    if context_tokens is not None:
+        metadata["context_tokens"] = context_tokens
 
     await collection.add(
         ids=[doc_id],
-        documents=[f"# {title}\n\n{details}"],
-        metadatas=[{
-            "title": title,
-            "type": "learning",
-            "status": "active",
-            "tags": json.dumps(tags),
-            "session_id": session_id,
-            "claude_instance": session_info["claude_instance"],
-            "created": now,
-            "updated": now
-        }]
+        documents=[document_text],
+        metadatas=[metadata]
     )
 
     # Phase 1 #2 canary: emit op-log entry per §4.3.a (best-effort).
@@ -336,7 +469,89 @@ async def memory_record_learning(
             "tags": tags,
             "created": now,
             "embedding": embedding,
+            **({"context_tokens": context_tokens} if context_tokens is not None else {}),
         },
     )
 
-    return json.dumps({"status": "recorded", "id": doc_id})
+    # STATUS CARRIES THE WARNING (legacy-team 2026-08-09, self-evidenced):
+    # "a loud note inside a SUCCESS response is the least-read surface you
+    # have" — they skimmed past unresolved_refs repeatedly in one session
+    # because `status: recorded` was the field they were actually reading.
+    # A malforming client that never notices never self-corrects, so the
+    # recovery signal rides `status`, not a trailing note.
+    # Compat: the value still PREFIXES "recorded" — a startswith() check is
+    # unaffected; an equality check deliberately trips, which is the correct
+    # outcome for a write that only succeeded because the server repaired it.
+    result = {
+        "status": "recorded_with_recovery" if _lint_notes else "recorded",
+        "id": doc_id,
+    }
+    if _lint_notes:
+        result["write_lint"] = _lint_notes
+        result["action_required"] = (
+            "Your tool-call emission is malformed — it serialized the call's own "
+            "XML envelope into `details`. The server repaired this write, but it "
+            "cannot repair the client. Fix the emission; see write_lint above for "
+            "what was recovered."
+        )
+
+    # Dangling-ref advisory (backlog_d03297e01f30): existence-check ID-shaped
+    # references in the body, warn in THIS response — the artifact chokepoint.
+    # Best-effort; never blocks or rejects the recorded learning.
+    try:
+        from shared_memory.write_lint import advisory_payload, find_unresolved_refs
+        _unresolved = await find_unresolved_refs(
+            f"{title}\n{details}", get_mongo(), chroma, project
+        )
+        if _unresolved:
+            result.update(advisory_payload(_unresolved))
+    except Exception:
+        pass
+
+    if similar_prior:
+        # Classifier stage (interface:claim-extraction-v0): annotate each
+        # surfaced prior with CONTRADICTS/CONSISTENT/UNRELATED. Advisory and
+        # fail-quiet by contract — classify_against_priors never raises; when
+        # the gate is disabled or the endpoint is down it hands the priors
+        # back untouched and we fall through to the threshold-only wording.
+        contradicted: List[str] = []
+        similar_prior, contradicted = await claim_gate.classify_against_priors(
+            db=get_mongo(),
+            collection=collection,
+            new_doc_id=doc_id,
+            new_title=title,
+            new_details=details,
+            priors=similar_prior,
+        )
+        result["similar_prior"] = similar_prior
+        if contradicted:
+            result["note"] = (
+                f"CONTRADICTION: per the claim classifier, this learning "
+                f"contradicts {', '.join(contradicted)} — one of them is wrong. "
+                "If the prior no longer holds, supersede it: memory_change_status("
+                "doc_id=..., new_status='superseded', reason=...). If the prior "
+                "is still right, re-check this note before relying on it. "
+                "(Advisory — both records exist until you act.)"
+            )
+        else:
+            # Pointers, not conclusions: surface the near priors + why, let the
+            # author judge. Threshold similarity alone can't tell contradiction
+            # from restatement, so the wording asks the author to check, not
+            # asserts a conflict.
+            result["note"] = (
+                f"{len(similar_prior)} existing learning(s) are similar to this one — "
+                "review for duplication or contradiction before relying on both. If this "
+                "supersedes one, mark it: memory_change_status(new_status='superseded')."
+            )
+
+    # Write-time facets (design:memory-facets-v0): fire-and-forget extraction
+    # AFTER the write has landed — the response never waits on the model. When
+    # the claim gate ran above, the facet task reuses its cached claim.
+    from shared_memory import facets as facets_mod
+    if facets_mod.schedule_facet_extraction(
+        get_mongo(), collection, doc_id, title, details
+    ):
+        result["facets"] = "extraction scheduled"
+    from shared_memory.context_stamp import stamp as _context_stamp
+    _context_stamp(get_mongo(), session_id, "learning", doc_id)
+    return json.dumps(result)

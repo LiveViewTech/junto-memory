@@ -213,6 +213,12 @@ async def memory_db(
     if error:
         return error
 
+    # Identity for the audit trail below. Read once here rather than at each
+    # call site so a missing session can never silently degrade the actor to
+    # "unknown" on a write.
+    from shared_memory.state import active_sessions
+    session_info = active_sessions.get(session_id, {})
+
     # -- LIST --
     if action == "list":
         databases = []
@@ -290,9 +296,58 @@ async def memory_db(
         if not query:
             return json.dumps({"error": "query parameter required"})
 
+        # AUDIT (Tom-directed 2026-08-09). Every external-DB query is logged —
+        # verbatim SQL, actor, database, and whether the handle permits writes.
+        # RATIONALE, worth keeping because it is not the obvious one: the
+        # read-only flag and the SQL guard do NOT stop a determined agent —
+        # both are one env var / one direct mysql client away, and an agent
+        # that has convinced itself an action is necessary will find the path.
+        # What CANNOT be reasoned around is a record made after the fact.
+        # Detection is the control that survives motivated reasoning; the
+        # guards above only make the unsafe path require a decision.
+        # Writes are stamped WARNING severity so a write against a
+        # write-capable handle is greppable in one query.
+        _is_write_handle = not config.get("read_only", True)
+        _sql_head = (query or "").strip()[:2000]
+        _verb = _sql_head.split()[0].upper() if _sql_head.split() else "?"
+        _mutating = _verb not in ("SELECT", "WITH")
+        try:
+            from shared_memory.audit import log_audit
+            log_audit(
+                "db.query" if not (_is_write_handle and _mutating) else "db.write",
+                session_info.get("claude_instance", "unknown"),
+                session_info.get("project", ""),
+                {
+                    "database": database,
+                    "host": config.get("host", ""),
+                    "db_user": config.get("user", ""),
+                    "read_only_handle": not _is_write_handle,
+                    "verb": _verb,
+                    "mutating": _mutating,
+                    "sql": _sql_head,
+                    "truncated_sql": len(query or "") > 2000,
+                    "severity": "WARNING" if (_is_write_handle and _mutating) else "info",
+                },
+                session_id,
+            )
+        except Exception:
+            pass  # auditing must never block a query
+
         if config.get("read_only", True):
             validation_error = _validate_sql_readonly(query, db_type)
             if validation_error:
+                try:
+                    from shared_memory.audit import log_audit
+                    log_audit(
+                        "db.query_rejected",
+                        session_info.get("claude_instance", "unknown"),
+                        session_info.get("project", ""),
+                        {"database": database, "verb": _verb,
+                         "reason": validation_error, "sql": _sql_head},
+                        session_id,
+                    )
+                except Exception:
+                    pass
                 return json.dumps({"error": validation_error})
 
         max_rows = config.get("max_rows", 500)
@@ -306,6 +361,49 @@ async def memory_db(
         try:
             cursor = conn.cursor()
             cursor.execute(query)
+
+            # MUTATING STATEMENTS MUST BE COMMITTED (billing-team 2026-08-09).
+            # Both drivers default to autocommit=False and memory_db opens a
+            # NEW CONNECTION PER CALL, so an INSERT/UPDATE/DELETE executed
+            # fine, returned no error, and was rolled back when the connection
+            # closed. No call sequence could fix it client-side: semicolons are
+            # blocked so `INSERT; COMMIT` is unreachable, and a later standalone
+            # COMMIT lands on a different connection.
+            # ⚠️ The audit made this WORSE, not neutral: a db.write row was
+            # recorded for a write that never landed, so the trail corroborated
+            # the wrong conclusion. Hence the separate committed-effect event
+            # below — attempted and landed are now different records.
+            if _mutating:
+                affected = cursor.rowcount
+                conn.commit()
+                try:
+                    from shared_memory.audit import log_audit
+                    log_audit(
+                        "db.write_committed",
+                        session_info.get("claude_instance", "unknown"),
+                        session_info.get("project", ""),
+                        {
+                            "database": database, "verb": _verb,
+                            "affected_rows": affected, "sql": _sql_head,
+                            "severity": "WARNING",
+                        },
+                        session_id,
+                    )
+                except Exception:
+                    pass
+                return json.dumps({
+                    "database": database,
+                    "type": db_type,
+                    "affected_rows": affected,
+                    "committed": True,
+                    "note": (
+                        "Mutating statement COMMITTED. `affected_rows` is the "
+                        "real effect — 0 means the statement matched nothing, "
+                        "not that it failed. Read the data back on a separate "
+                        "call if the effect matters."
+                    ),
+                }, indent=2)
+
             rows = cursor.fetchmany(limit + 1)
             truncated = len(rows) > limit
             if truncated:
@@ -338,6 +436,26 @@ async def memory_db(
 
             return json.dumps(result, indent=2)
         except Exception as e:
+            # Roll back explicitly so a partially-applied multi-row DML cannot
+            # be left dangling on a connection that is about to close.
+            if _mutating:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                try:
+                    from shared_memory.audit import log_audit
+                    log_audit(
+                        "db.write_failed",
+                        session_info.get("claude_instance", "unknown"),
+                        session_info.get("project", ""),
+                        {"database": database, "verb": _verb,
+                         "error": str(e)[:500], "sql": _sql_head,
+                         "severity": "WARNING"},
+                        session_id,
+                    )
+                except Exception:
+                    pass
             return json.dumps({"error": f"Query failed: {str(e)}"})
         finally:
             conn.close()

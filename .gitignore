@@ -60,3 +60,8 @@ temp/
 .agent-name
 .agent-name.bak
 .project-name
+.env.bak*
+
+# Local working data (wave outputs, ledgers, the librarian claim-cleanup queue).
+# Derived from knowledge-base content: never commit.
+data/

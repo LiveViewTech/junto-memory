@@ -23,12 +23,42 @@ log = logging.getLogger(__name__)
 DEFAULT_EXPAND = True
 DEFAULT_EXPAND_TOP = 0
 DEFAULT_SNIPPET_LENGTH = 200
+# POST /recall similarity floor (interface:recall-v0 §Floor). Ships
+# CONSERVATIVE (cry-wolf-averse): deliberately above memory_query's
+# MIN_RELEVANCE_THRESHOLD=0.3. Lower per-project only on A2(ii)
+# pull-through evidence.
+DEFAULT_RECALL_FLOOR = 0.6
+
+# Lexical identifier lane (lexical.py): max exact-match docs added per
+# memory_query / recall request. 0 disables the lane.
+DEFAULT_LEXICAL_MAX = 2
+
+# Chunked arctic2 lane (chunk_index.py, interface:chunk-index-v0). OFF by
+# default; its scores are cosine of the best chunk — NOT the MiniLM scale —
+# so it carries its own floors. Calibrated 2026-10-25 on eval v0+v1 to pass
+# the SAME share of null queries (question vs a collection without the
+# answer) as MiniLM's 0.3 / 0.6: 87% / 2% null pass, while true positives
+# pass 100% / 50% (MiniLM: 99% / 38%). interface:chunk-index-v0 0.2.0.
+DEFAULT_CHUNK_INDEX = False
+DEFAULT_CHUNK_MIN_RELEVANCE = 0.37
+DEFAULT_CHUNK_RECALL_FLOOR = 0.63
+
+# Cross-encoder rerank for memory_query (rerank.py, interface:rerank-v0).
+DEFAULT_RERANK = False
+DEFAULT_RERANK_MIN = 0.05  # top-3 rows scoring 0.02-0.5 were still mostly useful (Claude-graded, 10-25); see interface:rerank-v0
 
 # Allowed config keys + their types (used by set_config_value).
 CONFIG_KEYS = {
     "default_expand": bool,
     "default_expand_top": int,
     "default_snippet_length": int,
+    "recall_floor": float,
+    "lexical_max": int,
+    "chunk_index": bool,
+    "chunk_min_relevance": float,
+    "chunk_recall_floor": float,
+    "rerank": bool,
+    "rerank_min": float,
 }
 
 DEFAULT_SCOPE = "__default__"
@@ -48,6 +78,13 @@ def _default_config_dict() -> Dict[str, Any]:
         "default_expand": DEFAULT_EXPAND,
         "default_expand_top": DEFAULT_EXPAND_TOP,
         "default_snippet_length": DEFAULT_SNIPPET_LENGTH,
+        "recall_floor": DEFAULT_RECALL_FLOOR,
+        "lexical_max": DEFAULT_LEXICAL_MAX,
+        "chunk_index": DEFAULT_CHUNK_INDEX,
+        "chunk_min_relevance": DEFAULT_CHUNK_MIN_RELEVANCE,
+        "chunk_recall_floor": DEFAULT_CHUNK_RECALL_FLOOR,
+        "rerank": DEFAULT_RERANK,
+        "rerank_min": DEFAULT_RERANK_MIN,
     }
 
 
@@ -111,6 +148,12 @@ def set_config_value(db, project: Optional[str], key: str, value: Any, actor: st
     if key == "default_expand_top" and isinstance(value, int):
         if value < 0 or value > 50:
             return {"error": "default_expand_top must be between 0 and 50"}
+    if key in ("recall_floor", "chunk_min_relevance", "chunk_recall_floor", "rerank_min") and isinstance(value, float):
+        if value < 0.0 or value > 1.0:
+            return {"error": f"{key} must be between 0.0 and 1.0"}
+    if key == "lexical_max" and isinstance(value, int):
+        if value < 0 or value > 5:
+            return {"error": "lexical_max must be between 0 and 5"}
 
     if db is None:
         return {"error": "MongoDB unavailable"}

@@ -13,6 +13,8 @@ Two new primitives in tools/projects.py back the ET-routing fix:
   live agent name or another agent's alias (uniqueness per project).
 """
 
+from types import SimpleNamespace
+
 from shared_memory.tools.projects import resolve_agent_name, persist_agent_aliases
 
 
@@ -45,16 +47,15 @@ class _FakeRegisteredAgents:
         return None
 
     def update_one(self, filt, update):
+        # Mirror pymongo's UpdateResult so callers can read .matched_count
+        # (persist_agent_aliases fails loud when nothing matched).
         for d in self.docs:
             if _matches(d, filt):
                 d.update(update["$set"])
-                return _UpdateResult(matched=1)
-        return _UpdateResult(matched=0)
-
-
-class _UpdateResult:
-    def __init__(self, matched):
-        self.matched_count = matched
+                return SimpleNamespace(matched_count=1, modified_count=1,
+                                       upserted_id=None)
+        # upsert=False semantics: no matching doc -> no write
+        return SimpleNamespace(matched_count=0, modified_count=0, upserted_id=None)
 
 
 class _FakeDB:
@@ -153,3 +154,15 @@ def test_persist_dedupes_input():
     db = _FakeDB([{"project": "emailtriage", "name": "emailTriage"}])
     res = persist_agent_aliases(db, "emailtriage", "emailTriage", ["coordinator", "coordinator"])
     assert res["accepted"] == ["coordinator"]
+
+
+def test_persist_fails_loud_when_agent_not_registered():
+    """PR #4 fix: an update that matches no doc must NOT silently report success.
+    If the agent has no registered_agents doc, every alias is rejected."""
+    db = _FakeDB([{"project": "emailtriage", "name": "emailTriage"}])
+    res = persist_agent_aliases(db, "emailtriage", "ghost-agent", ["coordinator"])
+    assert res["accepted"] == []
+    assert "coordinator" in res["rejected"]
+    assert "not registered" in res["rejected"]["coordinator"]
+    # nothing was written — the alias does not resolve
+    assert resolve_agent_name(db, "emailtriage", "coordinator") is None

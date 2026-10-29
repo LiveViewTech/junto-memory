@@ -9,6 +9,7 @@ from typing import Any, Dict, List
 from mcp.server.fastmcp import Context
 
 from shared_memory.app import mcp
+from shared_memory.auth import collection_allowed, project_allowed
 from shared_memory.clients import get_chroma, get_mongo
 from shared_memory.config import PROJECT_PREFIX, SHARED_PREFIX
 from shared_memory.helpers import (
@@ -68,6 +69,11 @@ async def memory_register_function(
     """
     Register a function for AI-optimized reference.
 
+    Call this AFTER creating or significantly modifying any function: name,
+    file:LINE, purpose, gotchas (include `code` when behavior is non-obvious).
+    Unregistered functions force the next agent to re-read entire files —
+    touching 3+ functions without registering them is technical debt.
+
     MINIMAL INPUT - just register what you know, librarian enriches the rest.
 
     For simple functions:
@@ -96,6 +102,20 @@ async def memory_register_function(
     session_info = active_sessions[session_id]
     now = utc_now_iso()
     requires = requires or []
+
+    # Write-lint (backlog_1115f9fe35f7): register_function was the ONE free-text
+    # writer NOT routed through the envelope recovery path, so func-ref bodies
+    # leaked freely (`**Gotchas:** …</gotchas>\n</invoke>\n<invoke name=…`,
+    # learning_08dfd3f8cbf6f0ce). Recover gotchas + purpose and route a swallowed
+    # project BEFORE collection selection. Best-effort; never blocks the write.
+    try:
+        from shared_memory.write_lint import recover_envelope_leak
+        if gotchas:
+            gotchas, project, _ = recover_envelope_leak(gotchas, "gotchas", project)
+        if purpose:
+            purpose, project, _ = recover_envelope_leak(purpose, "purpose", project)
+    except Exception:
+        pass
 
     if project:
         project = normalize_project(project)
@@ -260,6 +280,10 @@ async def memory_find_function(
     """
     Find functions by purpose, name, or description.
 
+    Call this BEFORE implementing ANY function — 200+ are registered and most
+    of what you'd write probably exists. Skipping this check produces
+    duplicates the next agent has to reconcile.
+
     Use this BEFORE implementing something to check:
     - Does a function for this already exist?
     - Which function should I use for X?
@@ -415,6 +439,7 @@ async def memory_get_enrichment_queue(
         }
         for func_id, info in function_enrichment_queue.items()
         if not info["enriched"]
+        and project_allowed(active_sessions.get(session_id), info.get("project"))  # tenant isolation R5
     ]
 
     return json.dumps({
@@ -627,6 +652,8 @@ async def memory_enrich_function(
     for col in collections:
         if not (col.name.startswith(PROJECT_PREFIX) or col.name.startswith(SHARED_PREFIX)):
             continue
+        if not collection_allowed(session_info, col.name):
+            continue  # tenant isolation R4: other projects' functions read as not found
 
         try:
             result = await col.get(ids=[func_id], include=["documents", "metadatas"])

@@ -72,12 +72,12 @@ Authorize the controlling Claude's SSH key for unattended setup:
 ```bash
 mkdir -p ~/.ssh && chmod 700 ~/.ssh
 cat >> ~/.ssh/authorized_keys <<'EOF'
-ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDLdW2vXZMia2f+av5UBhssIizsP1OiW/NEDXA0CNeWa memory@sage junto-§13-acceptance
+<contents of the controller's ~/.ssh/id_ed25519_junto_test.pub>
 EOF
 chmod 600 ~/.ssh/authorized_keys
 ```
 
-(That key is `~/.ssh/id_ed25519_junto_test.pub` on sage. Skip this step if
+(That key is `~/.ssh/id_ed25519_junto_test.pub` on the controlling host. Skip this step if
 you'll drive the test from xavier directly.)
 
 ## 1. Bring up VM1 (juntoPrimary)
@@ -122,7 +122,7 @@ Or use the tailnet MagicDNS name if you have it set up:
 `scp` or copy-paste — it's a single short file. On VM2:
 
 ```bash
-scp tlemmons@<juntoPrimary-tailnet-ip>:~/junto-memory/peer-credentials.txt ~/junto-memory/
+scp <user>@<juntoPrimary-tailnet-ip>:~/junto-memory/peer-credentials.txt ~/junto-memory/
 ```
 
 ## 3. Bring up VM2 (juntoPeer)

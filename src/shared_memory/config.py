@@ -97,6 +97,18 @@ STALE_LOCK_MINUTES = 30
 # Session TTL - auto-expire sessions with no activity for this many days
 SESSION_TTL_DAYS = 14
 
+# Mid-tier idle expiry (backlog_940b9f9c66e1): sessions with no tool call for
+# this many hours AND no live inbox SSE subscription are expired. A session
+# with a live subscription is a healthy idle plugin and is never idle-expired
+# (the 14-day TTL above still applies to everything). 0 disables.
+SESSION_IDLE_HOURS = int(os.getenv("JUNTO_SESSION_IDLE_HOURS", "6"))
+
+# Per-subscriber send timeout for inbox notify pushes. A half-open socket's
+# write BLOCKS on the zero-buffer notification stream (same failure the SSE
+# keepalive guards against) — without this, one zombie subscriber wedges the
+# announce loop and live subscribers never get the push.
+NOTIFY_SEND_TIMEOUT = float(os.getenv("JUNTO_NOTIFY_SEND_TIMEOUT", "5"))
+
 # Signal retention (24 hours)
 SIGNAL_RETENTION_HOURS = 24
 
@@ -170,7 +182,7 @@ MESSAGE_STATUSES = ["pending", "delivered", "received", "completed", "failed"]
 #   OBLIGATION_RESOLVE_ON_REPLY — an owner's reply RESOLVES (an answer satisfies).
 #   OBLIGATION_RETAIN_ON_REPLY  — an owner's reply marks RESPONDED but the item
 #                                 stays in the action lane until an explicit done.
-OBLIGATION_STATES = ["open", "responded", "resolved"]
+OBLIGATION_STATES = ["open", "responded", "resolved", "lapsed"]  # lapsed: design:action-lapse-v0
 ACTION_CATEGORIES = ["task", "question", "blocker", "contract", "review"]
 OBLIGATION_RESOLVE_ON_REPLY = ["question", "contract", "review"]
 OBLIGATION_RETAIN_ON_REPLY = ["task", "blocker"]
@@ -190,6 +202,9 @@ def classify_lane(category, obligation):
       lane "cleared" — an ACTION-category message whose obligation is resolved
                        (drops OUT of the action lane)
       lane "fyi"     — info / non-action
+      lane "lapsed"  — an ACTION-category message whose obligation lapsed
+                       unanswered (design:action-lapse-v0): out of the action
+                       lane, not deleted, revivable
 
       tier 0 — obligation "open" (or a legacy action message with no obligation):
                an un-engaged ask, top of the action lane
@@ -199,6 +214,8 @@ def classify_lane(category, obligation):
     if category in ACTION_CATEGORIES:
         if obligation == "resolved":
             return "cleared", None
+        if obligation == "lapsed":
+            return "lapsed", None
         # "open" or a legacy pre-lanes-B action message (obligation unset) → tier 0;
         # only an explicit "responded" demotes to tier 1.
         return "action", (1 if obligation == "responded" else 0)

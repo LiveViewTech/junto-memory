@@ -6,12 +6,14 @@ from typing import List
 
 from mcp.server.fastmcp import Context
 
-from shared_memory import query_config
+from shared_memory import chunk_index, query_config, rerank
 from shared_memory.app import mcp
+from shared_memory.auth import collection_allowed, project_allowed, scoped_projects
 from shared_memory.clients import get_chroma, get_mongo
 from shared_memory.config import OVERLAP_WINDOW_HOURS, PROJECT_PREFIX, SHARED_PREFIX
 from shared_memory.helpers import (
     cleanup_stale_signals,
+    embed_query_once,
     format_age,
     format_staleness_warning,
     format_status_warning,
@@ -20,6 +22,8 @@ from shared_memory.helpers import (
     is_expired,
     normalize_project,
     parse_timestamp,
+    project_from_collection,
+    query_kwargs,
     require_session,
     update_access_stats,
     utc_now,
@@ -67,6 +71,16 @@ async def memory_query(
     - Has this been done before?
     - Are there known patterns or gotchas?
     - What decisions were made about this area?
+
+    FRESHNESS DISCIPLINE (relocated from session guidelines): results rank by
+    text relevance, NOT recency — check the age field on every result; prefer
+    newer when several cover one topic; verify anything older than ~30 days
+    against reality before acting on it (results carry staleness warnings).
+    Handoffs older than 14 days are noise — flag them for archival. If a
+    result is wrong or outdated and it's yours (or a simple factual fix),
+    memory_change_status(new_status="superseded") + record the correction; if
+    it's another agent's spec/decision, message their project coordinator
+    rather than leaving it for the next reader.
 
     Args:
         session_id: Your session ID
@@ -134,15 +148,42 @@ async def memory_query(
 
     where_clause = where_filter if where_filter else None
 
+    # ── ONE embedding for the whole request (backlog_c5dba6d13707) ──
+    # This used to embed `query` once PER COLLECTION — project + shared
+    # patterns + shared context — at ~96-138 ms each, on the event loop.
+    # See embed_query_once() for why that serialised the whole server.
+    # _qvec stays None until the first collection is in hand (the embedding
+    # function lives on the collection object); every later scan reuses it.
+    _qvec = None
+
+    # Chunked arctic2 lane (interface:chunk-index-v0), per-project flag, default
+    # OFF. Fails open per collection: _vscan falls back to the MiniLM query when
+    # the lane is unusable. Its scores are chunk cosine — own floor.
+    _cvec = await chunk_index.embed_query(query) if chunk_index.enabled_for(_qcfg) else None
+    _chunk_min = float(_qcfg.get("chunk_min_relevance", MIN_RELEVANCE_THRESHOLD))
+
+    # Cross-encoder rerank (interface:rerank-v0), per-project flag, default OFF.
+    # On: each scan returns a wider pool with NO similarity floor and no
+    # access-stat bumps; the rerank step below selects (or, if the service is
+    # down, re-applies today's floors and per-collection caps).
+    _rr = rerank.enabled_for(_qcfg)
+
+    async def _vscan(col, n):
+        """(results, chunked): chunk lane when usable, else the MiniLM query."""
+        if _cvec is not None:
+            got = await chunk_index.scan(col, _cvec, n, where_clause)
+            if got is not None:
+                return got, True
+        return await col.query(**query_kwargs(query, _qvec), n_results=n, where=where_clause), False
+
     # Search project collection if specified
     if project:
         try:
             proj_collection = await get_project_collection(chroma, project)
-            proj_results = await proj_collection.query(
-                query_texts=[query],
-                n_results=limit,
-                where=where_clause
-            )
+            _qvec = await embed_query_once(proj_collection, query)
+            proj_results, _chunked = await _vscan(
+                proj_collection, rerank.pool_size(limit) if _rr else limit)
+            _proj_min = _chunk_min if _chunked else MIN_RELEVANCE_THRESHOLD
 
             if proj_results["documents"] and proj_results["documents"][0]:
                 for i, (doc, meta, dist) in enumerate(zip(
@@ -156,7 +197,7 @@ async def memory_query(
 
                     # Calculate relevance and skip if below threshold
                     relevance = calculate_relevance(dist)
-                    if relevance < MIN_RELEVANCE_THRESHOLD:
+                    if relevance < _proj_min and not _rr:
                         continue
 
                     # Recency filter (optional)
@@ -185,12 +226,63 @@ async def memory_query(
                         "age": format_age(meta.get("updated") or meta.get("created")),
                         "content": doc,
                         "access_count": meta.get("access_count", 0),
+                        # Creation identity (ratified authored_by v1.1.0,
+                        # msg_96c9f7fc73ee): the claude_instance stamped at
+                        # record_learning/store time, never rewritten by any
+                        # update path. None when the doc predates identity
+                        # capture — consumers fail open on null.
+                        "authored_by": meta.get("claude_instance"),
                         "warning": warning if warning else None
                     })
+                    if _rr:
+                        results[-1].update(_sim=relevance, _min=_proj_min, _cap_key="project",
+                                           _text=rerank.doc_text(meta.get("title", ""), doc),
+                                           _col=proj_collection)
 
-                    # Track access (fire-and-forget)
-                    if doc_id:
+                    # Track access (fire-and-forget); rerank mode counts only the served rows
+                    if doc_id and not _rr:
                         await update_access_stats(proj_collection, doc_id)
+
+            # Exact identifier hits (lexical.py) — kept even below the
+            # relevance threshold, flagged match="exact", capped by config.
+            try:
+                _lex_max = int(_qcfg.get("lexical_max", 0))
+            except Exception:
+                _lex_max = 0
+            if _lex_max > 0 and _qvec is not None:
+                from shared_memory.lexical import lexical_scan
+                for h in await lexical_scan(proj_collection, query, _qvec, where_clause,
+                                            min(_lex_max, limit),
+                                            exclude_ids={r["id"] for r in results}):
+                    meta = h["meta"]
+                    if is_expired(meta):
+                        continue
+                    if recency_cutoff is not None:
+                        ts = parse_timestamp(meta.get("updated") or meta.get("created"))
+                        if ts is None or ts < recency_cutoff:
+                            continue
+                    status = meta.get("status", "active")
+                    staleness = format_staleness_warning(meta)
+                    warning = format_status_warning(status, meta.get("superseded_by"))
+                    if staleness:
+                        warning = (warning + " " + staleness).strip() if warning else staleness
+                    results.append({
+                        "source": f"project:{project}",
+                        "id": h["id"],
+                        "title": meta.get("title", "Untitled"),
+                        "type": meta.get("type"),
+                        "status": status,
+                        "relevance": f"{calculate_relevance(h['dist']):.0%}",
+                        "match": "exact",
+                        "created": meta.get("created", ""),
+                        "updated": meta.get("updated", ""),
+                        "age": format_age(meta.get("updated") or meta.get("created")),
+                        "content": h["doc"],
+                        "access_count": meta.get("access_count", 0),
+                        "authored_by": meta.get("claude_instance"),
+                        "warning": warning if warning else None
+                    })
+                    await update_access_stats(proj_collection, h["id"])
         except Exception:
             pass
 
@@ -202,11 +294,14 @@ async def memory_query(
         for shared_name in ["patterns", "context"]:
             try:
                 shared = await get_shared_collection(chroma, shared_name)
-                shared_results = await shared.query(
-                    query_texts=[query],
-                    n_results=min(2, limit),  # Max 2 from each shared collection
-                    where=where_clause
-                )
+                if _qvec is None:
+                    # No project scan happened, so this is the first collection
+                    # we hold — embed here and the second shared scan reuses it.
+                    _qvec = await embed_query_once(shared, query)
+                # Max 2 from each shared collection
+                shared_results, _chunked = await _vscan(
+                    shared, rerank.POOL_SHARED if _rr else min(2, limit))
+                _shared_min = (_chunk_min + 0.1) if _chunked else shared_threshold
 
                 if shared_results["documents"] and shared_results["documents"][0]:
                     for i, (doc, meta, dist) in enumerate(zip(
@@ -220,7 +315,7 @@ async def memory_query(
 
                         # Calculate relevance and skip if below threshold
                         relevance = calculate_relevance(dist)
-                        if relevance < shared_threshold:
+                        if relevance < _shared_min and not _rr:
                             continue
 
                         # Recency filter (optional)
@@ -244,14 +339,31 @@ async def memory_query(
                             "age": format_age(meta.get("updated") or meta.get("created")),
                             "content": doc[:500] + "..." if len(doc) > 500 else doc,
                             "access_count": meta.get("access_count", 0),
+                            "authored_by": meta.get("claude_instance"),
                             "warning": staleness if staleness else None
                         })
+                        if _rr:
+                            results[-1].update(_sim=relevance, _min=_shared_min, _cap_key=shared_name,
+                                               _text=rerank.doc_text(meta.get("title", ""), doc),
+                                               _col=shared)
 
-                        # Track access (fire-and-forget)
-                        if doc_id:
+                        # Track access (fire-and-forget); rerank mode counts only the served rows
+                        if doc_id and not _rr:
                             await update_access_stats(shared, doc_id)
             except Exception:
                 pass
+
+    if _rr and results:
+        _pool = [r for r in results if r.get("match") != "exact"]
+        _exact_rows = [r for r in results if r.get("match") == "exact"]
+        _scores = await rerank.score(query, [r["_text"] for r in _pool])
+        _caps = {"project": limit, "patterns": min(2, limit), "context": min(2, limit)}
+        _kept = rerank.apply(_pool, _scores, float(_qcfg.get("rerank_min", 0.5)), _caps)
+        for r in _kept:
+            if r.get("id") and r.get("_col") is not None:
+                await update_access_stats(r["_col"], r["id"])
+        results = _kept + _exact_rows
+        rerank.strip_private(results)
 
     if not results:
         return json.dumps({
@@ -272,7 +384,63 @@ async def memory_query(
         return (band, -epoch)
 
     results.sort(key=_sort_key)
+    # Exact identifier hits keep their slots; the vector rows fill the rest.
+    _exact = [r for r in results if r.get("match") == "exact"]
+    if _exact:
+        _rest = [r for r in results if r.get("match") != "exact"]
+        results = _rest[:max(0, limit - len(_exact))] + _exact
+        results.sort(key=_sort_key)
     results = results[:limit]
+
+    # Eval-set seeding (recall_metrics.query_events; maintainer retrieval-eval harness, not shipped).
+    try:
+        from shared_memory.recall_metrics import log_query_event
+        log_query_event(
+            get_mongo(), project, active_sessions.get(session_id, {}).get("claude_instance"),
+            query, [r["id"] for r in results],
+            scores=[int(r["relevance"].rstrip("%")) / 100 for r in results],
+            matches=[r.get("match") for r in results])
+    except Exception:
+        pass
+
+    # ── Facets inline delivery (design:memory-facets-v0 §consumer) ──
+    # Contract guarantee: when a result row's learning has facets, they ride
+    # the row itself — consumers (sub's rater) must never need a per-candidate
+    # get_by_id round-trip. Batched single find; absent rows stay absent (the
+    # facets container is optional forever). Best-effort by design.
+    try:
+        from shared_memory.facets import get_facets_for_ids
+        _facet_map = get_facets_for_ids(
+            get_mongo(), [r["id"] for r in results if str(r.get("id", "")).startswith("learning_")]
+        )
+        for r in results:
+            f = _facet_map.get(r.get("id"))
+            if f:
+                r["facets"] = f
+    except Exception:
+        pass
+
+    # ── Modality shape flag (Tom-approved 2026-08-10) ──
+    # A SHAPE flag, never a defect predictor: "the body declares a proposal or
+    # a deployment state — open it" is true for every row it fires on, so it
+    # cannot mis-fire. Derived from the content already on the row (same
+    # title + first-300 window the 75-doc measurement used), so it needs no
+    # stored field and covers the whole historical corpus. See facets.modality_shape.
+    try:
+        from shared_memory.facets import SHAPE_LABELS, modality_shape
+        for r in results:
+            if not str(r.get("id", "")).startswith("learning_"):
+                continue
+            shape = modality_shape(r.get("title", ""), r.get("content", ""))
+            if shape:
+                r["shape"] = shape
+                r["shape_note"] = (
+                    f"{SHAPE_LABELS[shape]}: this doc's body declares a proposal or an "
+                    f"undeployed state. The extracted claim may render it as fact — "
+                    f"open the body before acting."
+                )
+    except Exception:
+        pass
 
     # ── Preview-mode trim (backlog_6d5aa1a2849f) ──
     # After sort+limit, decide per-position whether to ship full content or
@@ -307,10 +475,17 @@ async def memory_get_by_id(
     ctx: Context = None
 ) -> str:
     """
-    Retrieve a document by its exact ID.
+    Retrieve a document by its ID.
 
     Use this when you have a specific document ID (from memory_store, memory_query, etc.)
     and want to retrieve the full content.
+
+    Also accepts:
+    - Message IDs (msg_*) — returns the message in the same shape as
+      memory_get_messages(message_id=...), same permission rules.
+    - Unique ID prefixes of 12+ chars, with or without the type prefix
+      (e.g. "7cc0b78f0e53" or "learning_7cc0b78f0e53" for
+      "learning_7cc0b78f0e53b4bb"). Ambiguous prefixes return the candidates.
 
     Args:
         session_id: Your session ID
@@ -320,6 +495,56 @@ async def memory_get_by_id(
     error = require_session(session_id)
     if error:
         return error
+
+    # ── Message dispatch (backlog_f6f950b3b4ce) ──
+    # Messages live in Mongo, not Chroma. Same auth + read-marking semantics
+    # as memory_get_messages(message_id=...); entry shape shared via
+    # _message_entry so the two surfaces cannot diverge.
+    if doc_id.startswith("msg_"):
+        from shared_memory.tools.messaging import _mark_messages_read, _message_entry
+        from shared_memory.tools.projects import _is_project_admin
+
+        db = get_mongo()
+        if db is None:
+            return json.dumps({"found": False, "id": doc_id, "error": "MongoDB unavailable"})
+        doc = db.messages.find_one({"_id": doc_id})
+        if not doc:
+            return json.dumps({
+                "found": False,
+                "id": doc_id,
+                "error": f"Message not found: {doc_id}"
+            }, indent=2)
+        session_info = active_sessions[session_id]
+        my_instance = session_info["claude_instance"]
+        my_project = normalize_project(session_info.get("project", ""))
+        my_role = session_info.get("role", "agent")
+        is_admin = (my_role in ("admin", "user")) or _is_project_admin(db, my_project, my_instance)
+        if not is_admin:
+            msg_to = doc.get("to_instance", doc.get("to", ""))
+            msg_project = doc.get("to_project", "")
+            if msg_to != my_instance and msg_to != "*":
+                return json.dumps({
+                    "found": False,
+                    "id": doc_id,
+                    "error": "Permission denied. Only admins/coordinators can view other agents' messages."
+                }, indent=2)
+            if msg_project and msg_project != my_project:
+                return json.dumps({
+                    "found": False,
+                    "id": doc_id,
+                    "error": "Permission denied. Message belongs to a different project."
+                }, indent=2)
+        # Body-pull marks read — canonical read of your own message; skip when
+        # an admin peeks at someone else's (don't mark read on their behalf).
+        if doc.get("to_instance", doc.get("to")) in (my_instance, "*"):
+            _mark_messages_read(db, [doc["_id"]], my_instance)
+        return json.dumps({
+            "found": True,
+            "id": doc_id,
+            "collection": "messages",
+            "type": "message",
+            "message": _message_entry(doc)
+        }, indent=2)
 
     chroma = await get_chroma()
 
@@ -336,13 +561,79 @@ async def memory_get_by_id(
         collections_to_search.append(await get_shared_collection(chroma, "context"))
         collections_to_search.append(await get_shared_collection(chroma, "work"))
     else:
-        # Search all collections
+        # Search all collections (a scoped key: its own projects + shared,
+        # so another project's doc reads as not found — tenant isolation R4)
+        _sess_info = active_sessions.get(session_id)
         all_collections = await chroma.list_collections()
         for col in all_collections:
-            if col.name.startswith(PROJECT_PREFIX) or col.name.startswith(SHARED_PREFIX):
+            if ((col.name.startswith(PROJECT_PREFIX) or col.name.startswith(SHARED_PREFIX))
+                    and collection_allowed(_sess_info, col.name)):
                 collections_to_search.append(col)
 
-    # Search for the document
+    async def _found_response(col, found_id: str, meta: dict, doc: str,
+                              resolved_from: str = None) -> str:
+        # Update access tracking
+        meta["access_count"] = meta.get("access_count", 0) + 1
+        meta["last_accessed"] = utc_now_iso()
+        await col.update(ids=[found_id], metadatas=[meta])
+
+        payload = {
+            "found": True,
+            "id": found_id,
+            "collection": col.name,
+            "title": meta.get("title", "Untitled"),
+            "type": meta.get("type", "unknown"),
+            "status": meta.get("status", "active"),
+            # Collection wins when the metadata copy is absent — see
+            # project_from_collection(). Learnings have never carried the key.
+            "project": meta.get("project") or project_from_collection(col.name),
+            "tags": json.loads(meta.get("tags", "[]")),
+            "created": meta.get("created"),
+            "updated": meta.get("updated"),
+            # Creation identity (interface:recall-v0 §authored_by; the
+            # get_by_id surface gap was a proven false-clear trap,
+            # backlog_601d268dbe6b). Null = pre-identity-capture doc —
+            # consumers fail open.
+            "authored_by": meta.get("claude_instance"),
+            "content": doc
+        }
+        if resolved_from:
+            payload["resolved_from_prefix"] = resolved_from
+        # Facets ride the follow-through surface too (get_by_id is the
+        # documented pointer-chase for /recall). Best-effort, learnings only.
+        if found_id.startswith("learning_"):
+            try:
+                from shared_memory.facets import (
+                    SHAPE_LABELS,
+                    get_facets_for_ids,
+                    modality_shape,
+                )
+                f = get_facets_for_ids(get_mongo(), [found_id]).get(found_id)
+                if f:
+                    payload["facets"] = f
+                _shape = modality_shape(meta.get("title", ""), doc)
+                if _shape:
+                    payload["shape"] = _shape
+                    payload["shape_note"] = (
+                        f"{SHAPE_LABELS[_shape]}: this doc's body declares a proposal "
+                        f"or an undeployed state — read the body, not the claim."
+                    )
+            except Exception:
+                pass
+        # Pull-through join (recall_metrics): if this doc was recall-injected
+        # to this project in the last 24h, this fetch IS the follow-through
+        # the A2(ii) metric wants. Best-effort, one indexed read.
+        try:
+            from shared_memory.recall_metrics import log_pull_if_injected
+            _sess = active_sessions.get(session_id, {})
+            log_pull_if_injected(get_mongo(), found_id,
+                                 _sess.get("claude_instance"),
+                                 _sess.get("project"))
+        except Exception:
+            pass
+        return json.dumps(payload, indent=2)
+
+    # Exact-ID lookup
     for col in collections_to_search:
         try:
             result = await col.get(
@@ -353,33 +644,61 @@ async def memory_get_by_id(
             if result["ids"]:
                 meta = result["metadatas"][0]
                 doc = result["documents"][0] if result["documents"] else ""
-
-                # Update access tracking
-                meta["access_count"] = meta.get("access_count", 0) + 1
-                meta["last_accessed"] = utc_now_iso()
-                await col.update(ids=[doc_id], metadatas=[meta])
-
-                return json.dumps({
-                    "found": True,
-                    "id": doc_id,
-                    "collection": col.name,
-                    "title": meta.get("title", "Untitled"),
-                    "type": meta.get("type", "unknown"),
-                    "status": meta.get("status", "active"),
-                    "project": meta.get("project", ""),
-                    "tags": json.loads(meta.get("tags", "[]")),
-                    "created": meta.get("created"),
-                    "updated": meta.get("updated"),
-                    "content": doc
-                }, indent=2)
+                return await _found_response(col, doc_id, meta, doc)
         except Exception:
             continue
+
+    # ── Prefix resolution fallback (backlog_fa06355f851b) ──
+    # Agents cite 12-char ID prefixes in messages/logs. On exact miss, scan
+    # ids (cheap, ids-only get) for a unique startswith match. A typed input
+    # ("learning_abc...") only matches that type; a bare hex input matches
+    # against each id's post-type tail. Minimum 12 chars of tail to keep
+    # matches meaningful.
+    tail = doc_id.split("_", 1)[1] if "_" in doc_id else doc_id
+    if len(tail) >= 12:
+        matches = {}  # full_id -> collection (dedupe: same id in 2 collections)
+        for col in collections_to_search:
+            try:
+                res = await col.get(include=[])
+                for fid in res["ids"]:
+                    if fid in matches:
+                        continue
+                    if "_" in doc_id:
+                        matched = fid.startswith(doc_id)
+                    else:
+                        ftail = fid.split("_", 1)[1] if "_" in fid else fid
+                        matched = fid.startswith(doc_id) or ftail.startswith(doc_id)
+                    if matched:
+                        matches[fid] = col
+            except Exception:
+                continue
+
+        if len(matches) == 1:
+            fid, col = next(iter(matches.items()))
+            try:
+                result = await col.get(ids=[fid], include=["metadatas", "documents"])
+                if result["ids"]:
+                    meta = result["metadatas"][0]
+                    doc = result["documents"][0] if result["documents"] else ""
+                    return await _found_response(col, fid, meta, doc,
+                                                 resolved_from=doc_id)
+            except Exception:
+                pass
+        elif len(matches) > 1:
+            return json.dumps({
+                "found": False,
+                "id": doc_id,
+                "error": f"Ambiguous prefix: {len(matches)} documents match",
+                "candidates": sorted(matches.keys())[:10]
+            }, indent=2)
 
     return json.dumps({
         "found": False,
         "id": doc_id,
         "error": f"Document not found with ID: {doc_id}",
-        "hint": "Try memory_query() to search by content, or check the project parameter"
+        "hint": "Try memory_query() to search by content, or check the project parameter. "
+                "ID prefixes need at least 12 chars (excluding the type prefix); "
+                "msg_* IDs resolve from the message store."
     }, indent=2)
 
 
@@ -416,6 +735,10 @@ async def memory_get_active_work(
     if project:
         project = normalize_project(project)
 
+    # A scoped key sees only its own projects' agents and work (tenant
+    # isolation R5); _me is None-scoped for everyone else.
+    _me = active_sessions.get(session_id)
+
     # Get from active sessions (in-memory)
     active_work = []
     since_cutoff = None
@@ -424,7 +747,14 @@ async def memory_get_active_work(
 
     for sid, info in active_sessions.items():
         if sid != session_id:
+            # Service principals are invisible to active-work enumeration
+            # (design:identity-lifecycle-v0 Mechanism A) — this is the one
+            # enumerator keyed off the session rather than a registry row.
+            if info.get("is_principal"):
+                continue
             if project and normalize_project(info["project"]) != project:
+                continue
+            if not project_allowed(_me, info.get("project")):
                 continue
             if instance and info["claude_instance"] != instance:
                 continue
@@ -462,6 +792,8 @@ async def memory_get_active_work(
                 updated = meta.get("updated", "")
                 if updated < cutoff:
                     continue
+                if not project_allowed(_me, meta.get("project")):
+                    continue
                 recent_work.append({
                     "title": meta.get("title"),
                     "status": meta.get("status"),
@@ -473,10 +805,27 @@ async def memory_get_active_work(
     except Exception:
         recent_work = []
 
+    # Plugin sessions carry the client's boilerplate task ("junto-inbox
+    # channel plugin") on every agent (backlog_df486507318c). Show the
+    # identity's real task instead: its other session's, else its newest
+    # work-item title in the window, else "".
+    from shared_memory.tools.sessions import _display_task
+    real_task = {}
+    for info in active_sessions.values():
+        t = _display_task(info.get("task"))
+        if t:
+            real_task.setdefault((info["claude_instance"], info["project"]), t)
+    for w in sorted(recent_work, key=lambda w: w.get("updated") or "", reverse=True):
+        if w.get("title"):
+            real_task.setdefault((w.get("claude"), w.get("project")), w["title"])
+    for row in active_work:
+        if not _display_task(row["task"]):
+            row["task"] = real_task.get((row["claude_instance"], row["project"]), "")
+
     # NEW: Include blocked agents info
     blocked_agents = []
     for sid, info in active_sessions.items():
-        if info.get("blocked_by"):
+        if info.get("blocked_by") and project_allowed(_me, info.get("project")):
             blocked_agents.append({
                 "agent": info.get("claude_instance"),
                 "waiting_for": info.get("blocked_by"),
@@ -486,7 +835,16 @@ async def memory_get_active_work(
 
     # NEW: Include recent signals
     cleanup_stale_signals()
-    recent_signals = list(active_signals.values())[:10]
+    recent_signals = list(active_signals.values())
+    if scoped_projects(_me) is not None:
+        # A signal carries no project; resolve it from the sender's session
+        # and drop it when that session is gone or out of scope.
+        recent_signals = [
+            sig for sig in recent_signals
+            if (active_sessions.get(sig.get("from_session")) or {}).get("project")
+            and project_allowed(_me, active_sessions[sig["from_session"]]["project"])
+        ]
+    recent_signals = recent_signals[:10]
 
     return json.dumps({
         "currently_active": active_work[:limit],

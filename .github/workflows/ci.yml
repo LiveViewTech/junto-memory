@@ -38,4 +38,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # docker-compose.yml requires JUNTO_MCP_LAN_IP (no default since 1.41.2);
+      # the build never binds ports, so any address satisfies interpolation.
       - run: docker compose build
+        env:
+          JUNTO_MCP_LAN_IP: 127.0.0.1

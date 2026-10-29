@@ -2,6 +2,17 @@
 
 Optional tools, templates, and examples that complement the core MCP server.
 
+## runner/
+
+The local-model runner for delegated tasks (`memory_delegate`). It claims runs from the server, fetches items through the connection's adapter (inline, imap read-only, file, mcp), asks the local Ollama model for one schema-valid JSON result per item, and reports back. The server applies routes. Setup, the safety model and limits: the main README, section **Local-Model Delegation**.
+
+- `junto-runner.py` — the runner (single file; needs `cryptography`, plus `mcp` for MCP sources)
+- `junto-runner.service` — systemd user unit (install steps in its header)
+
+## context-report/
+
+`junto-context-report.py` — run one copy per machine on a systemd user timer. It reports each local agent's context fill via `memory_report_context`, so `memory_get_agent_status` and `/admin` show every machine's agents. It also runs the idle-park auto-reset gate for opted-in agents. Off the server box, set `JUNTO_SHARED_MEMORY_URL=http://<server>:8080/mcp`.
+
 ## launchers/
 
 PowerShell script for launching multiple Claude Code agents in Windows Terminal tabs, each with MCP guidelines injected at system-prompt authority.

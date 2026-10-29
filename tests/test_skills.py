@@ -311,3 +311,42 @@ def test_export_only_active_and_payload_shape(db):
     assert item["relpath"] == "ready/SKILL.md"
     assert item["content"].startswith("---\n")
     assert "junto skill" in item["content"]  # provenance footer
+
+
+def test_build_skill_export_shape_and_normalizes_project(db):
+    """The shared core (used by BOTH the MCP tool and the REST route) returns
+    the exact wire dict and normalizes the project name."""
+    _reg(name="ready")
+    _activate("ready")
+    _reg(name="draft-skill")  # not confirmed → excluded
+    result = sk.build_skill_export("JUNTO", role="memory")  # denormalized in
+    assert result["project"] == "junto"                     # normalized out
+    assert result["count"] == 1
+    assert set(result["skills"][0].keys()) == {"id", "name", "relpath", "content"}
+    assert result["skills"][0]["relpath"] == "ready/SKILL.md"
+
+
+def test_build_skill_export_fail_loud_on_db_outage(db, monkeypatch):
+    """A DB outage must RAISE, not return an empty export — the launcher prunes
+    by footer, so a silent count:0 would wipe every materialized skill."""
+    monkeypatch.setattr(sk, "get_mongo", lambda: None)
+    with pytest.raises(Exception):
+        sk.build_skill_export("junto", role="memory")
+
+
+def test_export_tool_fail_loud_on_db_outage(db, monkeypatch):
+    """The MCP tool surfaces the outage as an explicit error, never count:0."""
+    import json
+    monkeypatch.setattr(sk, "get_mongo", lambda: None)
+    out = json.loads(_run(sk.memory_export_skills(session_id="s_owner", project="junto")))
+    assert "error" in out
+    assert "count" not in out
+
+
+def test_scope_matcher_strict_raises_but_besteffort_swallows(db, monkeypatch):
+    """Phase-1 surfacing (strict=False) keeps returning [] on outage so it can
+    never break session start; the export path (strict=True) raises."""
+    monkeypatch.setattr(sk, "get_mongo", lambda: None)
+    assert sk._active_scope_matched_docs("junto") == []          # best-effort
+    with pytest.raises(Exception):
+        sk._active_scope_matched_docs("junto", strict=True)      # fail-loud

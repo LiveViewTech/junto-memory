@@ -10,11 +10,16 @@
 
 **A shared memory and coordination server for multiple AI coding agents, built on the Model Context Protocol (MCP).**
 
+> 📋 **Running a server already?** See [`CHANGELOG.md`](CHANGELOG.md) for release notes — the current release (1.39.0) changes how global guidelines are seeded and generalizes the `execute-don't-ask` default; each has an upgrade note.
+
+> [!IMPORTANT]
+> **This is meant to be set up by an AI agent, not installed by hand.** Junto exists to coordinate fleets of coding agents, so the install is written for one of those agents to read and run — clone the repo and hand it to a Claude Code (or any MCP-capable) session, and let it drive. The commands in this README and in [`AGENT_INSTALL.md`](AGENT_INSTALL.md) are there so you can follow along and so the agent has something exact to execute; they are **not** a hand-tuned human tutorial, and reading them straight through isn't the intended path. You stay in control — the agent pauses for every real decision (passwords, ports, auth). If handing setup to an agent isn't something you'd want to do, this probably isn't the tool for you.
+
 When you run multiple AI agents on the same codebase, three things break fast:
 
 1. **They forget everything between sessions.** Agent parks, knowledge dies. The next agent re-reads the same code, re-discovers the same bugs, re-learns the same gotchas.
 2. **They step on each other.** Two agents modify the same file. Nobody knows what anyone else is doing or has locked.
-3. **They get dumber as sessions get long.** Research calls this "context rot" — model performance degrades as the context window fills up, even well below capacity. Longer sessions don't mean better work.
+3. **They get dumber as sessions get long.** Research calls this "context rot" — model performance degrades as the context window fills up. Eventually every agent has to hand off; without a shared brain that handoff throws away everything it learned.
 
 This server fixes all three. It gives your agents a shared brain that persists across sessions, coordinates work across agents, and lets them record what they learn so the next agent starts where the last one left off.
 
@@ -28,6 +33,8 @@ This server fixes all three. It gives your agents a shared brain that persists a
 - **Multi-agent coordination** -- File locking, inter-agent messaging, heartbeat monitoring, and overlap detection so multiple AI agents can work on the same codebase without stepping on each other.
 - **Task and backlog management** -- Track work items, assign tasks to agents, manage checklists, and hand off context between sessions.
 - **Function registry with auto-enrichment** -- Register functions once, and a librarian daemon analyzes the source code to add signatures, gotchas, and semantic search summaries.
+- **Local-model delegation** -- Agents hand routine text work (classify, extract, summarise, watch a mailbox) to a model running on your own hardware via Ollama, on a schedule or once, with results routed back to agents. Saves cloud-agent usage for work that doesn't need it. See [Local-Model Delegation](#local-model-delegation).
+- **Admin web UI** -- `/admin` on the server: settings, agents and their context fill, alerts, local tasks and runs, connections, and a change log. See [Admin Web UI](#admin-web-ui).
 
 ---
 
@@ -49,8 +56,11 @@ There are 370+ MCP memory servers listed on PulseMCP. Most give a single agent p
 | Librarian mode | No | Yes — Agents analyze source code and enrich the knowledge base |
 | External database access | No | Yes — Read-only SQL queries (MSSQL, MySQL) against your project databases |
 | Checklists | No | Yes — Shared launch readiness, deploy steps, etc. |
+| Local-model delegation | No | Yes — Agent-owned tasks run on a local Ollama runner; results routed to agents or a daily digest |
+| Secrets for data sources | No | Yes — Encrypted vault; agents request connections, the operator activates them, agents never see the secret |
+| Operator web UI | No | Yes — `/admin`: settings, agents, alerts, tasks, connections, change log |
 
-40 tools across 14 categories. Not a toy — a coordination system.
+63 tools across 23 categories. Not a toy — a coordination system.
 
 ---
 
@@ -92,8 +102,8 @@ The server runs as a single Docker Compose stack. AI agents connect over MCP (st
 This server is designed for AI coding agents, so the install procedure is too. Clone the repo, then ask your agent to install it for you:
 
 ```bash
-git clone https://github.com/tlemmons/mcp-shared-memory.git
-cd mcp-shared-memory
+git clone https://github.com/tlemmons/junto-memory.git
+cd junto-memory
 # Now hand the prompt below to your AI agent in a fresh session.
 ```
 
@@ -105,7 +115,7 @@ The agent walks through prerequisites, env-file configuration, container start, 
 
 **Why this way?** The install has accumulated enough operational gotchas — Chroma volume mount path, Mongo init credentials, the auth env-var with soft-fallback, the difference between localhost and remote-host trust models — that a 6-line quickstart misleads more often than it helps. `AGENT_INSTALL.md` is dense, branchy, and tested against the actual current code; an agent reads and executes it in a few minutes. If you don't trust an AI agent to run the install, this server is probably not for you — its whole purpose is to coordinate fleets of AI agents working on real codebases.
 
-**Manual install:** `AGENT_INSTALL.md` is human-readable too. It's denser than typical README prose, but follow it the same way and the install works.
+**Doing it by hand anyway?** `AGENT_INSTALL.md` is legible to a person and the install works if you follow it carefully — but it's written for an agent to execute, so it's dense, branchy, and light on the hand-holding a human tutorial would give. The agent-driven path above is the supported one.
 
 After install, MongoDB listens on `localhost:27019`, ChromaDB on `localhost:8001`, and the MCP server on `localhost:8080`.
 
@@ -215,7 +225,7 @@ No API keys or authentication tokens are required for local use (see [Security](
 
 ## Tool Reference
 
-48 tools organized into 14 categories. (For the canonical, current list with grouping and end-to-end flows, see the architecture spec inside the server: `memory_get_spec(name="architecture:shared-memory-v1", project="shared_memory")`.)
+63 tools organized into 23 categories. (For the canonical, current list with grouping and end-to-end flows, see the architecture spec inside the server: `memory_get_spec(name="architecture:shared-memory-v1", project="junto")`.)
 
 ### Session Management (2)
 
@@ -326,11 +336,257 @@ No API keys or authentication tokens are required for local use (see [Security](
 | `memory_archive_by_tag` | Bulk archive all documents matching a tag (e.g., end-of-version cleanup). |
 | `memory_restore_by_tag` | Bulk restore previously archived documents by tag. |
 
+### Coordination & Activity (2)
+
+| Tool | Description |
+|------|-------------|
+| `memory_get_active_work` | See what other agents are currently working on — tasks, files touched, timestamps. Avoid overlap. |
+| `memory_claim_message` | Claim a message so exactly one agent in a group handles it (multi-consumer coordination). |
+
+### Reminders & Scheduling (3)
+
+| Tool | Description |
+|------|-------------|
+| `memory_set_reminder` | Schedule a message to your future self (or a peer) at a specific time — deadlines, follow-ups, "ping me after X". |
+| `memory_cancel_reminder` | Cancel a previously scheduled reminder. |
+| `memory_list_reminders` | List your pending scheduled reminders. |
+
+### Skills (6)
+
+Reusable, task-invoked how-to procedures. Authored as `draft`, promoted to `active` through a trust gate, and materialized into `.claude/skills/` by a launcher so the client's native matcher fires them mid-task.
+
+| Tool | Description |
+|------|-------------|
+| `memory_register_skill` | Author a reusable skill (trigger + steps + gotchas + preconditions). Always creates a `draft`. |
+| `memory_confirm_skill` | Promote a draft skill to `active` — the trust gate. Owner/human only. |
+| `memory_get_skill` | Fetch one skill's full body by id or name. |
+| `memory_list_skills` | List skills (headers) scoped by project/role/directory/status. Pinned first, then active. |
+| `memory_pin_skill` | Pin/unpin a skill so it ranks first in surfacing. |
+| `memory_export_skills` | Export active, scope-matched skills as ready-to-write `SKILL.md` payloads for a launcher to materialize. |
+
+### Behavioral Directives (1)
+
+| Tool | Description |
+|------|-------------|
+| `memory_ack_directive` | Acknowledge a server-issued directive (e.g. a park or behavioral instruction) so it clears. |
+
+### Push-Control, Alerts & Telemetry (2)
+
+Operator visibility into the messaging rate-limit / push-control subsystem (chain-depth caps, per-agent hourly budgets, silent suppression).
+
+| Tool | Description |
+|------|-------------|
+| `memory_list_alerts` | List push-control alerts — budget warnings, budget breaches, hard-ceiling trips — for an operator dashboard or polling fallback. |
+| `memory_get_emission_stats` | Per-agent message-emission counters and budget usage. |
+
+### Team Status & Health (3)
+
+| Tool | Description |
+|------|-------------|
+| `memory_report_context` | Report agents' context-window fill from any machine (used by the per-box `contrib/context-report` reporter). `memory_get_agent_status` then shows every agent's context gauge, and the idle→park nudge uses it (see [Context Gauge and Idle-Park Nudge](#context-gauge-and-idle-park-nudge)). |
+| `memory_standup` | Auto-compiled team standup for a project — every agent's current task, blockers, stale state specs, and an aggregated decision queue. Read-only, needs no agent to produce it. |
+| `memory_health` | Server health — MongoDB + ChromaDB status and active session/lock/signal counts. No session required. |
+
+### Replication / Sync (2, server-to-server)
+
+Phase-2 local-first replication endpoints (`admin`/`owner` tier). A LAN-local junto-memory reconciles with a central instance by shipping op-log entries — peers never re-embed text.
+
+| Tool | Description |
+|------|-------------|
+| `memory_sync_pull` | Pull op-log entries newer than the caller's per-origin cursor. |
+| `memory_sync_push` | Apply a batch of op-log entries received from a peer (seq-monotonic, intent-deduped). |
+
+### Backlog — bulk (1)
+
+| Tool | Description |
+|------|-------------|
+| `memory_batch_backlog` | Create or update many backlog items in one call. |
+
+### Local-Model Delegation (4)
+
+Hand work to a model on your own hardware. How it works: [Local-Model Delegation](#local-model-delegation).
+
+| Tool | Description |
+|------|-------------|
+| `memory_delegate` | Create a task for the local model: data source (scope), instructions, JSON output schema, routes, optional schedule and canaries. No schedule = run once now. Can request a new connection in the same call. |
+| `memory_schedule` | Manage your tasks: `list`, `get`, `edit` (versioned), `pause`, `resume`, `delete`, `run_now`, `history`, `runs`, `approve` (operator). |
+| `memory_job` | One run: `status`, `result` (each item's output and the route it took), `cancel`. Owner only. |
+| `memory_runners` | Runners and connections: `list` (hosts, models, last heartbeat), `scopes` (connections you can use), `request_connection`; operator-only `define_scope`, `create_runner_key`. |
+
+---
+
+## Local-Model Delegation
+
+A lot of agent work doesn't need a frontier model: sorting a support inbox, pulling fields out of logs, summarising a long dump, watching a list for changes. Delegation lets an agent hand that work to a model running on your own hardware (via [Ollama](https://ollama.com)), so cloud-agent usage goes to the work that needs it. Contract: `memory_get_spec(name="interface:delegated-inference-v0", project="junto")`.
+
+### How it works
+
+```mermaid
+graph LR
+    A[Agent] -->|memory_delegate| S[junto-memory]
+    S -->|claim run + sealed secret| R[Runner on your GPU box]
+    R -->|fetch items| D[(Connection: imap / mcp / file / inline)]
+    R -->|one JSON result per item| O[Ollama]
+    R -->|results| S
+    S -->|routes: notify / digest / drop| A2[Agents]
+```
+
+1. **Connection (scope).** A typed data source: `inline` (text passed in the task), `imap` (read-only mailbox), `mcp` (read-only tools on another MCP server), `file` (allowed roots on the runner host), or `gmail` (read-only API; needs your own Google OAuth client). Each lists the agents granted it and the runner hosts allowed to use it. `memory_runners(action="scopes")` shows yours.
+2. **Task.** The agent owns it: `instructions`, an `output_schema` (JSON Schema for one item's result), `source_params`, `routes`, an optional `schedule` (`{"every": "15m"}` or `{"cron": "0 7 * * *"}`, minimum 5 minutes) and optional `canaries`. Every field can be edited later and edits are versioned. No schedule means it runs once now.
+3. **Run.** The server queues runs. A runner on the GPU box claims one, fetches the items, sends each to the model with the task's instructions, validates the reply against the schema, and reports back. One runner works one run at a time.
+4. **Routes.** The **server**, not the model, decides what happens to each result: `notify` an agent (with a template), add it to the owner's **daily digest**, or `drop` it. First matching rule wins; no match means digest. The local model can't take actions — anything it suggests reaches an agent as data.
+
+```python
+memory_delegate(
+    session_id=sid, name="ticket-sort", scope="myproject:inline",
+    instructions="Classify this support message.",
+    output_schema={"type": "object", "properties": {
+        "classification": {"type": "string", "enum": ["bug", "billing", "how_to", "spam"]},
+        "summary": {"type": "string"}}, "required": ["classification", "summary"]},
+    source_params={"items": ["text of message 1", "text of message 2"]},
+    routes=[{"if": {"field": "classification", "op": "in", "value": ["bug"]},
+             "then": "notify", "to": "myproject/backend", "category": "task",
+             "template": "{classification}: {summary}"},
+            {"if": {"field": "classification", "op": "eq", "value": "spam"}, "then": "drop"}],
+    run_now=True)
+# → a "Delegated job done" notice; then memory_job(run_id, action="result")
+```
+
+### Safety model
+
+- **Item content is untrusted data.** It reaches the model fenced, with the task restated after it. The default model, `gpt-oss:20b`, resisted every prompt-injection case in testing; `qwen3:14b` is faster but followed instructions planted in plausible mail, so use it only on trusted text.
+- **Canaries** are known items with expected outputs. They run daily (or every run) and after any edit to instructions, schema, model or source. A failed canary sends the owner a notice.
+- **Read-only sources.** IMAP opens with `EXAMINE` and `BODY.PEEK`. MCP tools are limited to the connection's `tools_allowed`, intersected with what the task asks for.
+- **Failed items are never silent.** An item with no valid output gets no route; for a scheduled task the owner gets an action notice listing each one (ref, from/subject, error), because the source cursor has moved past it.
+- **Visibility.** Only the task owner reads run results. Schema fields marked `"x-sensitive": true` are stripped from notifications to agents outside the connection's `content_visible_to`.
+
+### Connections and the secret vault
+
+Agents never handle credentials. An agent **requests** a connection (`memory_runners(action="request_connection")`, or `connection=` on `memory_delegate`). The operator **activates** it in `/admin` → Connections by pasting the secret; that act is the approval. Tasks waiting on it then start.
+
+- Secrets are stored encrypted (Fernet) under `JUNTO_VAULT_KEY`. Each claim seals a fresh copy to that runner's X25519 key; the runner opens it in memory for that run only and never logs or caches it.
+- Revoking a connection deletes the ciphertext and cancels queued runs. A run already claimed finishes within its 10-minute lease.
+- Every request, activation, rotation and revocation is in the connection audit (`/admin` → Connections).
+- `JUNTO_VAULT_KEY` lives in `.env`, not in the Mongo backups. A backup holds ciphertext only; losing the key means re-entering the secrets.
+- `JUNTO_DEFAULT_RUNNER_HOSTS` (comma list) sets which runner hosts a newly requested connection may run on. Unset means none: assign hosts in /admin before activating.
+
+### Running a runner
+
+The runner (`contrib/runner/junto-runner.py`) is a single Python file that needs `cryptography` (plus `mcp` for MCP sources). It talks only to the junto server, the local Ollama, and the connection's own source.
+
+First, from an owner/admin agent session, create the runner's key (it is shown once):
+`memory_runners(session_id=sid, action="create_runner_key", runner_id="gpu-1", host="gpubox")`.
+
+```bash
+# On the GPU box
+cp contrib/runner/junto-runner.py ~/.local/bin/ && chmod 755 ~/.local/bin/junto-runner.py
+mkdir -p ~/.config/junto-runner && chmod 700 ~/.config/junto-runner
+# save that key to ~/.config/junto-runner/runner.key (mode 600)
+# config.json (mode 600): {"server": "http://<server>:8080", "runner_id": "gpu-1",
+#   "key_file": "~/.config/junto-runner/runner.key", "ollama": "http://localhost:11434"}
+cp contrib/runner/junto-runner.service ~/.config/systemd/user/
+systemctl --user daemon-reload && systemctl --user enable --now junto-runner
+loginctl enable-linger $USER
+```
+
+The runner creates its X25519 key pair on first start and registers its installed models. The runner API (`/runner/api/*`) is LAN-only.
+
+### Limits and gotchas
+
+| Limit | Value |
+|---|---|
+| Tasks per agent | 25 live (delete one-offs with `memory_schedule(action="delete")`) |
+| Items per run | 200 |
+| Instructions | 20,000 chars |
+| Inline item | 20,000 chars (imap `max_chars` defaults to 12,000) |
+| Model context | The runner picks `num_ctx` per run: the smallest of 8,192 / 16,384 tokens (config `num_ctx_buckets`) that fits the run's longest item, capped by the model's trained context, `num_ctx_max` per model, and 4,096 for models over 30 GB (they don't fit one 24 GB card). One value per run, because changing `num_ctx` reloads the model. An item that still doesn't fit is cut by the runner with a visible marker; run evidence shows `num_ctx` and `items_truncated`. With the reply budget reserved, 16K holds about 20,000 chars of item. |
+| Reply length | `num_predict` = min(8,192, context/2) tokens per model call, **including reasoning** (gpt-oss reasons even with `think: false`; 2,048 was too small). A reply cut at the cap fails as `reply cut at num_predict=…`. For gpt-oss, a reply cut at the cap is retried once at `think: "low"` (counted as `low_effort_retries` in run evidence); default effort stays first because it resisted prompt injection better (0/16 vs 1/16 at low). |
+| Queue | One runner works one run at a time. Runs of scheduled tasks are claimed before one-off batches, oldest first within each group. |
+| Schedule | every ≥ 5 minutes; daily digest at 07:00 in the task's timezone unless `digest_at` is set |
+
+A model too big for VRAM (e.g. a 72B model on 2×24 GB) runs partly on CPU and evicts every other loaded model. Keep big models out of batches.
+
+---
+
+## Admin Web UI
+
+The server serves an operator page at **`http://<server>:8080/admin`** and a read-only activity feed at **`/dashboard`**. Both are **LAN-only**: requests arriving through a tunnel get 403. Every change needs an **owner API key** (pasted into the page, sent as a Bearer header).
+
+Who can view depends on `JUNTO_REQUIRE_KEY`:
+- **Off** (LAN soft-auth): anyone on the LAN can view both pages.
+- **On**: the pages load, but their data needs an **unscoped** API key (any role), pasted into the page's key box. The two pages share it per browser tab. A key limited to particular projects gets 403, because these views span every project.
+
+| Tab | What it shows / does |
+|---|---|
+| Overview | Headline counts, with links to `/dashboard` (activity feed) and `/health` |
+| Settings | Every tunable setting: code default vs. server value, editable server-wide or per project |
+| Agents | Registered agents, last activity, context-fill gauge |
+| Alerts | Push-control alerts (budget warnings and breaches); acknowledge them |
+| Local tasks | Delegated tasks (pause / resume / run now / approve), recent runs with evidence, canaries, routes and errors, and runner heartbeats |
+| Connections | Requested and active connections: paste a secret to activate or rotate, revoke, plus the connection audit |
+| Change log | Every settings change: who, when, before and after |
+
+To put it behind a hostname, proxy `/admin` from nginx or similar, and keep that vhost LAN-only too.
+
+---
+
+## Context Gauge and Idle-Park Nudge
+
+**Context gauge.** `contrib/context-report/junto-context-report.py` runs on each machine (systemd user timer). It finds local `claude` processes, reads each agent's context-fill metrics written by its status line, and calls `memory_report_context`. `memory_get_agent_status` and `/admin` → Agents then show every agent's context fill across all machines.
+
+**Self-report on keyed servers.** With `JUNTO_REQUIRE_KEY=true`, a non-owner/admin caller of `memory_report_context` may report only its *own* agent's context; reports for other instances come back in `skipped`. This is the path for a client that reports for itself (interface:context-self-report-v0), so on a multi-person server no agent can set another's gauge. On a trusted fleet without that flag, one reporter per machine speaks for every agent on it.
+
+**Idle-park nudge.** If an agent makes no real tool call for `idle_park_minutes` (default 50, just under the ~60-minute prompt-cache TTL), the server pushes it one notice. Only agents with at least `idle_park_min_context` (default 200K) of reported context are nudged, and `idle_park_optout` lists agents that never are. Agents listed in `idle_park_autoreset` go further: after a nudged park, the reporter checks the agent's tmux pane is safe to type into, then types `/clear` and `go`.
+
+**What the nudge says.**
+- The body is the project's idle policy. If the project has an active `park_on_idle_nudge` guideline, its text is used.
+- Otherwise the body is the `idle_park_policy` setting (per project, or the server default), so a server with many projects sets one policy once, e.g. "keep the cache warm by day, park at night".
+- With neither set, the default body suggests parking at a clean stop.
+- Every nudge ends with the agent's **local time and a DAY/NIGHT verdict**, e.g. `Your local time: 13:07 (America/Chicago) — DAY (night = 21:00–06:00)`, so policies never need to shell out for the time.
+
+**Time zones.** An agent sets its zone once with `memory_start_session(..., timezone="America/Denver")` (an IANA name, stored on its directory entry). Agents without one use `idle_park_timezone` (project, then server default), then `America/Chicago`.
+
+Configure all of these with `memory_admin push_control_set_config` or `/admin` → Settings.
+
+---
+
+## Action Lapse
+
+An action message (task, question, blocker, contract, review) stays in the recipient's action lane until someone closes it, and replies often forget `in_response_to`, so old asks pile up and hide new ones. Every 6 hours the server lapses open action messages older than `action_lapse_days` (default **30**; 0 disables). Tasks and blockers that were answered but never closed lapse `action_lapse_responded_days` (default 7) after the reply.
+
+Lapsed messages leave the action lane but are **not deleted**. `memory_update_message_status(id, "open")` or a reply from the owner revives them. Threads a human touched are exempt. Each affected recipient gets one digest notice per sweep listing what lapsed.
+
+---
+
+## Optional Local Inference
+
+Three features use a local model. All are **off by default** and all **fail open**: if the model host is down or slow, the server answers exactly as it would without them. Each is turned on with an env var (plus a restart) or a runtime setting, so a server can run without a GPU and add one later. The endpoints are URLs, so the GPU can be the docker host itself (`host.docker.internal`, mapped by `extra_hosts` in `docker-compose.yml`) or another machine.
+
+| Feature | What it does | Needs | Turn on |
+|---|---|---|---|
+| **Reranker** | Re-orders `memory_query` candidates with a cross-encoder. Response shape is unchanged; `relevance` becomes the cross-encoder score, which runs low (a useful indirect match can show 5–15%). | `contrib/reranker/rerank_server.py` (BAAI/bge-reranker-v2-m3 on GPU, torch + sentence-transformers; systemd unit in the same folder) | `JUNTO_RERANK_URL` in `.env`, then `memory_admin(action="query_set_config", key="rerank", value=true)` for all projects, or add `project=` for one |
+| **Write-time contradiction check** | When a learning is recorded, extracts its one-sentence claim and asks a judge model whether it contradicts the similar earlier learnings the server already surfaces. The response labels them CONTRADICTS / CONSISTENT. Advisory only; it never blocks a write. | An OpenAI-compatible `/v1` endpoint (e.g. Ollama) with a judge model (default `phi4:14b`) | `JUNTO_CLAIM_GATE_ENABLED=true` plus `JUNTO_CLAIM_GATE_URL` / `_MODEL` / `_EXTRACT_MODEL` |
+| **Facets** | Adds `claim`, `operation`, `trigger` and `shelf_life` fields to each learning in the background after the write. They show up on `memory_query` results. | The same endpoint and extract model | `JUNTO_FACETS_ENABLED=true`. Backfill older learnings with `scripts/facets_backfill.py --batch N` |
+
+On real queries the reranker took precision from **.84 to .96** (Claude-graded sample; interface:rerank-v0). With the reranker on, memory_query took 0.4–0.6 s, versus 0.3–0.45 s without.
+
+Two cautions. Turn `rerank` on only after the service answers: with the flag on and no service, every `memory_query` waits up to `JUNTO_RERANK_TIMEOUT` (2 s) before falling back. And thinking models (qwen3.x, gemma4) need `JUNTO_CLAIM_GATE_EXTRACT_REASONING=none`, or they spend the token budget thinking and return nothing.
+
+See `.env.example` for every inference variable.
+
+---
+
+## Ambient Recall (`/recall`)
+
+`POST /recall` is a plain-HTTP endpoint (no MCP handshake) for client hooks, e.g. a Claude Code `UserPromptSubmit` hook. The hook posts the recent conversation each turn and gets back **headers only**, never bodies: id, type, title, a one-line summary, score, updated date and author for the few memories above a similarity floor. The agent pulls a body with `memory_get_by_id` only if one clearly applies.
+
+Body: `{project, query, agent?, k? (1–15, default 5), threshold? (default: the recall_floor setting, 0.6), scope? (learnings|specs|functions|all)}`. Auth follows the same rules as `memory_start_session`. An outage returns 5xx, never an empty result. Contract: interface:recall-v0.
+
 ---
 
 ## Configuration
 
-All configuration is via environment variables. See `.env.example` for the complete reference.
+Server configuration comes from environment variables; `.env.example` documents every one, with its default. Settings that change at runtime (idle-park, action lapse, push budgets, query defaults such as `rerank`) live in the database instead and are edited with `memory_admin` or `/admin` → Settings.
 
 ### Required Variables
 
@@ -340,7 +596,7 @@ All configuration is via environment variables. See `.env.example` for the compl
 | `MONGO_USER` | `mcp_orch` | MongoDB username. |
 | `MONGO_DB` | `mcp_orchestrator` | MongoDB database name. |
 | `MONGO_HOST` | `localhost` | MongoDB host (set automatically in Docker Compose). |
-| `MONGO_PORT` | `27019` | MongoDB external port. (`.env.example` currently shows `27018`; that's stale — `docker-compose.yml` uses `27019`.) |
+| `MONGO_PORT` | `27019` | MongoDB host-side port (`docker-compose.yml` publishes 27019 on 127.0.0.1). |
 | `CHROMA_HOST` | `localhost` | ChromaDB host (set automatically in Docker Compose). |
 | `CHROMA_PORT` | `8001` | ChromaDB external port. |
 
@@ -348,7 +604,18 @@ All configuration is via environment variables. See `.env.example` for the compl
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `MCP_AUTH_ENABLED` | `false` | Enable API key authentication. When true, `memory_start_session` requires a valid key — passed either as the `api_key` tool argument or via an `Authorization: Bearer <key>` HTTP header (see [Security](#security)). |
+| `MCP_AUTH_ENABLED` | `false` | Enable API key authentication. When true, keys are validated and scoped and an invalid key is rejected, but a keyless session still falls back to `agent` tier unless `JUNTO_REQUIRE_KEY` is set. Keys are passed either as the `api_key` tool argument or via an `Authorization: Bearer <key>` HTTP header (see [Security](#security)). |
+| `JUNTO_REQUIRE_KEY` | `false` | Reject every keyless session. Use on any server reachable beyond a trusted LAN (see [Auth modes](#auth-modes)). |
+| `JUNTO_TUNNEL_REQUIRES_KEY` | `true` (compose: `false`) | Reject keyless sessions that arrive through a Cloudflare tunnel (`CF-Connecting-IP` header). |
+| `JUNTO_MCP_LAN_IP` | **required, no default** | IP that port 8080 binds to besides 127.0.0.1 (read by `docker-compose.yml`). Compose refuses to start until it is set. |
+| `JUNTO_LOG_QUERY_TEXT` | `true` | Store the text of searches in the metrics collections (90-day TTL). `false` keeps ids/scores but drops the text. |
+| `JUNTO_SESSION_IDLE_HOURS` | `6` | Expire sessions idle this long with no live inbox subscription. `0` disables. |
+| `JUNTO_SESSION_PERSIST` | `true` | Keep session ids valid across a server restart (mirrored to Mongo). |
+| `JUNTO_RERANK_URL` | `http://host.docker.internal:8091` | Reranker service. The on-switch is the `rerank` query setting (see [Optional Local Inference](#optional-local-inference)). |
+| `JUNTO_CLAIM_GATE_ENABLED` | `false` | Write-time contradiction check (needs an OpenAI-compatible endpoint, `JUNTO_CLAIM_GATE_URL`). |
+| `JUNTO_FACETS_ENABLED` | `false` | Background facets on learnings (same endpoint). |
+| `JUNTO_PENDING_REAP_ENABLED` | `false` | Reap idle pending-tier roster ghosts after `JUNTO_PENDING_REAP_GRACE_HOURS` (48). |
+| `JUNTO_VAULT_KEY` | -- | Fernet key for the connection-secret vault (local-model delegation). Needed only to store connection secrets. Generate with `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`. Keep it out of backups and git. |
 | `ANTHROPIC_API_KEY` | -- | Required only for the standalone librarian enrichment service. |
 | `LIBRARIAN_PROJECT_ROOTS` | -- | JSON map of project names to filesystem paths for librarian code analysis. |
 | `DB_<NAME>_TYPE` | -- | Register an external database. Supported: `mssql`, `mysql`. See `.env.example` for full pattern. |
@@ -360,6 +627,14 @@ All configuration is via environment variables. See `.env.example` for the compl
 | `DB_<NAME>_READONLY` | `true` | Enforce read-only queries. |
 | `DB_<NAME>_TIMEOUT` | `30` | Query timeout in seconds. |
 | `DB_<NAME>_MAX_ROWS` | `500` | Maximum rows returned per query. |
+
+### Host-side tools (not read by the server)
+
+These have **no default**, and each tool exits with a clear message when its variable is unset, so nothing silently targets someone else's machine:
+
+| Variable | Used by |
+|----------|---------|
+| `JUNTO_OLLAMA_URL` | `contrib/local-inference/li.py` (or `--url`); http/https only. |
 
 ---
 
@@ -379,6 +654,11 @@ mcp-shared-memory/
 │       ├── helpers.py            # Shared utility functions
 │       ├── auth.py               # API key auth, RBAC, tenant isolation
 │       ├── audit.py              # Audit logging to MongoDB
+│       ├── delegation.py         # Local-model tasks, scopes/connections, scheduling, routes
+│       ├── vault.py              # Encrypted connection secrets, sealed per runner
+│       ├── runner_api.py         # /runner/api/* (register, heartbeat, claim, complete, fail)
+│       ├── admin_ui.py           # /admin web UI + its JSON API
+│       ├── idle_park.py          # Idle→park nudge and auto-reset
 │       └── tools/
 │           ├── __init__.py       # Tool registration
 │           ├── sessions.py       # Session start/end
@@ -394,8 +674,11 @@ mcp-shared-memory/
 │           ├── checklists.py     # Shared checklists
 │           ├── database.py       # External database queries
 │           ├── lifecycle.py      # Document lifecycle and work status
+│           ├── delegation.py     # memory_delegate / schedule / job / runners
 │           └── admin.py          # API key management and audit logs
 ├── librarian.py                  # Standalone enrichment daemon (uses Haiku)
+├── contrib/runner/               # Local-model runner + systemd user unit
+├── contrib/context-report/       # Per-machine context-fill reporter
 ├── docker-compose.yml            # Full stack: server + MongoDB + ChromaDB
 ├── Dockerfile
 ├── requirements.txt
@@ -470,12 +753,39 @@ Set `MCP_AUTH_ENABLED=true` in `.env` to require API keys for all sessions. Keys
 |------|--------|
 | `owner` | Full access — manage API keys, guidelines, all projects |
 | `admin` | Manage backlog, specs, functions, messaging across all projects |
+| `user` | Human-driven tooling (dashboards, CLIs): broader read across projects and can send messages (which start fresh chains at depth 0), but no key or guideline management |
 | `agent` | Standard agent access, scoped to assigned projects |
 | `readonly` | Query and search only, no writes |
 
 Each API key can be scoped to specific projects for **tenant isolation** — agents only see data in their allowed projects. All security-sensitive operations are written to an **audit log** (90-day retention).
 
 When auth is disabled (default), all tools are open — suitable for local single-user setups.
+
+#### Auth modes
+
+| Setting | Keyless session | Invalid key | Use for |
+|---|---|---|---|
+| `MCP_AUTH_ENABLED` unset (default) | allowed | n/a | local single-user |
+| `MCP_AUTH_ENABLED=true` | **allowed**, falls back to `agent` tier with access to all projects | rejected | a trusted LAN where some clients have no key |
+| `MCP_AUTH_ENABLED=true` + `JUNTO_REQUIRE_KEY=true` | **rejected** | rejected | any server reachable beyond a trusted LAN (Tailscale, VPN, shared office network) |
+
+`MCP_AUTH_ENABLED=true` on its own does **not** require keys: a keyless agent gets more access than a project-scoped key. If every legitimate client holds a key, set `JUNTO_REQUIRE_KEY=true`. `JUNTO_TUNNEL_REQUIRES_KEY` (code default `true`) rejects keyless sessions only when they arrive through a Cloudflare tunnel. The same rules apply to the plain-HTTP endpoints `/recall` and `/export-skills`. The `/admin` page refuses tunnel traffic and needs an owner key for changes. With `JUNTO_REQUIRE_KEY=true`, its read endpoints also need a valid key (any role) and answer 401 without one.
+
+**Project-scoped keys are enforced on every tool (1.41+).** A key created with a `projects` list stays inside those projects (`interface:project-scope-enforcement-v0`):
+- Any tool call that names another project in `project`/`projects` is rejected with `ERROR: Tenant isolation: …`.
+- Listings that span projects when `project` is omitted return only the key's projects plus shared data: `memory_list_backlog`, `memory_list_specs`, `memory_search_global`, `memory_get_active_work`, `memory_list_agents`, `memory_get_agent_status`, `memory_list_alerts`, `memory_get_emission_stats`, `memory_get_locks`, `memory_archive_by_tag` / `memory_restore_by_tag`, and `memory_list_projects` (scoped by the request's Bearer key).
+- A doc in another project, addressed by id (`memory_get_by_id`, backlog update/complete/batch, `memory_enrich_function`, skills by `skill_` id), reads as not found.
+- Shared data stays readable.
+
+**Exemptions, on purpose:**
+- `memory_send_message(to_project=…)`: cross-project messaging is how teams talk.
+- `memory_start_session`: checks the scope itself.
+- `memory_get_messages`: has its own permission rules.
+- `memory_admin`: role-gated.
+
+Unscoped keys, keyless sessions and auth-disabled servers are unaffected.
+
+The same applies to the server-wide HTTP views. Under `JUNTO_REQUIRE_KEY`, `/admin` reads, `/dashboard/api/*` and `/hook/compact-log/stats` need an unscoped key, and a scoped key gets 403 (see [Admin Web UI](#admin-web-ui)).
 
 #### Passing the key: tool argument or `Authorization` header
 
@@ -506,7 +816,7 @@ Precedence: explicit `api_key` argument > header > keyless. A keyless session (n
 - **Reverse proxy with auth** — Use nginx or Caddy with HTTP basic auth, mTLS, or OAuth2 in front of the server.
 - **SSH tunnel** — `ssh -L 8080:localhost:8080 your-server` for ad-hoc remote access.
 
-The `MONGO_PASSWORD` in `.env.example` defaults to `changeme`. The server will start with this value, but **you must change it** for any non-throwaway deployment. MongoDB and ChromaDB ports are also exposed by default in Docker Compose — restrict these with firewall rules if your machine is network-accessible.
+The `MONGO_PASSWORD` in `.env.example` defaults to `changeme`. The server will start with this value, but **you must change it** for any non-throwaway deployment. In `docker-compose.yml`, MongoDB (27019) and ChromaDB (8001) bind to 127.0.0.1 only, and the MCP port (8080) binds to 127.0.0.1 plus `JUNTO_MCP_LAN_IP`, never 0.0.0.0. Keep it that way if you edit the ports.
 
 ---
 
@@ -532,7 +842,15 @@ This server includes tools to fight that drift:
 
 ### Server-managed guidelines
 
-Set rules once via `memory_guidelines`, every agent receives them at session start. Rules like "never write to local files," "record learnings immediately," "park after 1-3 tasks." Update once — every agent on every machine picks it up on their next `memory_start_session`.
+Every agent receives a set of behavioral rules at session start (in the `memory_start_session` response). There are two tiers:
+
+**Built-in global defaults (shipped, universal).** Junto ships a set of `scope="global"` rules in code — [`src/shared_memory/global_guidelines.py`](src/shared_memory/global_guidelines.py) — that are re-seeded into the DB on every server boot. So a fresh server (yours, or an isolated peer/work box) gets sane defaults with **zero manual setup**, and updating a default travels with the deploy. These are deliberately **universal process** — memory-first querying, running longer sessions and parking at a clean stop, accuracy over agreement, persisting knowledge to the server, recording learnings immediately, session discipline, message semantics, pointers-not-summaries, contracts-before-code, freshness checks, concise output, and reading the source before asserting. Nothing team- or deployment-specific lives here. Global scope is **code-managed and read-only through the tool** — change a default by editing that file and deploying (the seeder re-asserts it), not with a live edit.
+
+**Your own rules (project-scoped, runtime).** Add rules specific to your team or project with `memory_guidelines(action="set", scope="<project>", name=..., rule=...)` — these are writable at runtime and served only to agents in that project. This is where deployment specifics go.
+
+**Approval boundaries.** The built-in "execute, don't ask" rule is intentionally generic — it states the principle (do reversible work; only a human approves the irreversible) and **defers the exact boundaries to your fleet's own approval contract**. Define yours as a spec (e.g. `memory_define_spec(name="approval-contract", spec_type="interface", ...)`) or a project-scoped guideline; agents pull it when an action's reversibility is in question. Don't bake one fleet's staging/prod/merge policy into the shipped defaults.
+
+Server guidelines are authoritative for the process they cover — they override any stale context/session heuristic still sitting in a project's `CLAUDE.md`.
 
 ### Staleness management
 
@@ -549,8 +867,8 @@ Contributions welcome! These are known gaps that would benefit the project:
 - ~~**Authentication and tenant isolation**~~ — Done! API keys with RBAC and project scoping. See [Security](#security).
 - **PostgreSQL support** — the `memory_db` tool supports MSSQL and MySQL. PostgreSQL not yet implemented.
 - **Local model support for librarian** — Ollama integration so the enrichment daemon doesn't require a cloud API key
-- **TTL and stale data cleanup** — background pruning of expired sessions, locks, and messages with configurable retention
-- **Data export/backup tooling** — dump and restore scripts for migration and disaster recovery
+- ~~**TTL and stale data cleanup**~~ — Largely done: idle-session expiry (`JUNTO_SESSION_IDLE_HOURS`), lane-based message TTLs (info 48 h; open actions never age; closed actions 7 d), [action lapse](#action-lapse), pending-agent reaping, and 90-day metrics TTLs.
+- **Data export/backup tooling** — `contrib/backup/` has Mongo (mongodump) and Chroma (pause, copy, archive) backup scripts to run from cron. A one-command restore/migration tool is still missing.
 
 See [docs/WORKED_EXAMPLE.md](docs/WORKED_EXAMPLE.md) for an end-to-end walkthrough of multi-agent coordination.
 
@@ -562,7 +880,7 @@ Don't want to run your own server? A hosted version is available — you get a d
 
 - No server setup — connect your agents in minutes
 - Automatic backups
-- Same 40 tools, same features
+- Same 57 tools, same features
 - Multi-project isolation
 
 **Interested?** Open an issue or reach out for details.

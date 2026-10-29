@@ -38,3 +38,32 @@ DISCUSSION_PROFILE_TOOLS: frozenset[str] = frozenset({
     "memory_define_spec",
     "memory_health",
 })
+
+
+def advertise_session_alias(tool):
+    """Discussion-profile schema: rename the `session_id` parameter to
+    `junto_session` (msg_50ff99f0ead1). Claude desktop/Cowork strips any
+    argument named exactly `session_id`; the CallToolRequest wrapper
+    (intent.build_call_tool_handler_with_session_alias) maps it back. Returns a
+    copy — the registered tool is never mutated. Clients cache tool schemas
+    until a fresh conversation, so old schemas keep sending session_id, which
+    still works."""
+    from shared_memory.intent import SESSION_ALIAS_KWARG
+    schema = tool.inputSchema or {}
+    props = schema.get("properties") or {}
+    if "session_id" not in props:
+        return tool
+    new_props = {}
+    for k, v in props.items():
+        if k == "session_id":
+            v = {**v, "title": "Junto Session",
+                 "description": "Your session ID (from memory_start_session)."}
+            k = SESSION_ALIAS_KWARG
+        new_props[k] = v
+    required = [SESSION_ALIAS_KWARG if r == "session_id" else r
+                for r in schema.get("required") or []]
+    new_schema = {**schema, "properties": new_props}
+    if "required" in schema:
+        new_schema["required"] = required
+    desc = (tool.description or "").replace("session_id:", f"{SESSION_ALIAS_KWARG}:")
+    return tool.model_copy(update={"inputSchema": new_schema, "description": desc})

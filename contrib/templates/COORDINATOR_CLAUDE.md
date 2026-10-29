@@ -83,8 +83,12 @@ notes.md, .context, etc). These are invisible to other agents and lost on repo
 switches. ALL persistent knowledge goes to the MCP shared memory server.
 
 ### Session Length Discipline
-Park after completing focused work units (1-3 related tasks). Do NOT run
-marathon sessions. Long sessions cause context window degradation.
+Run longer sessions — park on TASK COMPLETION at a clean stop, not a task count
+or "feels long." Context-usage bands (the server's global guidelines are
+authoritative): keep working **< 500K**, watch for degradation **500–800K**,
+park **> 800K**. **As a coordinator, shift the bands ~150–200K LOWER** — channel
+messages and spec pulls are large, so you fill context faster than a worker.
+Any park must cite a token count or a named symptom. If the user says park, park.
 
 ### Topic-Scoped Parking
 Do NOT dump everything into one monolith state:coordinator spec. The goal is

@@ -98,9 +98,11 @@ async def broadcast_restart_warning(
     if reason:
         body_lines.append(f"Reason: {reason}")
     body_lines.append(
-        "Recommended action: complete current tool call, park if mid-task, "
-        "and pause before issuing further calls. The MCP transport will reset; "
-        "your next call will need a fresh memory_start_session."
+        "Recommended action: complete current tool call and pause before "
+        "issuing further calls. The MCP transport will reset, but your "
+        "session_id survives the restart (session_persist.py): keep using it. "
+        "Only if a call returns 'Session not found', re-run memory_start_session "
+        "with guidelines_held=<your guidelines.hash>."
     )
     body = "\n".join(body_lines)
 

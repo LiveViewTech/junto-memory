@@ -72,7 +72,7 @@ def test_detect_tunnel_origin_case_insensitive():
 
 def test_detect_tunnel_origin_false_for_lan_local():
     # A LAN/local direct hit carries no CF header → keyless allowed.
-    assert auth_mod.detect_tunnel_origin([(b"host", b"192.168.15.240:8080")]) is False
+    assert auth_mod.detect_tunnel_origin([(b"host", b"192.0.2.10:8080")]) is False
     assert auth_mod.detect_tunnel_origin([]) is False
     assert auth_mod.detect_tunnel_origin(None) is False
 

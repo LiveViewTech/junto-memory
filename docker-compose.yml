@@ -1,9 +1,14 @@
 services:
   chromadb:
-    # Chroma 1.x (Rust rewrite). Public tag chromadb/chroma:1.2.4 (released
-    # 2025-12-12). The local Image ID is sha256:501769453712...; the registry
-    # manifest digest is sha256:70c20dbcb64e... — that's the digest pinned
-    # below so Docker Hub cannot silently re-tag 1.2.4 to a different image.
+    # Chroma 1.x (Rust rewrite). Public tag chromadb/chroma:1.5.9 (released
+    # 2026-05-05), manifest digest pinned below so Docker Hub cannot silently
+    # re-tag it. Upgraded from 1.2.4 on 2026-10-25 after a rehearsal on a volume
+    # copy: 334,240 records identical across all 4 databases, determinism canary
+    # green, HNSW recall@10 vs exact 0.993 (1.2.4: 0.994). Keep the client pin
+    # (requirements.txt) on the same version. Pre-upgrade cold backup: docker
+    # volume chroma-backup-pre159-20261025 (rollback = restore it + old digest
+    # sha256:70c20dbcb64edbfad111a87149e7828348510246d1bb67c727f6aea926d3db7a;
+    # 1.5.9 may migrate the on-disk schema, so never point 1.2.4 at 1.5.9 data).
     #
     # The model (all-MiniLM-L6-v2) is statically baked into the 487MB chroma
     # binary inside this image — no HuggingFace download at runtime. Empirical
@@ -16,7 +21,7 @@ services:
     # Do NOT downgrade to 0.6.x — different SQLite schema, can't read 1.x data
     # (verified 2026-04-17 during migration: 0 collections visible after downgrade).
     # When upgrading to a newer 1.x point release, test on a volume COPY first.
-    image: chromadb/chroma:1.2.4@sha256:70c20dbcb64edbfad111a87149e7828348510246d1bb67c727f6aea926d3db7a
+    image: chromadb/chroma:1.5.9@sha256:1e0b73a187a28757c572acba508c46f48c9e8b0acaf5c20e6d95cdedce1acdf6
     container_name: mcp-chromadb
     # Chroma 1.x persists to /data by default. The previous mount at
     # /chroma/chroma was silently ignored, causing the Apr 2026 data loss
@@ -66,6 +71,13 @@ services:
       - "--keyFile"
       - "/etc/mongo/keyfile"
       - "--bind_ip_all"
+    # WiredTiger keeps a file handle per collection + index. The Docker default
+    # (1024) was exhausted on 2026-10-13 and mongod fassert-looped on startup
+    # ("Too many open files"). 64000 is MongoDB's documented recommendation.
+    ulimits:
+      nofile:
+        soft: 64000
+        hard: 64000
     volumes:
       - mongo-data:/data/db
       - ./secrets/mongo-keyfile:/etc/mongo/keyfile:ro
@@ -118,17 +130,42 @@ services:
       # the edge (401 before the request reaches this server) AND claude.ai
       # connectors cannot send a Bearer key — true would hard-block every
       # cloud connector (tom-assistant/advisor/research/DeeAnn). Flip to true
-      # ONLY if the CF Access app on mcp.lemmons.net is ever removed.
+      # ONLY if the CF Access app on the public tunnel hostname is ever removed.
       - JUNTO_TUNNEL_REQUIRES_KEY=${JUNTO_TUNNEL_REQUIRES_KEY:-false}
+      # Write-time contradiction gate, classifier stage (claim_gate.py,
+      # interface:claim-extraction-v0). Advisory + fail-quiet: with the
+      # endpoint down, memory_record_learning degrades to threshold-only
+      # pointers. Default OFF; flip in .env when the host Ollama endpoint
+      # is reachable from the container (extra_hosts below provides
+      # host.docker.internal on Linux).
+      - JUNTO_CLAIM_GATE_ENABLED=${JUNTO_CLAIM_GATE_ENABLED:-false}
+      - JUNTO_CLAIM_GATE_URL=${JUNTO_CLAIM_GATE_URL:-http://host.docker.internal:11434/v1}
+      - JUNTO_CLAIM_GATE_MODEL=${JUNTO_CLAIM_GATE_MODEL:-phi4:14b}
+      - JUNTO_CLAIM_GATE_EXTRACT_MODEL=${JUNTO_CLAIM_GATE_EXTRACT_MODEL:-}
+      - JUNTO_CLAIM_GATE_EXTRACT_REASONING=${JUNTO_CLAIM_GATE_EXTRACT_REASONING:-}
+      - JUNTO_LOG_QUERY_TEXT=${JUNTO_LOG_QUERY_TEXT:-true}
+      # Pending-agent GC (identity_gc.py, design:identity-lifecycle-v0
+      # Mechanism B). Reaps PENDING-tier roster ghosts idle past the grace
+      # window (never named/admin; blocked by live sessions and open inbound
+      # obligations). Default OFF — enable only after the roster's legitimate
+      # long-livers are promoted to named (done on sage 2026-07-12).
+      - JUNTO_PENDING_REAP_ENABLED=${JUNTO_PENDING_REAP_ENABLED:-false}
+      - JUNTO_PENDING_REAP_GRACE_HOURS=${JUNTO_PENDING_REAP_GRACE_HOURS:-48}
+    extra_hosts:
+      # Lets the container reach host services (Ollama :11434) on Linux,
+      # where host.docker.internal is not automatic.
+      - "host.docker.internal:host-gateway"
     ports:
-      # Bind to loopback + the home LAN IP only — NOT 0.0.0.0 (design:auth-
-      # origin-trust-v0). cloudflared connects locally (127.0.0.1) so the public
-      # tunnel still works; LAN agents reach the LAN IP and stay keyless. This
-      # removes the tailnet (100.89.194.85) and OVH-wg (10.100.0.4) exposure.
-      # Adopters: override JUNTO_MCP_LAN_IP, or drop the second mapping for a
-      # loopback-only (tunnel-only) deployment.
+      # Bind to loopback + one LAN/tailnet IP only — NOT 0.0.0.0 (design:auth-
+      # origin-trust-v0). A local tunnel client (cloudflared) connects via
+      # 127.0.0.1, so a public tunnel still works; agents on that network reach
+      # the IP below. Nothing listens on other interfaces (VPNs, other tailnets).
+      # JUNTO_MCP_LAN_IP is REQUIRED (no default): set it in .env to this host's
+      # LAN or Tailscale IP. Compose refuses to start without it rather than
+      # trying to bind someone else's address. For a loopback-only (tunnel-only)
+      # deployment, drop the second mapping.
       - "127.0.0.1:8080:8080"
-      - "${JUNTO_MCP_LAN_IP:-192.168.15.240}:8080:8080"
+      - "${JUNTO_MCP_LAN_IP:?set JUNTO_MCP_LAN_IP in .env to this host's LAN or Tailscale IP}:8080:8080"
     ulimits:
       nofile:
         soft: 65536

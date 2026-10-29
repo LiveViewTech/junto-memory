@@ -1,0 +1,9 @@
+[Unit]
+Description=junto context-report — push each running agent's context fill to junto agent_status
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 %h/.claude/junto-context-report.py
+# A hung oneshot stays "activating" and its OnUnitActiveSec timer never fires
+# again (madrox, 10-13 → 10-24). The script also self-kills at 40s.
+TimeoutStartSec=45

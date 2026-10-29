@@ -7,10 +7,10 @@ registering every tool with the FastMCP server instance.
 
 from shared_memory.tools import (  # noqa: F401
     admin,
-    autopilot,
     backlog,
     checklists,
     database,
+    delegation,
     diagnostics,
     directives,
     functions,

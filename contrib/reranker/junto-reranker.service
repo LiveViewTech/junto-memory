@@ -1,0 +1,14 @@
+# systemd USER unit: cross-encoder rerank service for memory_query (interface:rerank-v0).
+#   cp contrib/reranker/junto-reranker.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable --now junto-reranker
+# Binds docker0 (172.17.0.1) — needs docker up; Restart covers the boot race.
+[Unit]
+Description=junto reranker (bge-reranker-v2-m3, GPU)
+
+[Service]
+ExecStart=/usr/bin/python3 %h/sharedUtils/junto/junto-memory/contrib/reranker/rerank_server.py --host 172.17.0.1 --port 8091
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target

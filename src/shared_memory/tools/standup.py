@@ -94,10 +94,15 @@ async def memory_standup(
     if db is None:
         return json.dumps({"error": "MongoDB unavailable"})
 
-    # Roster: registered agents (name -> doc)
+    # Roster: registered agents (name -> doc). Retired identities are
+    # terminal (identity-lifecycle Mechanism C) — excluded from the standup
+    # entirely; their archived state specs are already filtered by the
+    # status=="active" check below.
     roster = {}
     try:
-        for a in db.registered_agents.find({"project": project}):
+        for a in db.registered_agents.find(
+            {"project": project, "tier": {"$ne": "retired"}}
+        ):
             roster[a.get("name")] = a
     except Exception:
         pass
@@ -215,6 +220,32 @@ async def memory_standup(
             "purpose": reg.get("purpose"),
         })
 
+    # Sunset watch (identity-lifecycle Mechanism C): temp agents whose sunset
+    # date is past or within 14 days — surfaced so retirement is a standup
+    # line, not memory-of-a-human. Decommission stays deliberate (operator
+    # runs memory_project action="decommission"); this only reminds.
+    sunset_watch = []
+    for a in roster.values():
+        s = a.get("sunset")
+        if not s:
+            continue
+        st = parse_timestamp(s) if isinstance(s, str) else s
+        if st is None:
+            continue
+        if st.tzinfo is None:
+            from datetime import timezone as _tz
+            st = st.replace(tzinfo=_tz.utc)
+        days_left = (st - now).total_seconds() / 86400
+        if days_left <= 14:
+            sunset_watch.append({
+                "agent": a.get("name"),
+                "sunset": str(s),
+                "days_left": round(days_left, 1),
+                "overdue": days_left < 0,
+                "purpose": a.get("purpose"),
+            })
+    sunset_watch.sort(key=lambda w: w["days_left"])
+
     project_doc = None
     try:
         project_doc = db.projects.find_one({"name": project})
@@ -233,7 +264,9 @@ async def memory_standup(
             "blocked": len(blocked),
             "stale_specs": len(stale),
             "open_tom_decisions": len(tom_queue),
+            "sunset_watch": len(sunset_watch),
         },
+        "sunset_watch": sunset_watch,
         "tom_decision_queue": tom_queue,
         "blocked_agents": blocked,
         "stale_specs": stale,

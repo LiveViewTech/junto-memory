@@ -307,7 +307,10 @@ async def cleanup():
     import os
     from urllib.parse import quote_plus
     from pymongo import MongoClient
-    pw = quote_plus(os.environ.get("MONGO_PASSWORD", "McpOrch2026!"))
+    pw = os.environ.get("MONGO_PASSWORD")
+    if not pw:
+        raise SystemExit("MONGO_PASSWORD is not set (export it from your .env)")
+    pw = quote_plus(pw)
     db = MongoClient(
         f"mongodb://mcp_orch:{pw}@localhost:27019/mcp_orchestrator?authSource=admin"
     )["mcp_orchestrator"]

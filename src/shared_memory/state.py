@@ -7,7 +7,8 @@ persistence -- they are rebuilt each time the server starts.
 
 from typing import Any, Dict
 
-# Active sessions stored in memory (lightweight, no persistence needed)
+# Active sessions stored in memory; mirrored to Mongo and restored at start
+# by session_persist.py so session ids survive a restart.
 active_sessions: Dict[str, Dict[str, Any]] = {}
 
 # File locks stored in memory (auto-released on session end)

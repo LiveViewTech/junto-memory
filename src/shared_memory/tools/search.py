@@ -1,11 +1,12 @@
 """Search and discovery tools - cross-project search, list projects."""
 
 import json
-from typing import List
+from typing import List, Optional
 
 from mcp.server.fastmcp import Context
 
 from shared_memory.app import mcp
+from shared_memory.auth import collection_allowed
 from shared_memory.clients import get_chroma
 from shared_memory.config import PROJECT_PREFIX, SHARED_PREFIX
 from shared_memory.helpers import format_age, format_staleness_warning, parse_timestamp, require_session
@@ -48,8 +49,10 @@ async def memory_search_global(
 
     # Search all project collections
     collections = await chroma.list_collections()
+    _me = active_sessions.get(session_id)
     for col in collections:
-        if col.name.startswith(PROJECT_PREFIX) or col.name.startswith(SHARED_PREFIX):
+        if ((col.name.startswith(PROJECT_PREFIX) or col.name.startswith(SHARED_PREFIX))
+                and collection_allowed(_me, col.name)):  # tenant isolation R5
             try:
                 results = await col.query(
                     query_texts=[query],
@@ -101,6 +104,25 @@ async def memory_search_global(
     }, indent=2)
 
 
+def _caller_scope() -> Optional[dict]:
+    """A session_info-shaped scope for a session-less call, from the Bearer key.
+
+    None = unrestricted (auth off, or an unscoped/keyless caller on a server
+    that allows keyless). A key with a project list scopes to it. Under
+    JUNTO_REQUIRE_KEY a missing/invalid key gets a scope no project matches.
+    """
+    from shared_memory import auth
+    if not auth.AUTH_ENABLED:
+        return None
+    key = auth.get_header_api_key()
+    info = auth.validate_api_key(key) if key else None
+    if info:
+        return {"allowed_projects": info.get("projects") or []}
+    if auth.REQUIRE_KEY:
+        return {"allowed_projects": ["\x00no-project"]}
+    return None
+
+
 @mcp.tool()
 async def memory_list_projects(ctx: Context = None) -> str:
     """
@@ -113,8 +135,14 @@ async def memory_list_projects(ctx: Context = None) -> str:
 
     projects = []
     shared = []
+    # Session-less, so scope comes from the request's Bearer key (tenant
+    # isolation R5): a scoped key sees its own projects; under
+    # JUNTO_REQUIRE_KEY a keyless or invalid caller sees shared only.
+    caller = _caller_scope()
 
     for col in collections:
+        if col.name.startswith(PROJECT_PREFIX) and not collection_allowed(caller, col.name):
+            continue
         if col.name.startswith(PROJECT_PREFIX):
             project_name = col.name[len(PROJECT_PREFIX):]
             try:

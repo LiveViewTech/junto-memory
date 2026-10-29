@@ -15,8 +15,9 @@ from shared_memory import op_log
 
 
 def test_op_types_is_closed_catalog():
-    """The catalog matches design v0.3.0 §4.1 exactly (26 entries)."""
-    assert len(op_log.OP_TYPES) == 26
+    """The catalog matches design v0.3.0 §4.1 minus the 3 autopilot.* entries
+    removed in design:autopilot-removal-v0 Phase 2 (23 entries)."""
+    assert len(op_log.OP_TYPES) == 23
     # Sanity-check a few representative entries from each category.
     for required in (
         "session.started",
@@ -29,8 +30,6 @@ def test_op_types_is_closed_catalog():
         "backlog.added",
         "lock.acquired",
         "lock.expired",
-        "autopilot.config_changed",
-        "autopilot.auto_disabled",
         "agent.heartbeat",
         "audit.event",
         "rename.applied",

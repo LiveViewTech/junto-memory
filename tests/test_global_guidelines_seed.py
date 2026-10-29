@@ -129,3 +129,37 @@ def test_real_seed_data_is_wellformed():
     for g in gg.GLOBAL_GUIDELINES:
         assert g["rule"].strip(), f"empty rule for {g['name']}"
         assert 1 <= g["priority"] <= 100, f"bad priority for {g['name']}"
+
+
+def test_shipped_guidelines_are_universal_not_fleet_specific():
+    """Tom's directive (2026-09-09): the CODE-shipped global guidelines go to every
+    adopter/peer server, so they must be UNIVERSAL process — no home-fleet or
+    deployment-specific identifiers. This guards against a team-specific rule
+    silently drifting back into the shipped constant. Fleet-specific policy belongs
+    in a per-fleet approval contract / project-scoped guideline, not here."""
+    import re
+    # unambiguous home-fleet / deployment identifiers (word-boundaried where a
+    # substring would false-fire, e.g. 'sage' inside 'messages')
+    forbidden = [
+        r"\bTom\b", r"\bStripe\b", r"revert\.sh", r"approval-contract",
+        r"\bnimbus\b", r"\bsage\b", r"\bcerebro\b", r"\bclaudecontrol\b",
+        r"\bemailtriage\b", r"\bspg-junto\b",
+    ]
+    for g in gg.GLOBAL_GUIDELINES:
+        for pat in forbidden:
+            m = re.search(pat, g["rule"], re.IGNORECASE)
+            assert m is None, (
+                f"shipped global guideline {g['name']!r} contains fleet-specific "
+                f"marker {pat!r} ({m.group(0)!r}) — keep it universal or move the "
+                f"specifics to a per-fleet approval contract / project guideline"
+            )
+
+
+def test_execute_dont_ask_is_generic():
+    """trim_03 ships GENERIC and defers to a per-fleet approval contract; our
+    home-specific version is kept private, not shipped (Tom, 2026-09-09)."""
+    t03 = next((g for g in gg.GLOBAL_GUIDELINES
+                if g["name"] == "trim_03_execute_dont_ask"), None)
+    assert t03 is not None, "execute-dont-ask rule missing"
+    assert "APPROVAL CONTRACT" in t03["rule"], "must defer to a per-fleet approval contract"
+    assert "RECOVERABILITY" in t03["rule"], "must keep the recoverability principle"
