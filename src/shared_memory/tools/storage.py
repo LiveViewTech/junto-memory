@@ -29,6 +29,9 @@ from shared_memory.intent import get_current_context_tokens
 from shared_memory.op_log import emit_op_log_from_context, fetch_embedding_for_op_log
 from shared_memory.state import active_sessions
 
+# Tag the transcript extractor puts on every learning it writes.
+TRANSCRIPT_EXTRACT_TAG = "transcript-extract"
+
 logger = logging.getLogger(__name__)
 
 
@@ -103,6 +106,11 @@ async def memory_store(
     # and re-route swallowed params before content is used for dedup/doc_id/op-log.
     from shared_memory.write_lint import recover_envelope_leak
     content, project, _lint_notes = recover_envelope_leak(content, "content", project)
+    # Secret redaction (Memento #3, interface:secret-redaction-v0) runs before
+    # dedup/doc_id/op-log so no copy of the credential is derived anywhere.
+    from shared_memory.redact import redact_fields
+    (title, content), _redacted = redact_fields(
+        title, content, tool="memory_store", session_id=session_id, fields=["title", "content"])
 
     tags = tags or []
     files_related = files_related or []
@@ -251,6 +259,9 @@ async def memory_store(
     result = {"status": "stored_with_recovery" if _lint_notes else "stored", "id": doc_id}
     if _lint_notes:
         result["write_lint"] = _lint_notes
+    if _redacted:
+        from shared_memory.redact import redaction_notice
+        result.update(redaction_notice(_redacted))
         result["action_required"] = (
             "Your tool-call emission is malformed — it serialized the call's own "
             "XML envelope into `content`. The server repaired this write, but it "
@@ -380,6 +391,25 @@ async def memory_record_learning(
         pass
 
     tags = tags or []
+
+    # Transcript-extraction off switch (query_config `transcript_extract`,
+    # default OFF). Checked before any write work so a disabled server stores
+    # nothing from the extractor.
+    if TRANSCRIPT_EXTRACT_TAG in tags:
+        from shared_memory.query_config import get_effective_config
+        try:
+            _te_on = bool(get_effective_config(get_mongo(), project).get("transcript_extract"))
+        except Exception:
+            _te_on = False
+        if not _te_on:
+            return json.dumps({
+                "error": "transcript extraction is disabled on this server"
+                         + (f" for project '{normalize_project(project)}'" if project else ""),
+                "code": "transcript_extract_disabled",
+                "hint": "An operator enables it with memory_admin(action='query_set_config', "
+                        "key='transcript_extract', value=true[, project=...]).",
+            })
+
     chroma = await get_chroma()
     session_info = active_sessions[session_id]
     now = utc_now_iso()
@@ -394,6 +424,9 @@ async def memory_record_learning(
     # flagged in the response. The helper never raises.
     from shared_memory.write_lint import recover_envelope_leak
     details, project, _lint_notes = recover_envelope_leak(details, "details", project)
+    from shared_memory.redact import redact_fields
+    (title, details), _redacted = redact_fields(
+        title, details, tool="memory_record_learning", session_id=session_id, fields=["title", "details"])
 
     if project:
         project = normalize_project(project)
@@ -486,6 +519,9 @@ async def memory_record_learning(
         "status": "recorded_with_recovery" if _lint_notes else "recorded",
         "id": doc_id,
     }
+    if _redacted:
+        from shared_memory.redact import redaction_notice
+        result.update(redaction_notice(_redacted))
     if _lint_notes:
         result["write_lint"] = _lint_notes
         result["action_required"] = (

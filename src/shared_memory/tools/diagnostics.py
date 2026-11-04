@@ -40,6 +40,10 @@ async def memory_health(
     - server_time: current UTC timestamp (useful for clock-skew detection)
     - uptime_seconds: seconds since server process started
     - storage: when include_storage=True, mongo ping result
+    - features: server-default feature switches a client may need before
+      doing costly work. Today: {"transcript_extract": bool} (query_config
+      `transcript_extract`; a per-project override can still turn one
+      project off or on, enforced at write time).
 
     Args:
         include_storage: When True (default), pings Mongo for storage
@@ -52,6 +56,13 @@ async def memory_health(
         "server_time": datetime.now(timezone.utc).isoformat(),
         "uptime_seconds": round(time.time() - _SERVER_START_TS, 1),
     }
+
+    try:
+        from shared_memory.query_config import get_effective_config
+        _cfg = get_effective_config(get_mongo(), None)
+        result["features"] = {"transcript_extract": bool(_cfg.get("transcript_extract"))}
+    except Exception:
+        result["features"] = {"transcript_extract": False}
 
     if include_storage:
         try:

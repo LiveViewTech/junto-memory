@@ -18,6 +18,7 @@ from shared_memory.tools import (  # noqa: F401
     lifecycle,
     locking,
     messaging,
+    notify,
     projects,
     push_control_api,
     query,

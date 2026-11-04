@@ -115,3 +115,47 @@ def test_flag_on_service_down_gives_todays_results(mq):
     out = _run(q.memory_query("s", "x", project="x", limit=3))
     assert _ids(out) == ["p0", "p1", "p2"]
     assert mq["bumped"] == ["p0", "p1", "p2"]
+
+
+def test_all_below_rerank_min_says_so_not_new_territory(mq):
+    # learning_d3e133172b928694: terse queries score ~0 on every candidate.
+    mq["cfg"]["rerank"] = True
+
+    async def all_low(query, texts):
+        return [0.01] * len(texts)
+    mq["mp"].setattr(rr, "score", all_low)
+    d = json.loads(_run(q.memory_query("s", "x", project="x", limit=3)))
+    assert d["results"] == [] and d["rerank_dropped"] == 10
+    assert "does NOT mean nothing exists" in d["message"]
+    assert "scan_errors" not in d
+
+
+def test_true_miss_keeps_the_old_message(mq):
+    mq["proj"].rows = []
+    d = json.loads(_run(q.memory_query("s", "x", project="x", limit=3)))
+    assert d["results"] == [] and "rerank_dropped" not in d and "scan_errors" not in d
+    assert d["message"].startswith("No matching memories found.")
+
+
+def test_scan_failure_is_reported_not_swallowed(mq):
+    async def boom(*a, **k):
+        raise RuntimeError("chroma down")
+    mq["proj"].query = boom
+    d = json.loads(_run(q.memory_query("s", "x", project="x", limit=3)))
+    assert d["results"] == [] and d["scan_errors"] == ["project:x: RuntimeError: chroma down"]
+    assert "not a miss" in d["message"]
+
+
+def test_scan_failure_on_one_collection_rides_a_non_empty_result(mq):
+    async def boom(*a, **k):
+        raise RuntimeError("shared down")
+
+    async def _ret(v):
+        return v
+    bad = FakeCol("shared_patterns", [])
+    bad.query = boom
+    mq["mp"].setattr(q, "get_shared_collection", lambda c, n: _ret(bad))
+    d = json.loads(_run(q.memory_query("s", "x", project="x", limit=3)))
+    assert [r["id"] for r in d["results"]] == ["p0", "p1", "p2"]
+    assert d["scan_errors"] == ["shared:patterns: RuntimeError: shared down",
+                                "shared:context: RuntimeError: shared down"]

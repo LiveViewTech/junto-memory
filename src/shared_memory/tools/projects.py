@@ -118,8 +118,12 @@ def persist_agent_aliases(db, project_name: str, agent_name: str,
         seen.add(alias)
         if alias == agent_name:
             continue  # no self-alias needed
+        # Retired rows don't count: resolve_agent_name skips them, and
+        # "retire X, then alias X to Y" is how a stray identity gets folded
+        # into its real one (backlog_a008fd6947c9).
         if db.registered_agents.find_one(
-            {"project": project_name, "name": alias}, {"_id": 1}
+            {"project": project_name, "name": alias,
+             "tier": {"$ne": "retired"}}, {"_id": 1}
         ):
             rejected[alias] = f"collides with live agent '{alias}'"
             continue
@@ -150,7 +154,7 @@ async def memory_project(
     display_name: str = None,
     agent: str = None,
     role_description: str = None,
-    tier: str = "named",
+    tier: str = None,
     path_patterns: List[str] = None,
     owner: str = None,
     sunset: str = None,
@@ -226,7 +230,8 @@ async def memory_project(
         display_name: Human-readable project name (for create)
         agent: Agent name (for add_agent, remove_agent, update_agent)
         role_description: What this agent does (for add_agent, update_agent)
-        tier: Agent tier - "admin" or "named" (default: named). Workers self-register.
+        tier: Agent tier - "admin" or "named". add_agent defaults to named;
+            update_agent leaves the tier unchanged when omitted. Workers self-register.
         path_patterns: Working directory patterns for auto-identity (e.g., ["*/picFrameWeb*"])
         owner: Project owner agent (for create / set_owner) — the discoverable
             contact for cross-project access, permission, and governance needs.
@@ -417,7 +422,9 @@ async def memory_project(
         if not _caller_is_admin(project_name):
             return json.dumps({"error": f"Permission denied. Only project admins can add agents. You are '{caller}'. Admins: {project.get('admins', [])}"})
 
-        # Validate tier
+        # Validate tier. The signature default is None so update_agent can
+        # tell "not passed" from "named"; add_agent still defaults to named.
+        tier = tier or "named"
         if tier not in ["admin", "named"]:
             return json.dumps({"error": f"Invalid tier '{tier}'. Must be 'admin' or 'named'. Workers self-register."})
 
@@ -519,7 +526,11 @@ async def memory_project(
         update_fields = {"updated_at": now}
         if role_description is not None:
             update_fields["role_description"] = role_description
-        if tier is not None and tier in ["admin", "named"]:
+        # Only touch tier when the caller passed one. A defaulted "named" here
+        # used to demote admins on every role/purpose edit (backlog_a008fd6947c9).
+        if tier is not None:
+            if tier not in ["admin", "named"]:
+                return json.dumps({"error": f"Invalid tier '{tier}'. Must be 'admin' or 'named'."})
             update_fields["tier"] = tier
         if path_patterns is not None:
             update_fields["path_patterns"] = path_patterns

@@ -24,6 +24,8 @@ class _FakeCollection:
 
     async def add(self, ids, documents, metadatas):
         self.added_ids.extend(ids)
+        self.added_docs = getattr(self, "added_docs", []) + list(documents)
+        self.added_metas = getattr(self, "added_metas", []) + list(metadatas)
 
 
 def _install_session(session_id="sess_test", project="test", role="agent"):
@@ -110,3 +112,44 @@ async def test_memory_store_returns_full_doc_id(_patch_storage_collection):
     # doc_id shape for non-interface memory: prefix + 16 hex. Prefix varies by
     # memory_type but is always >= 5 chars; full id always > 12 chars.
     assert len(response["id"]) > 12
+
+
+async def test_record_learning_redacts_secrets_before_persist(_patch_storage_collection):
+    """Memento #3: the credential never reaches Chroma, and the writer is told."""
+    _install_session()
+    raw = await storage.memory_record_learning(
+        session_id="sess_test",
+        title="dev mongo creds",
+        details="MONGO_URI='mongodb://admin:T0mPass1@localhost:27017' for the dev box",
+        project="test",
+    )
+    response = json.loads(raw)
+    stored = " ".join(_patch_storage_collection.added_docs)
+    assert "T0mPass1" not in stored
+    assert "[REDACTED:url_password]" in stored
+    assert response["redacted"] == {"url_password": 1}
+    assert "redacted_warning" in response
+
+
+async def test_store_redacts_title_and_content(_patch_storage_collection):
+    _install_session()
+    raw = await storage.memory_store(
+        session_id="sess_test",
+        title="key AKIAIOSFODNN7EXAMPLE",
+        content="HA_TOKEN=eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N",
+        memory_type="pattern",
+        project="test",
+    )
+    response = json.loads(raw)
+    assert "AKIA" not in _patch_storage_collection.added_metas[0]["title"]
+    assert "eyJhbGci" not in _patch_storage_collection.added_docs[0]
+    assert response["redacted"] == {"aws_access_key": 1, "jwt": 1}
+
+
+async def test_clean_write_has_no_redaction_keys(_patch_storage_collection):
+    _install_session()
+    raw = await storage.memory_record_learning(
+        session_id="sess_test", title="plain", details="nothing secret here",
+        project="test",
+    )
+    assert "redacted" not in json.loads(raw)

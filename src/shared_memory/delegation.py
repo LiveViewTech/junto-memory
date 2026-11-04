@@ -269,8 +269,13 @@ def validate_task_fields(fields: Dict[str, Any], scope: Dict[str, Any]) -> List[
         if action == "notify":
             to = r.get("to") or ""
             p, a = _split_ident(to)
-            if not p or not a:
-                errors.append(f"routes[{i}].to: required for notify, as 'project/agent'")
+            if to.startswith("human:"):
+                if len(to) <= 6:
+                    errors.append(f"routes[{i}].to: 'human:<name>' needs a name")
+                if r.get("urgency", "normal") not in ("normal", "urgent"):
+                    errors.append(f"routes[{i}].urgency: normal or urgent")
+            elif not p or not a:
+                errors.append(f"routes[{i}].to: required for notify, as 'project/agent' or 'human:<name>'")
             if r.get("category", "info") not in ("info", "task"):
                 errors.append(f"routes[{i}].category: info or task")
             for ph in _PLACEHOLDER_RE.findall(r.get("template") or ""):
@@ -308,6 +313,10 @@ def validate_task_fields(fields: Dict[str, Any], scope: Dict[str, Any]) -> List[
                 errors.append("schedule.quiet_hours: like '01:00-05:00'")
             if schedule.get("digest_at") and not _HHMM_RE.match(schedule["digest_at"]):
                 errors.append("schedule.digest_at: like '07:00'")
+            dt = schedule.get("digest_to")
+            if dt and not (isinstance(dt, str) and (dt.startswith("human:") and len(dt) > 6
+                                                    or all(_split_ident(dt)))):
+                errors.append("schedule.digest_to: 'human:<name>' or 'project/agent'")
             if schedule.get("canary_every", "daily") not in ("daily", "run"):
                 errors.append("schedule.canary_every: daily or run")
 
@@ -1191,6 +1200,7 @@ def complete_run(db, key_doc: Dict[str, Any], body: Dict[str, Any]) -> Tuple[Dic
                 "to": [route["to"]], "category": route.get("category", "info"),
                 "subject": f"[{task['name']}] " + str(meta.get("subject") or out.get("classification") or "item")[:120],
                 "body": render_notice(route, task, scope, out, meta), "kind": "delegated_result",
+                "owner": task.get("owner"), "urgency": route.get("urgency", "normal"),
             })
 
     canary = _check_canaries(task, canary_items) if run.get("canary_due") else {"ran": False}
@@ -1306,7 +1316,10 @@ def digest_due(db, now: Optional[datetime] = None) -> List[Dict[str, Any]]:
                 f"Items examined: {examined}. Routes: {json.dumps(counts)}. Canaries: {canary_txt}.\n"
                 f"Cursor: {cursors[0] if cursors else '-'} → {cursors[-1] if cursors else '-'}.\n"
                 + (("Items routed to digest:\n" + "\n".join(digest_lines)) if digest_lines else "No digest items."))
-        notices.append({"to": [task["owner"]], "category": "info", "kind": "delegated_digest",
+        digest_targets = [task["owner"]]
+        if (task.get("schedule") or {}).get("digest_to"):
+            digest_targets.append(task["schedule"]["digest_to"])
+        notices.append({"to": digest_targets, "owner": task.get("owner"), "category": "info", "kind": "delegated_digest",
                         "subject": f"Digest: {task['name']} ({examined} items, {len(failed)} failed runs)",
                         "body": body[:8000]})
         sched = task.get("schedule") or {}
@@ -1317,12 +1330,27 @@ def digest_due(db, now: Optional[datetime] = None) -> List[Dict[str, Any]]:
 
 async def send_notices(db, notices: List[Dict[str, Any]]) -> int:
     """Persist + push each notice as a system message to every target."""
+    from shared_memory import notify as human_notify
     from shared_memory.config import ACTION_CATEGORIES
     from shared_memory.tools.messaging import _build_announce_packet, _notify_inbox_for_send
 
     sent = 0
     for n in notices:
         for target in n.get("to") or []:
+            if isinstance(target, str) and target.startswith("human:"):
+                owner_p, owner_a = _split_ident(n.get("owner") or "")
+                res = human_notify.enqueue(
+                    db, target, n.get("subject") or "(no subject)", n.get("body") or "",
+                    {"agent": owner_a or "delegation", "project": owner_p or "junto", "kind": n.get("kind")},
+                    urgency=n.get("urgency", "normal"))
+                if res.get("status") in ("queued", "duplicate"):
+                    sent += 1
+                elif n.get("owner"):
+                    # Tell the task owner instead of dropping it silently.
+                    notices.append({"to": [n["owner"]], "category": "info", "kind": "delegated_failure",
+                                    "subject": f"Could not notify {target}: {str(res.get('error'))[:100]}",
+                                    "body": f"Notice '{n.get('subject')}' for {target} was not queued: {res}"})
+                continue
             project, agent = _split_ident(target)
             if not project or not agent:
                 continue

@@ -137,47 +137,11 @@ async def memory_update_work(
 # Lifecycle Management Tools
 # =============================================================================
 
-@mcp.tool()
-async def memory_change_status(
-    session_id: str,
-    doc_id: str,
-    new_status: str,
-    project: str = None,
-    superseded_by: str = None,
-    reason: str = None,
-    ctx: Context = None
-) -> str:
-    """
-    Change a document's lifecycle status.
-
-    Use this to:
-    - Mark outdated docs as DEPRECATED (still searchable with warning)
-    - Mark replaced docs as SUPERSEDED (link to replacement)
-    - Archive old docs (excluded from normal search)
-
-    Prefer this over deletion - it preserves history and context.
-
-    Args:
-        session_id: Your session ID
-        doc_id: Document ID to update
-        new_status: New status (active, deprecated, superseded, archived)
-        project: Project (if project-specific doc)
-        superseded_by: ID of replacement document (if superseding)
-        reason: Reason for status change
-    """
-    error = require_session(session_id)
-    if error:
-        return error
-
-    if new_status not in DOC_STATUSES:
-        return json.dumps({"error": f"Invalid new_status. Must be one of: {DOC_STATUSES}"}, indent=2)
-
-    chroma = await get_chroma()
-    now = utc_now_iso()
-
-    if project:
-        project = normalize_project(project)
-
+async def _locate_doc(chroma, session_id, doc_id, project):
+    """Find doc_id for a write tool: the given project, else the session's
+    project then shared, with locate-on-miss. Returns (collection, result,
+    None) on a hit or (None, None, error_json). Shared by change_status and
+    memory_verify so both resolve scope identically."""
     # Find the document. Scope resolution (learning_c5ea0608b8fe4c46,
     # coordinator blocker msg_065a525bff50): when project is omitted, default
     # to the SESSION's project first, then shared. The old shared-only
@@ -232,7 +196,7 @@ async def memory_change_status(
             pass
         if _found_in:
             _proj = _found_in["project"]
-            return json.dumps({
+            return None, None, json.dumps({
                 "error": f"Document not found in the scope you searched: {doc_id}",
                 "searched": searched,
                 "found_in": _found_in,
@@ -245,7 +209,7 @@ async def memory_change_status(
                       "malformed tool-call emission swallowed it)."
                 ),
             }, indent=2)
-        return json.dumps({
+        return None, None, json.dumps({
             "error": f"Document not found: {doc_id}",
             "searched": searched,
             "hint": ("Check the project parameter — an omitted or wrong "
@@ -254,6 +218,54 @@ async def memory_change_status(
                      "scoped to the project they were recorded in), or use "
                      "memory_query() to locate the doc first."),
         }, indent=2)
+
+    return collection, result, None
+
+
+@mcp.tool()
+async def memory_change_status(
+    session_id: str,
+    doc_id: str,
+    new_status: str,
+    project: str = None,
+    superseded_by: str = None,
+    reason: str = None,
+    ctx: Context = None
+) -> str:
+    """
+    Change a document's lifecycle status.
+
+    Use this to:
+    - Mark outdated docs as DEPRECATED (still searchable with warning)
+    - Mark replaced docs as SUPERSEDED (link to replacement)
+    - Archive old docs (excluded from normal search)
+
+    Prefer this over deletion - it preserves history and context.
+
+    Args:
+        session_id: Your session ID
+        doc_id: Document ID to update
+        new_status: New status (active, deprecated, superseded, archived)
+        project: Project (if project-specific doc)
+        superseded_by: ID of replacement document (if superseding)
+        reason: Reason for status change
+    """
+    error = require_session(session_id)
+    if error:
+        return error
+
+    if new_status not in DOC_STATUSES:
+        return json.dumps({"error": f"Invalid new_status. Must be one of: {DOC_STATUSES}"}, indent=2)
+
+    chroma = await get_chroma()
+    now = utc_now_iso()
+
+    if project:
+        project = normalize_project(project)
+
+    collection, result, _err = await _locate_doc(chroma, session_id, doc_id, project)
+    if _err:
+        return _err
 
     # Update metadata
     meta = result["metadatas"][0]
@@ -306,6 +318,105 @@ async def memory_change_status(
         "message": f"Document marked as {new_status}. " +
                    ("It will show warnings when retrieved." if new_status != "archived"
                     else "It is now excluded from normal searches.")
+    }, indent=2)
+
+
+VERIFICATION_STATES = ("verified", "rejected", "unreviewed")
+_VERIFIER_ROLES = ("user", "admin", "owner")
+
+
+@mcp.tool()
+async def memory_verify(
+    session_id: str,
+    doc_id: str,
+    verdict: str,
+    reason: str = None,
+    project: str = None,
+    ctx: Context = None
+) -> str:
+    """
+    Mark whether a memory doc has been checked and found true (Memento #1,
+    interface:verification-state-v0).
+
+    Separate from lifecycle status: status says whether a doc is CURRENT,
+    verification says whether anyone CHECKED it. Every doc starts unreviewed.
+    Verified docs lead their relevance band in memory_query and get a small
+    boost in /recall; rejected docs drop out of search and recall.
+
+    Who may call: human (user), admin and owner sessions, and the librarian.
+    Nobody but a human can verify or reject a doc they authored themselves.
+
+    Args:
+        session_id: Your session ID
+        doc_id: Document ID
+        verdict: verified | rejected | unreviewed (unreviewed resets)
+        reason: Why. Required for rejected.
+        project: Project of the doc (omit = your session's project, then shared)
+    """
+    error = require_session(session_id)
+    if error:
+        return error
+    if verdict not in VERIFICATION_STATES:
+        return json.dumps({"error": f"Invalid verdict. Must be one of: {list(VERIFICATION_STATES)}"})
+    if verdict == "rejected" and not (reason or "").strip():
+        return json.dumps({"error": "reason is required to reject a doc"})
+
+    sess = active_sessions[session_id]
+    caller = sess.get("claude_instance")
+    role = sess.get("role") or "agent"
+    if role not in _VERIFIER_ROLES and caller != "librarian":
+        return json.dumps({"error": (
+            f"Permission denied: verification needs a user/admin/owner session or "
+            f"the librarian (you are '{caller}', role '{role}')."
+        )})
+
+    chroma = await get_chroma()
+    if project:
+        project = normalize_project(project)
+    collection, result, _err = await _locate_doc(chroma, session_id, doc_id, project)
+    if _err:
+        return _err
+
+    meta = result["metadatas"][0]
+    if meta.get("claude_instance") == caller and role != "user":
+        return json.dumps({"error": (
+            "You authored this doc. Verification has to come from someone else "
+            "(a human, an admin, or the librarian)."
+        )})
+
+    from shared_memory.redact import redact_fields
+    (reason,), _ = redact_fields(reason, tool="memory_verify", session_id=session_id, fields=["reason"])
+    now = utc_now_iso()
+    old = meta.get("verification") or "unreviewed"
+    meta["verification"] = verdict
+    meta["verified_by"] = caller
+    meta["verified_at"] = now
+    if reason:
+        meta["verification_reason"] = reason
+    await collection.update(ids=[doc_id], metadatas=[meta])
+
+    facets_synced = False
+    try:
+        db = get_mongo()
+        if db is not None:
+            db.verification_events.insert_one({
+                "doc_id": doc_id, "collection": collection.name,
+                "project": meta.get("project") or "", "from": old, "to": verdict,
+                "by": caller, "by_role": role, "reason": reason, "at": now,
+            })
+            _stamp = {"source_verification": verdict}
+            r1 = db.learning_facets.update_many({"_id": doc_id}, {"$set": _stamp})
+            r2 = db.learning_claims.update_many({"_id": doc_id}, {"$set": _stamp})
+            facets_synced = bool(r1.modified_count or r2.modified_count)
+    except Exception:
+        pass  # the chroma write above is the load-bearing op
+
+    return json.dumps({
+        "status": "updated",
+        "doc_id": doc_id,
+        "old_verification": old,
+        "new_verification": verdict,
+        "facets_synced": facets_synced,
     }, indent=2)
 
 

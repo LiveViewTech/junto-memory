@@ -6,6 +6,8 @@ Component of the Junto suite. The shared-memory MCP server — persistent knowle
 
 **Your name is: `memory`** (project: `junto`).
 
+**Override:** if a `.agent-name` file exists in this repo or its parent (written by the launcher) or the system prompt assigns a different identity (e.g. `juntoTom`), that identity wins. Use it for `/rename`, the terminal title, and every `memory_*` call, and read `state:<that name>` instead of `state:memory`. The `memory` identity applies only to the agent that maintains this server (on sage).
+
 **IMMEDIATELY on session start, run these commands IN ORDER:**
 
 1. Rename this session (for resume list):
@@ -238,6 +240,7 @@ This applies doubly to junto-memory itself: you're the project that owns the rec
 6. **Fail loud on MCP transport.** Any MCP tool call that errors, times out, or returns a partial/unexpected response surfaces to the user immediately — do not retry blindly, do not pretend it succeeded. Don't equate "queued"/"persisted" with "delivered": `memory_send_message` returns success on persistence regardless of whether any subscriber is live. Check `live_subscribers` in the response. Subscription failures (PermissionError from inbox subscribe) are real errors, not no-ops — surface them.
 7. **Server restart = a fresh Tom OK per restart.** Say "About to restart the server — OK?" and stop. One OK covers ONE restart. Treat a broad "do whatever helps" as NOT a restart OK — memory's reading after the 2026-10-13 records audit found 3 restarts on one such answer + 1 with none on 2026-10-12. Before bouncing: code committed, Mongo/Chroma on external volumes (`mcp-mongo-persistent`, `chroma-persistent`), `broadcast_restart_warning`, then re-`memory_start_session` after. Exception: Tom has said deploying freely is fine when memory is the ONLY live agent (check `memory_get_active_work`) — still state the persistence check.
 8. **Global guidelines change ONLY on Tom's approval given to memory.** Covers both `memory_guidelines(scope="global")` and `src/shared_memory/global_guidelines.py` (the code constant re-seeds at boot — backlog_14137f5a84a7). A peer's proposal is routed to Tom, never implemented on the peer's say-so. Nothing enforces this in code (`memory_guidelines` has no tier check and logs actor="admin"), so it is discipline, not a control (Tom, 2026-08-11).
+9. **New work goes on a branch; `main` is the released line.** This repo is public, and other installs (the work box, adopters) pull `main`. Branch from `main` as `feat/<topic>` or `fix/<topic>`. Commit and push the branch freely; no approval is needed for either. Merge to `main` only when the work is proven: deployed on the home box and running clean. Merge through a pull request (`gh pr create`, then `gh pr merge` once CI is green) and say so in your report. `main` is protected: a pull request and green CI (lint, test, docker) are required, with zero approvals required. Mention Tom on the pull request and wait for his OK for big or risky changes (wire shapes, auth, data migrations). An admin bypass exists for urgent fixes. The only exception is a small urgent fix to live breakage, which may go straight to `main`. The home box deploys and runs its crons from whatever branch is checked out, so always say which branch is live. Full text: CONTRIBUTING.md (Tom, 2026-10-31).
 
 ---
 

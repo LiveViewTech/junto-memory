@@ -116,6 +116,10 @@ async def memory_register_function(
             purpose, project, _ = recover_envelope_leak(purpose, "purpose", project)
     except Exception:
         pass
+    from shared_memory.redact import redact_fields, redaction_notice
+    (purpose, gotchas, code), _redacted = redact_fields(
+        purpose, gotchas, code, tool="memory_register_function", session_id=session_id,
+        fields=["purpose", "gotchas", "code"])
 
     if project:
         project = normalize_project(project)
@@ -264,6 +268,8 @@ async def memory_register_function(
         result["note"] = "Code included - librarian will perform deep analysis"
     else:
         result["note"] = "Basic registration - librarian will enrich if file accessible"
+    if _redacted:
+        result.update(redaction_notice(_redacted))
 
     return json.dumps(result)
 

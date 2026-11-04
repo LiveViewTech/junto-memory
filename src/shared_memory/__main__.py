@@ -174,6 +174,9 @@ def _recall_foreign_digest(meta, agent):
 RECALL_SELF_ECHO_HOURS = 48
 
 
+RECALL_VERIFIED_BONUS = 0.05
+
+
 def _recall_excluded(doc_id, meta, agent):
     """Type-aware exclusions (nimbus first-day read, msg_53e467692779 —
     score tracks lexical mass, TYPE tracks usefulness):
@@ -185,6 +188,8 @@ def _recall_excluded(doc_id, meta, agent):
     - self-echo: requester's own docs updated within 48h (only when the
       request identifies the agent)."""
     if str(doc_id).startswith("spec_state_"):
+        return True
+    if meta.get("verification") == "rejected":  # interface:verification-state-v0
         return True
     if _recall_stale_handoff(meta):
         return True
@@ -393,6 +398,7 @@ async def _recall_payload(body, api_key, via_tunnel=False):
                 "score": round(score, 3),
                 "updated": meta.get("updated") or meta.get("created", ""),
                 "authored_by": meta.get("claude_instance"),
+                "verification": meta.get("verification") or "unreviewed",
                 "_content": doc,
                 "_source": source,
             })
@@ -422,6 +428,7 @@ async def _recall_payload(body, api_key, via_tunnel=False):
                     "match": "exact",
                     "updated": h["meta"].get("updated") or h["meta"].get("created", ""),
                     "authored_by": h["meta"].get("claude_instance"),
+                    "verification": h["meta"].get("verification") or "unreviewed",
                     "_content": h["doc"],
                     "_source": f"project:{project}",
                 })
@@ -434,7 +441,26 @@ async def _recall_payload(body, api_key, via_tunnel=False):
     except Exception as e:
         return 500, {"error": f"recall query failed: {e}"}
 
-    candidates.sort(key=lambda c: -c["score"])
+    # Verified docs get a small SORT bonus; the reported score stays the raw
+    # similarity (interface:verification-state-v0).
+    # Shelf-life decay (interface:ranking-decay-v0), per-project flag, default
+    # OFF: multiplies the SORT score only; `score` stays raw.
+    _decay = {}
+    if _qcfg.get("shelf_life_decay"):
+        try:
+            from shared_memory.decay import age_days_of, decay_factor
+            from shared_memory.facets import get_facets_for_ids
+            _shelf = get_facets_for_ids(mongo, [c["id"] for c in candidates])
+            for c in candidates:
+                f = decay_factor((_shelf.get(c["id"]) or {}).get("shelf_life"),
+                                 c.get("verification"), age_days_of(c.get("updated")))
+                if f < 1.0:
+                    _decay[c["id"]] = f
+                    c["decay"] = round(f, 2)
+        except Exception:
+            _decay = {}
+    candidates.sort(key=lambda c: -(c["score"] * _decay.get(c["id"], 1.0)
+                                     + (RECALL_VERIFIED_BONUS if c.get("verification") == "verified" else 0)))
     candidates = candidates[:max(0, k - len(lexical))] + lexical
 
     # one_line: claim facet when present (mongo best-effort), else content head.

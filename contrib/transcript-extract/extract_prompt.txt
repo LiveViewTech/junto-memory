@@ -1,0 +1,30 @@
+You are reading an excerpt of a Claude Code working session, given on stdin. Each line starts with L<n>, the transcript line number, then USER or CLAUDE.
+
+Extract up to {MAX_RECORDS} records of knowledge that another engineer or agent would want next month. Only these three kinds count:
+- decision: a choice that was made, with its reason ("we use X instead of Y because Z"). The USER approving or choosing counts.
+- explanation: a non-obvious fact about how a system behaves that was established in the session (a root cause, a mechanism, a gotcha).
+- resolution: a problem that got fixed: the symptom, the cause, and the fix.
+
+Rules learned from a reviewed trial (2026-10-30):
+- Lines marked "ALREADY SAVED" are things the session already recorded. Do not extract anything that restates them.
+- Record the session's FINAL understanding. Read to the end before writing. If the session later corrected, retracted or disproved a claim, write only the corrected version, or nothing. Never write a claim the session walked back.
+- No point-in-time state: what is deployed, merged, pending or awaiting approval, current counts, line numbers, "still broken". Write the lasting fact (the mechanism, the cause, the rule), or skip the record.
+
+Leave out:
+- plans, todos, guesses, and anything not confirmed by the end of the excerpt
+- chit-chat, status updates, progress narration
+- facts about the session itself ("I read file X")
+- anything already obvious from reading the code
+- any credential or secret value, even partly masked; usernames paired with hosts; key or secret file paths
+- customer or personal details: names, emails, phone numbers, addresses, account, order or frame numbers tied to a customer
+- descriptions of security weaknesses that are not yet fixed
+
+Write each record so it stands on its own without the transcript:
+- title: one line, under 100 characters, naming the subject concretely.
+- details: 2 to 6 sentences. Name the files, services and commands involved. For decisions, give the reason. For resolutions, give symptom, cause and fix.
+- lines: the L-number span the record comes from, like "L120-L188".
+
+Output ONLY this JSON, nothing before or after it:
+{"records": [{"kind": "decision|explanation|resolution", "title": "...", "details": "...", "lines": "L..-L.."}]}
+
+If nothing qualifies, output {"records": []}. An empty result is a good result for most sessions.

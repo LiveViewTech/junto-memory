@@ -166,3 +166,16 @@ def test_persist_fails_loud_when_agent_not_registered():
     assert "not registered" in res["rejected"]["coordinator"]
     # nothing was written — the alias does not resolve
     assert resolve_agent_name(db, "emailtriage", "coordinator") is None
+
+
+def test_persist_accepts_alias_equal_to_retired_agent():
+    # backlog_a008fd6947c9: retire X, then alias X to Y. The retired row must
+    # not count as a live-agent collision (resolve_agent_name skips it too).
+    db = _FakeDB([
+        {"project": "cerebro", "name": "madrox", "tier": "named"},
+        {"project": "cerebro", "name": "cerebro", "tier": "retired"},
+    ])
+    res = persist_agent_aliases(db, "cerebro", "madrox", ["cerebro"])
+    assert res["accepted"] == ["cerebro"]
+    assert res["rejected"] == {}
+    assert resolve_agent_name(db, "cerebro", "cerebro") == "madrox"

@@ -2,9 +2,9 @@
 
 
 def test_all_tools_register():
-    """All 63 tools are registered with the MCP server.
+    """All 65 tools are registered with the MCP server.
 
-    (51 + 6 skill-registry tools + memory_ack_directive + memory_report_context + 4 delegated-inference tools;
+    (51 + 6 skill-registry tools + memory_ack_directive + memory_report_context + 4 delegated-inference tools + memory_verify + memory_notify;
     the 6 autopilot tools were deleted in design:autopilot-removal-v0 Phase 2.)
     """
     from shared_memory.app import create_app
@@ -12,7 +12,7 @@ def test_all_tools_register():
     mcp = create_app()
     tools = mcp._tool_manager._tools
 
-    assert len(tools) == 63, f"Expected 63 tools, got {len(tools)}: {sorted(tools.keys())}"
+    assert len(tools) == 65, f"Expected 65 tools, got {len(tools)}: {sorted(tools.keys())}"
 
 
 def test_expected_tools_present():

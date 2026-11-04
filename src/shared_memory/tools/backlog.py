@@ -67,6 +67,10 @@ async def memory_add_backlog_item(
     # and re-route swallowed params before description enters the doc / op-log.
     from shared_memory.write_lint import recover_envelope_leak
     description, project, _lint_notes = recover_envelope_leak(description, "description", project)
+    from shared_memory.redact import redact_fields, redaction_notice
+    (title, description), _redacted = redact_fields(
+        title, description, tool="memory_add_backlog_item", session_id=session_id,
+        fields=["title", "description"])
 
     tags = tags or []
     chroma = await get_chroma()
@@ -154,6 +158,8 @@ async def memory_add_backlog_item(
             "it cannot repair the client. Fix the emission; see write_lint above "
             "for what was recovered."
         )
+    if _redacted:
+        result.update(redaction_notice(_redacted))
     return json.dumps(result)
 
 
@@ -367,6 +373,11 @@ async def memory_update_backlog_item(
     if priority and priority not in BACKLOG_PRIORITIES:
         return json.dumps({"error": f"Invalid priority. Must be one of: {BACKLOG_PRIORITIES}"})
 
+    from shared_memory.redact import redact_fields, redaction_notice
+    (title, description, deferred_reason), _redacted = redact_fields(
+        title, description, deferred_reason, tool="memory_update_backlog_item",
+        session_id=session_id, fields=["title", "description", "deferred_reason"])
+
     chroma = await get_chroma()
     session_info = active_sessions[session_id]
     now = utc_now_iso()
@@ -494,7 +505,7 @@ async def memory_update_backlog_item(
                 )
 
                 found = True
-                return json.dumps({
+                _resp = {
                     "status": "moved" if moved else "updated",
                     "id": item_id,
                     "title": meta["title"],
@@ -504,7 +515,10 @@ async def memory_update_backlog_item(
                     "assigned_to": meta.get("assigned_to") or None,
                     "target_version": meta.get("target_version") or None,
                     "deferred_reason": meta.get("deferred_reason") or None
-                })
+                }
+                if _redacted:
+                    _resp.update(redaction_notice(_redacted))
+                return json.dumps(_resp)
         except Exception:
             continue
 
@@ -646,6 +660,23 @@ async def memory_batch_backlog(
     session_info = active_sessions[session_id]
     now = utc_now_iso()
     results = {"succeeded": 0, "failed": 0, "ids": [], "errors": []}
+    # Redact free text on every item up front (Memento #3); copies, so the
+    # caller's dicts are not mutated.
+    from shared_memory.redact import redact_fields, redaction_notice
+    _redacted: dict = {}
+    _clean = []
+    for _it in items:
+        if isinstance(_it, dict):
+            _it = dict(_it)
+            _keys = [k for k in ("title", "description", "deferred_reason")
+                     if isinstance(_it.get(k), str)]
+            _vals, _found = redact_fields(*[_it[k] for k in _keys], tool="memory_batch_backlog",
+                                          session_id=session_id, fields=_keys)
+            _it.update(zip(_keys, _vals))
+            for k, n in _found.items():
+                _redacted[k] = _redacted.get(k, 0) + n
+        _clean.append(_it)
+    items = _clean
 
     if action == "create":
         for i, item in enumerate(items):
@@ -885,4 +916,6 @@ async def memory_batch_backlog(
     if not results["errors"]:
         del results["errors"]
 
+    if _redacted:
+        results.update(redaction_notice(_redacted))
     return json.dumps(results, indent=2)

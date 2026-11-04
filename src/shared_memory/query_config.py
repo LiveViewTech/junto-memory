@@ -47,6 +47,17 @@ DEFAULT_CHUNK_RECALL_FLOOR = 0.63
 DEFAULT_RERANK = False
 DEFAULT_RERANK_MIN = 0.05  # top-3 rows scoring 0.02-0.5 were still mostly useful (Claude-graded, 10-25); see interface:rerank-v0
 
+# Shelf-life decay at rank time (decay.py, interface:ranking-decay-v0).
+# OFF until the replay eval shows it helps (Memento #2).
+DEFAULT_SHELF_LIFE_DECAY = False
+
+# Transcript extraction (contrib/transcript-extract, design:transcript-extraction-v0).
+# OFF by default: the operator opts a server (or one project) in. When off,
+# memory_record_learning rejects transcript-extract writes, and the extractor
+# reads memory_health features.transcript_extract and exits before any model
+# call (so no API spend).
+DEFAULT_TRANSCRIPT_EXTRACT = False
+
 # Allowed config keys + their types (used by set_config_value).
 CONFIG_KEYS = {
     "default_expand": bool,
@@ -59,6 +70,8 @@ CONFIG_KEYS = {
     "chunk_recall_floor": float,
     "rerank": bool,
     "rerank_min": float,
+    "shelf_life_decay": bool,
+    "transcript_extract": bool,
 }
 
 DEFAULT_SCOPE = "__default__"
@@ -85,6 +98,8 @@ def _default_config_dict() -> Dict[str, Any]:
         "chunk_recall_floor": DEFAULT_CHUNK_RECALL_FLOOR,
         "rerank": DEFAULT_RERANK,
         "rerank_min": DEFAULT_RERANK_MIN,
+        "shelf_life_decay": DEFAULT_SHELF_LIFE_DECAY,
+        "transcript_extract": DEFAULT_TRANSCRIPT_EXTRACT,
     }
 
 

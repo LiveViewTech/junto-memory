@@ -844,6 +844,13 @@ async def memory_send_message(
             # No roster yet — allow message through (backward compatibility).
             # This lets messaging work before projects are fully set up.
 
+    # Secret redaction (Memento #3) before dedup, so the dedup key and the
+    # persisted doc both carry the redacted text.
+    from shared_memory.redact import redact_fields, redaction_notice
+    (message, subject), _redacted = redact_fields(
+        message, subject, tool="memory_send_message", session_id=session_id,
+        fields=["message", "subject"])
+
     # ── Dedup check ──
     # Reject identical messages to same target within 5 minutes
     dedup_window = now - timedelta(minutes=5)
@@ -935,7 +942,7 @@ async def memory_send_message(
     # First crossing of the hard ceiling for this sender in this hour:
     # compute the incident window, write an alert, insert system@junto
     # recovery notices into both endpoints' inboxes, suspend the agent,
-    # and fire an out-of-band webhook to claudeControl. All inside a
+    # and fire the out-of-band alert webhook if configured. All inside a
     # try/except so a malfunction in the escalation path never breaks
     # the underlying send.
     if hard_trip:
@@ -1185,6 +1192,8 @@ async def memory_send_message(
         if idle is not None:
             response["recipient_idle"] = idle
 
+    if _redacted:
+        response.update(redaction_notice(_redacted))
     return json.dumps(response)
 
 

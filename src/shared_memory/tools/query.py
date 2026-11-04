@@ -1,6 +1,7 @@
 """Query and retrieval tools - search knowledge base, get documents."""
 
 import json
+import logging
 from datetime import timedelta
 from typing import List
 
@@ -11,6 +12,7 @@ from shared_memory.app import mcp
 from shared_memory.auth import collection_allowed, project_allowed, scoped_projects
 from shared_memory.clients import get_chroma, get_mongo
 from shared_memory.config import OVERLAP_WINDOW_HOURS, PROJECT_PREFIX, SHARED_PREFIX
+from shared_memory.decay import STALE_BELOW
 from shared_memory.helpers import (
     cleanup_stale_signals,
     embed_query_once,
@@ -30,6 +32,8 @@ from shared_memory.helpers import (
     utc_now_iso,
 )
 from shared_memory.state import active_sessions, active_signals
+
+log = logging.getLogger(__name__)
 
 # Relevance threshold - results below this are excluded
 # Chroma L2 distance: 0 = identical, 1 = quite different, 2+ = very different
@@ -138,6 +142,14 @@ async def memory_query(
         recency_cutoff = utc_now() - timedelta(days=int(updated_within_days))
 
     results = []
+    # A failed collection scan used to look exactly like a miss (bare
+    # `except: pass`). Failures are now logged and returned as `scan_errors`.
+    scan_errors = []
+    rerank_dropped = 0
+
+    def _scan_failed(where: str, e: Exception) -> None:
+        log.warning("memory_query: %s scan failed: %s: %s", where, type(e).__name__, e)
+        scan_errors.append(f"{where}: {type(e).__name__}: {str(e)[:200]}")
 
     # Build where filter
     where_filter = {}
@@ -232,6 +244,7 @@ async def memory_query(
                         # update path. None when the doc predates identity
                         # capture — consumers fail open on null.
                         "authored_by": meta.get("claude_instance"),
+                        "verification": meta.get("verification") or "unreviewed",
                         "warning": warning if warning else None
                     })
                     if _rr:
@@ -280,11 +293,12 @@ async def memory_query(
                         "content": h["doc"],
                         "access_count": meta.get("access_count", 0),
                         "authored_by": meta.get("claude_instance"),
+                        "verification": meta.get("verification") or "unreviewed",
                         "warning": warning if warning else None
                     })
                     await update_access_stats(proj_collection, h["id"])
-        except Exception:
-            pass
+        except Exception as e:  # noqa: BLE001
+            _scan_failed(f"project:{project}", e)
 
     # Search shared collections only if requested and with higher threshold
     if include_shared:
@@ -340,6 +354,7 @@ async def memory_query(
                             "content": doc[:500] + "..." if len(doc) > 500 else doc,
                             "access_count": meta.get("access_count", 0),
                             "authored_by": meta.get("claude_instance"),
+                            "verification": meta.get("verification") or "unreviewed",
                             "warning": staleness if staleness else None
                         })
                         if _rr:
@@ -350,8 +365,17 @@ async def memory_query(
                         # Track access (fire-and-forget); rerank mode counts only the served rows
                         if doc_id and not _rr:
                             await update_access_stats(shared, doc_id)
-            except Exception:
-                pass
+            except Exception as e:  # noqa: BLE001
+                _scan_failed(f"shared:{shared_name}", e)
+
+    # Verification (interface:verification-state-v0): rejected docs leave
+    # normal search like archived ones do; include_inactive shows them flagged.
+    if include_inactive:
+        for r in results:
+            if r.get("verification") == "rejected":
+                r["warning"] = ((r.get("warning") or "") + " REJECTED on verification: checked and found wrong.").strip()
+    else:
+        results = [r for r in results if r.get("verification") != "rejected"]
 
     if _rr and results:
         _pool = [r for r in results if r.get("match") != "exact"]
@@ -359,6 +383,8 @@ async def memory_query(
         _scores = await rerank.score(query, [r["_text"] for r in _pool])
         _caps = {"project": limit, "patterns": min(2, limit), "context": min(2, limit)}
         _kept = rerank.apply(_pool, _scores, float(_qcfg.get("rerank_min", 0.5)), _caps)
+        if _scores is not None:
+            rerank_dropped = len(_pool) - len(_kept)
         for r in _kept:
             if r.get("id") and r.get("_col") is not None:
                 await update_access_stats(r["_col"], r["id"])
@@ -366,11 +392,45 @@ async def memory_query(
         rerank.strip_private(results)
 
     if not results:
-        return json.dumps({
+        empty = {
             "query": query,
             "results": [],
             "message": "No matching memories found. This might be new territory - consider recording what you learn!"
-        }, indent=2)
+        }
+        if rerank_dropped:
+            # The reranker scored every candidate under rerank_min. Terse
+            # keyword/tag queries do this (learning_d3e133172b928694), so it is
+            # NOT evidence that nothing exists.
+            empty["rerank_dropped"] = rerank_dropped
+            empty["message"] = (
+                f"No results: {rerank_dropped} candidate(s) were found but the reranker scored all of them "
+                f"below rerank_min. This does NOT mean nothing exists. Short keyword or tag queries score "
+                f"near zero; rephrase as a full question.")
+        if scan_errors:
+            empty["scan_errors"] = scan_errors
+            empty["message"] = "Search failed on some collections (see scan_errors); an empty result is not a miss."
+        return json.dumps(empty, indent=2)
+
+    # Shelf-life decay (interface:ranking-decay-v0), per-project flag, default
+    # OFF. v2: a within-band tiebreak only, never a band change (decay.py). The
+    # reported relevance stays raw and a decayed row carries `decay` so the
+    # reader can see why it sank.
+    if _qcfg.get("shelf_life_decay"):
+        try:
+            from shared_memory.decay import age_days_of, decay_factor
+            from shared_memory.facets import get_facets_for_ids
+            _shelf = get_facets_for_ids(
+                get_mongo(), [r["id"] for r in results if str(r.get("id", "")).startswith("learning_")]
+            )
+            for r in results:
+                f = decay_factor((_shelf.get(r.get("id")) or {}).get("shelf_life"),
+                                 r.get("verification"),
+                                 age_days_of(r.get("updated") or r.get("created")))
+                if f < 1.0:
+                    r["_decay"] = f
+                    r["decay"] = round(f, 2)
+        except Exception:
+            pass
 
     # Tiered sort: group by relevance band, then sort by recency within each band.
     # This prevents old docs from outranking fresh ones on the same topic.
@@ -378,10 +438,14 @@ async def memory_query(
         # Relevance band: >70% = 0 (best), 50-70% = 1, <50% = 2
         pct = int(r["relevance"].rstrip("%")) / 100
         band = 0 if pct > 0.70 else (1 if pct > 0.50 else 2)
-        # Within band, sort by updated timestamp descending (newest first)
+        # Within band: verified first (interface:verification-state-v0), then
+        # rows past their half-life last (decay flag), then newest first.
+        # Neither lifts nor drops a doc across a band.
+        verified = 0 if r.get("verification") == "verified" else 1
+        stale = 1 if r.get("_decay", 1.0) < STALE_BELOW else 0
         ts = parse_timestamp(r.get("updated") or r.get("created"))
         epoch = ts.timestamp() if ts else 0
-        return (band, -epoch)
+        return (band, verified, stale, -epoch)
 
     results.sort(key=_sort_key)
     # Exact identifier hits keep their slots; the vector rows fill the rest.
@@ -391,6 +455,8 @@ async def memory_query(
         results = _rest[:max(0, limit - len(_exact))] + _exact
         results.sort(key=_sort_key)
     results = results[:limit]
+    for r in results:
+        r.pop("_decay", None)
 
     # Eval-set seeding (recall_metrics.query_events; maintainer retrieval-eval harness, not shipped).
     try:
@@ -463,7 +529,8 @@ async def memory_query(
         "expand": bool(expand),
         "expand_top": int(expand_top),
         "snippet_length": int(snippet_length),
-        "results": results
+        "results": results,
+        **({"scan_errors": scan_errors} if scan_errors else {}),
     }, indent=2)
 
 
@@ -595,8 +662,14 @@ async def memory_get_by_id(
             # backlog_601d268dbe6b). Null = pre-identity-capture doc —
             # consumers fail open.
             "authored_by": meta.get("claude_instance"),
+            "verification": meta.get("verification") or "unreviewed",
             "content": doc
         }
+        if meta.get("verified_by"):
+            payload["verified_by"] = meta.get("verified_by")
+            payload["verified_at"] = meta.get("verified_at")
+            if meta.get("verification_reason"):
+                payload["verification_reason"] = meta.get("verification_reason")
         if resolved_from:
             payload["resolved_from_prefix"] = resolved_from
         # Facets ride the follow-through surface too (get_by_id is the

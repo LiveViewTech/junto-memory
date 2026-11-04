@@ -166,3 +166,51 @@ async def test_no_false_stale_flag_when_consistent(monkeypatch):
     )
     row = next(a for a in out["agents"] if a["instance"] == "wordpress-team")
     assert "directory_cache_stale" not in row
+
+
+class _AdminProjCol(_ProjCol):
+    def __init__(self, admins):
+        super().__init__(admins)
+        self.updates = []
+
+    def update_one(self, filt, update, *a, **k):
+        self.updates.append(update)
+
+
+@pytest.mark.asyncio
+async def test_update_without_tier_leaves_admin_alone(monkeypatch):
+    """backlog_a008fd6947c9: the old tier="named" default demoted admins on
+    every role edit and pulled them from the project's admins list."""
+    reg, dirs = _rows()
+    reg[0]["tier"] = "admin"
+    db = _DB(reg, dirs)
+    db.projects = _AdminProjCol(["coordinator", "wordpress-team"])
+    active_sessions["s1"] = {"claude_instance": "coordinator", "project": "nimbus"}
+    monkeypatch.setattr(projects_mod, "get_mongo", lambda: db)
+
+    out = json.loads(
+        await projects_mod.memory_project(
+            session_id="s1", action="update_agent", name="nimbus",
+            agent="wordpress-team", role_description=NEW,
+        )
+    )
+    assert "tier" not in out["updated_fields"]
+    assert db.registered_agents.rows[0]["tier"] == "admin"
+    assert db.projects.updates == []
+
+
+@pytest.mark.asyncio
+async def test_update_rejects_invalid_tier(monkeypatch):
+    reg, dirs = _rows()
+    db = _DB(reg, dirs)
+    active_sessions["s1"] = {"claude_instance": "coordinator", "project": "nimbus"}
+    monkeypatch.setattr(projects_mod, "get_mongo", lambda: db)
+
+    out = json.loads(
+        await projects_mod.memory_project(
+            session_id="s1", action="update_agent", name="nimbus",
+            agent="wordpress-team", tier="retired",
+        )
+    )
+    assert "error" in out
+    assert db.registered_agents.rows[0]["tier"] == "named"
