@@ -36,6 +36,18 @@ sys.path.insert(0, str(REPO / "src"))
 # them. In-container defaults point at host.docker.internal / mongodb.
 os.environ.setdefault("JUNTO_CLAIM_GATE_URL", "http://localhost:11434/v1")
 os.environ.setdefault("JUNTO_FACETS_ENABLED", "true")
+# Use the server's model choice: without these the backfill fell back to
+# phi4:14b while live writes used the .env extract model (found 10-31).
+# Same for the sage-router endpoint + token (design:sage-inference-router-v0);
+# the fallback is the host's own Ollama, not the container's host.docker.internal.
+for _line in (REPO / ".env").read_text().splitlines():
+    _k, _, _v = _line.strip().partition("=")
+    if _k in ("JUNTO_CLAIM_GATE_MODEL", "JUNTO_CLAIM_GATE_EXTRACT_MODEL",
+              "JUNTO_CLAIM_GATE_EXTRACT_REASONING", "JUNTO_CLAIM_GATE_API_KEY") and _v:
+        os.environ.setdefault(_k, _v)
+    elif _k == "JUNTO_CLAIM_GATE_URL" and _v and "host.docker.internal" not in _v:
+        os.environ["JUNTO_CLAIM_GATE_URL"] = _v
+os.environ.setdefault("JUNTO_FACETS_TASK", "backfill")
 
 from shared_memory import claim_gate, facets  # noqa: E402
 
@@ -207,6 +219,28 @@ async def run_batch(db, chroma, batch, project=None, dry_run=False):
     return done
 
 
+# sage-router P0 (design:sage-inference-router-v0, amendment A6): the nightly
+# batch yields the GPU when its model is not loaded and no card has room.
+ROUTER_STATUS_URL = os.environ.get("JUNTO_ROUTER_STATUS_URL",
+                                   "http://192.168.15.240:11500/v1/status")
+MODEL_NEED_GB = 19.0   # qwen3.8:27b resident size at num_ctx 8192 (18.4 GB, 11-01), rounded up
+
+
+def _gpu_busy() -> str:
+    """Reason to defer, or '' to go. Any failure reading /status = go."""
+    import httpx
+    model = claim_gate._extract_model()
+    try:
+        st = httpx.get(ROUTER_STATUS_URL, timeout=3.0).json()
+        resident = [r.get("model") for b in (st.get("backends") or {}).values()
+                    for r in (b.get("resident") or [])]
+        if model in resident or float(st.get("max_gpu_free_gb", 99)) >= MODEL_NEED_GB:
+            return ""
+        return f"{model} not resident and max_gpu_free_gb={st.get('max_gpu_free_gb')}"
+    except Exception:
+        return ""
+
+
 async def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--probe", action="store_true")
@@ -234,6 +268,10 @@ async def main():
             await _process_one(db, chroma, doc_id, args.project)
         return
     if args.batch:
+        busy = _gpu_busy()
+        if busy:
+            print(f"== deferred: GPU busy ({busy}); the next nightly run retries ==")
+            return
         await run_batch(db, chroma, args.batch, args.project, args.dry_run)
         return
     ap.print_help()

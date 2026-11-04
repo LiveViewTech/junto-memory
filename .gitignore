@@ -65,3 +65,4 @@ temp/
 # Local working data (wave outputs, ledgers, the librarian claim-cleanup queue).
 # Derived from knowledge-base content: never commit.
 data/
+.claude/skills/

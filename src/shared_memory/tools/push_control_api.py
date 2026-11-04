@@ -1,6 +1,7 @@
 """Push control read-side tools — `design:push-control-v0` v1.1.0 §5, §7.
 
-Exposes two MCP tools for the claudeControl dashboard:
+Exposes two MCP tools for operator alert views (originally the
+claudeControl dashboard, retired 2026-10-24; alerts are now pull-only):
   - memory_list_alerts: list recent alerts, filterable by ack state.
   - memory_get_emission_stats: per-agent current-hour emission count +
     config thresholds, for the per-agent counter display.
@@ -33,9 +34,10 @@ async def memory_list_alerts(
 ) -> str:
     """List push-control alerts, newest first.
 
-    Designed for claudeControl's alert dashboard. Default behavior returns
-    the most recent 50 alerts regardless of ack state — claudeControl uses
-    `unacknowledged_only=True` for the active-incident feed.
+    Operator alert feed (alerts are pull-only since junto-control retired
+    2026-10-24). Default behavior returns the most recent 50 alerts
+    regardless of ack state — use `unacknowledged_only=True` for the
+    active-incident feed (the `go` briefing does).
 
     Args:
         session_id: Your session ID.
@@ -95,7 +97,8 @@ async def memory_get_emission_stats(
 ) -> str:
     """Current-hour emission count + thresholds for one or all agents.
 
-    Designed for the claudeControl per-agent counter dashboard (§5). Returns
+    Per-agent counter view (§5; built for the retired claudeControl
+    dashboard). Returns
     a list of `{instance, project, hour, count, depth_cap, push_budget,
     hard_ceiling, suspended}` entries.
 

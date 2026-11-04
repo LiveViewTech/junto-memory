@@ -3,7 +3,7 @@
 Implements interface:claim-extraction-v0 v1.0.3 VERBATIM on top of the
 threshold stage in tools/storage.py. Pipeline per the contract:
 
-  EXTRACT (phi4:14b, temp 0, title + first ~3000 chars, max_tokens 400,
+  EXTRACT (JUNTO_CLAIM_GATE_EXTRACT_MODEL, temp 0, title + first ~3000 chars, max_tokens 400,
   non-empty validate) → title-anchor claims ("{title}\\n{claim}") →
   CLASSIFY (CONTRADICTS / CONSISTENT / UNRELATED, one word, substring
   parse, no-match → CONSISTENT fail-quiet).
@@ -16,9 +16,12 @@ Contract amendments honored here:
 - Extracted claims are PERSISTED in mongo `learning_claims`, tagged with
   RECIPE_VERSION; a recipe bump invalidates the cache lazily (mismatched
   rows are re-extracted on next touch).
-- The judge model for THIS consumer is phi4:14b (precision-decisive:
-  a false CONTRADICTS flags a legitimate write). Do NOT normalize to
-  gpt-oss — that variant belongs to junto-sub's trap-escalation check.
+- The judge is precision-decisive (a false CONTRADICTS flags a legitimate
+  write). The contract's reference judge was phi4:14b; on sage it has been
+  qwen3.8:27b since 2026-10-31, set via JUNTO_CLAIM_GATE_MODEL (the router's
+  junto judge allowlist is [qwen3.8:27b] only, so phi4 now gets 400
+  not_allowlisted). Do NOT normalize to gpt-oss — that variant belonged to
+  junto-sub's trap-escalation check.
 
 Known limit (do not overclaim): temporal invalidation (dataset P12,
 "A was true, the world changed") is missed by every tested model.
@@ -35,6 +38,8 @@ Config (env):
                             via the compose host-gateway extra_host).
   JUNTO_CLAIM_GATE_MODEL    default phi4:14b (contract reference model). The
                             CLASSIFY judge, and the extractor unless overridden.
+                            sage's .env MUST set it (qwen3.8:27b): the code
+                            default is no longer allowlisted by the router.
   JUNTO_CLAIM_GATE_EXTRACT_MODEL      optional model for claim EXTRACT and the
                             facets (operation / shelf_life / trigger); unset →
                             JUNTO_CLAIM_GATE_MODEL. The judge stays on
@@ -43,6 +48,19 @@ Config (env):
                             extract calls (e.g. "none"). Thinking models (qwen3.x,
                             gemma4) think by default and spend the whole 8/150/400
                             token budget on it, returning empty content.
+  JUNTO_CLAIM_GATE_REASONING  optional reasoning_effort for the JUDGE (classify)
+                            calls. Needed only if the judge is a thinking model.
+  JUNTO_CLAIM_GATE_API_KEY  optional bearer token, sent as Authorization to
+                            JUNTO_CLAIM_GATE_URL (the sage-router needs one).
+  JUNTO_CLAIM_GATE_FALLBACK_URL  optional second OpenAI-compatible base (direct
+                            Ollama). Tried once, same model, when the primary
+                            gives a connect error, 502 or 503. Never on other
+                            statuses (429 budget_exhausted, 400 not_allowlisted).
+                            design:sage-inference-router-v0 amendment A1.
+                            Unset on sage since 2026-11-01: the router now owns
+                            :11434 too, so a "fallback" there is the same process.
+  JUNTO_FACETS_TASK         X-Infer-Task the facets calls send (default
+                            "facets"; the nightly backfill sets "backfill").
 """
 
 import logging
@@ -119,10 +137,11 @@ def _extract_model() -> str:
 
 
 async def _chat(client, system: str, user: str, max_tokens: int,
-                extract: bool = False) -> str:
+                extract: bool = False, task: Optional[str] = None) -> str:
     """One /chat/completions call, temperature 0. Returns content ('' on a
     shape surprise); transport errors propagate to the orchestrator's
-    fail-quiet boundary. extract=True uses the extraction model/reasoning."""
+    fail-quiet boundary. extract=True uses the extraction model/reasoning.
+    task is the router's X-Infer-Task (default extract / judge)."""
     body = {
         "model": _extract_model() if extract else _gate_model(),
         "temperature": 0,
@@ -132,11 +151,15 @@ async def _chat(client, system: str, user: str, max_tokens: int,
             {"role": "user", "content": user},
         ],
     }
-    reasoning = os.environ.get("JUNTO_CLAIM_GATE_EXTRACT_REASONING")
-    if extract and reasoning:
+    reasoning = os.environ.get(
+        "JUNTO_CLAIM_GATE_EXTRACT_REASONING" if extract else "JUNTO_CLAIM_GATE_REASONING")
+    if reasoning:
         body["reasoning_effort"] = reasoning
-    resp = await client.post(f"{_gate_url()}/chat/completions", json=body)
-    resp.raise_for_status()
+    headers = {"X-Infer-Task": task or ("extract" if extract else "judge")}
+    key = os.environ.get("JUNTO_CLAIM_GATE_API_KEY")
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+    resp = await _post_with_fallback(client, body, headers)
     data = resp.json()
     try:
         return data["choices"][0]["message"]["content"] or ""
@@ -144,13 +167,43 @@ async def _chat(client, system: str, user: str, max_tokens: int,
         return ""
 
 
-async def extract_claim(client, title: str, content: str) -> Optional[str]:
+FALLBACK_STATUSES = (502, 503)
+
+
+async def _post_with_fallback(client, body: Dict, headers: Dict):
+    """POST to the primary; on a connect error or 502/503, once to
+    JUNTO_CLAIM_GATE_FALLBACK_URL with the SAME model (no substitution) and
+    no Authorization header (the key belongs to the primary)."""
+    import httpx
+
+    fallback = os.environ.get("JUNTO_CLAIM_GATE_FALLBACK_URL", "").rstrip("/")
+    try:
+        resp = await client.post(f"{_gate_url()}/chat/completions", json=body,
+                                 headers=headers)
+        if resp.status_code not in FALLBACK_STATUSES or not fallback:
+            resp.raise_for_status()
+            return resp
+        reason = f"HTTP {resp.status_code}"
+    except (httpx.ConnectError, httpx.ConnectTimeout) as e:
+        if not fallback:
+            raise
+        reason = type(e).__name__
+    logger.warning("claim gate: primary %s (%s) — falling back to %s", _gate_url(), reason, fallback)
+    resp = await client.post(f"{fallback}/chat/completions", json=body,
+                             headers={k: v for k, v in headers.items() if k != "Authorization"})
+    resp.raise_for_status()
+    return resp
+
+
+async def extract_claim(client, title: str, content: str,
+                        task: Optional[str] = None) -> Optional[str]:
     """Stage 1. Returns the whitespace-collapsed claim, or None when the
     model returned empty (contract: output MUST be non-empty — an empty
     result means this pair is skipped, e.g. a think-mode model ate the
     budget)."""
     user = f"{title}\n\n{content[:CONTENT_HEAD_CHARS]}"
-    raw = await _chat(client, EXTRACT_SYSTEM, user, EXTRACT_MAX_TOKENS, extract=True)
+    raw = await _chat(client, EXTRACT_SYSTEM, user, EXTRACT_MAX_TOKENS, extract=True,
+                      task=task)
     claim = " ".join(raw.split())
     return claim or None
 

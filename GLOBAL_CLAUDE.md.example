@@ -24,7 +24,7 @@ echo -ne "\033]0;[YOUR_NAME] Claude Code\007"
 
 When MCP shared-memory is available, you MUST follow this startup sequence:
 
-1. Call `memory_start_session(project="...", claude_instance="YOUR_NAME", role_description="...")`
+1. Call `attach_session` first if the junto-inbox plugin is loaded (retry once on `not_ready`); otherwise call `memory_start_session(project="...", claude_instance="YOUR_NAME", role_description="...")`. Never both.
    - Include `role_description` from your project CLAUDE.md
    - If no project CLAUDE.md exists, derive from project name and working directory
    - If start_session returns `action_needed` about role_description, re-call with one

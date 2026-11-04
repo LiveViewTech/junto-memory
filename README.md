@@ -60,7 +60,7 @@ There are 370+ MCP memory servers listed on PulseMCP. Most give a single agent p
 | Secrets for data sources | No | Yes — Encrypted vault; agents request connections, the operator activates them, agents never see the secret |
 | Operator web UI | No | Yes — `/admin`: settings, agents, alerts, tasks, connections, change log |
 
-63 tools across 23 categories. Not a toy — a coordination system.
+65 tools across 23 categories. Not a toy — a coordination system.
 
 ---
 
@@ -225,7 +225,7 @@ No API keys or authentication tokens are required for local use (see [Security](
 
 ## Tool Reference
 
-63 tools organized into 23 categories. (For the canonical, current list with grouping and end-to-end flows, see the architecture spec inside the server: `memory_get_spec(name="architecture:shared-memory-v1", project="junto")`.)
+65 tools organized into 23 categories. (For the canonical, current list with grouping and end-to-end flows, see the architecture spec inside the server: `memory_get_spec(name="architecture:shared-memory-v1", project="junto")`.)
 
 ### Session Management (2)
 
@@ -267,11 +267,12 @@ No API keys or authentication tokens are required for local use (see [Security](
 | `memory_update_backlog_item` | Update a backlog item's status, priority, assignee, or description. |
 | `memory_complete_backlog_item` | Mark a backlog item as done or won't-do, with optional resolution notes. |
 
-### Inter-Agent Messaging (7)
+### Inter-Agent Messaging (8)
 
 | Tool | Description |
 |------|-------------|
 | `memory_send_message` | Send a message to another agent. Supports categories (task, question, blocker, etc.) and threading. |
+| `memory_notify` | Send a message to a PERSON over their own Gmail/Slack. Junto queues it; the person's notify runner (contrib/notify-runner, on their machine) delivers it through their approved Claude connector with a headless `claude -p`, behind a local recipient allowlist. Scheduled tasks can route to `human:<name>` too. Each person registers and tests their own channels. |
 | `memory_get_messages` | Get pending messages for your agent. Scoped by project. |
 | `memory_acknowledge_message` | Mark a message as received (shortcut for status update). |
 | `memory_update_message_status` | Track message lifecycle: pending, delivered, received, completed, failed. |
@@ -327,12 +328,13 @@ No API keys or authentication tokens are required for local use (see [Security](
 |------|-------------|
 | `memory_admin` | Manage API keys and view audit logs. Actions: `create_key`, `revoke_key`, `list_keys`, `audit_log`, `auth_status`. Requires owner role when auth is enabled. |
 
-### Document Lifecycle (4)
+### Document Lifecycle (5)
 
 | Tool | Description |
 |------|-------------|
 | `memory_update_work` | Update your current work status and files touched. Enables overlap detection and dependency signaling. |
 | `memory_change_status` | Change a document's status: active, deprecated, superseded, archived. Preserves history. |
+| `memory_verify` | Mark a doc verified / rejected / unreviewed (separate from status). Verified docs lead their relevance band; rejected docs drop out of search and recall. Human, admin/owner or librarian only; no self-verify. |
 | `memory_archive_by_tag` | Bulk archive all documents matching a tag (e.g., end-of-version cleanup). |
 | `memory_restore_by_tag` | Bulk restore previously archived documents by tag. |
 

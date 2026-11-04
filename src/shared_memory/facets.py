@@ -252,6 +252,12 @@ def is_park_summary(tags) -> bool:
         return False
 
 
+def _facets_task() -> str:
+    """Router X-Infer-Task for facets calls; the nightly backfill sets
+    JUNTO_FACETS_TASK=backfill (batch priority)."""
+    return os.environ.get("JUNTO_FACETS_TASK", "facets")
+
+
 async def extract_operation(client, title: str, content: str,
                             tags=None) -> Optional[str]:
     # SHAPE RULE, PRE-MODEL (librarian-proposed 07-31, adopted; sub released
@@ -265,7 +271,7 @@ async def extract_operation(client, title: str, content: str,
     raw = await claim_gate._chat(
         client, OPERATION_SYSTEM,
         f"{title}\n\n{content[:claim_gate.CONTENT_HEAD_CHARS]}",
-        ONE_WORD_MAX_TOKENS, extract=True,
+        ONE_WORD_MAX_TOKENS, extract=True, task=_facets_task(),
     )
     return _parse_one_word(raw, OPERATION_ENUM)
 
@@ -274,7 +280,7 @@ async def extract_shelf_life(client, title: str, content: str) -> Optional[str]:
     raw = await claim_gate._chat(
         client, SHELF_LIFE_SYSTEM,
         f"{title}\n\n{content[:claim_gate.CONTENT_HEAD_CHARS]}",
-        ONE_WORD_MAX_TOKENS, extract=True,
+        ONE_WORD_MAX_TOKENS, extract=True, task=_facets_task(),
     )
     word = _parse_one_word(raw, ("DURABLE", "VOLATILE"))
     return word.lower() if word else None
@@ -284,7 +290,7 @@ async def extract_trigger(client, title: str, content: str) -> List[str]:
     raw = await claim_gate._chat(
         client, TRIGGER_SYSTEM,
         f"{title}\n\n{content[:claim_gate.CONTENT_HEAD_CHARS]}",
-        TRIGGER_MAX_TOKENS, extract=True,
+        TRIGGER_MAX_TOKENS, extract=True, task=_facets_task(),
     )
     lines = []
     for line in (raw or "").splitlines():
@@ -383,7 +389,8 @@ async def _extract_and_store(db, collection, doc_id: str, title: str,
             # claim: the gate may have already extracted+cached it this write.
             claim = claim_gate._cached_claim(db, doc_id)
             if not claim:
-                claim = await claim_gate.extract_claim(client, title, details)
+                claim = await claim_gate.extract_claim(client, title, details,
+                                                      task=_facets_task())
                 if claim:
                     claim_gate._cache_claim(db, doc_id, claim)
             if not claim:

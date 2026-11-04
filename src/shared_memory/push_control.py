@@ -1239,8 +1239,9 @@ async def fire_alert_webhook(
 
     Best-effort: failures do not lose the alert (already persisted to
     `alerts` collection). Updates the alert row with `webhook_fired_at` +
-    `webhook_status` on completion. Short timeout (10s) — claudeControl is
-    expected to respond fast; if it does not, the polling fallback at
+    `webhook_status` on completion. Short timeout (10s) — the receiver is
+    expected to respond fast (junto-control, the original receiver, was
+    retired 2026-10-24; no webhook_url is configured on sage); if it does not, the polling fallback at
     `memory_list_alerts(unacknowledged=True)` catches the alert anyway.
     """
     if not webhook_url or not alert_id:
@@ -1293,7 +1294,7 @@ def handle_hard_trip(
       3. Write durable alert to `alerts` collection.
       4. Insert system@junto recovery notices into both endpoints' inboxes.
       5. Flip agent.suspended=True on the registered_agents doc.
-      6. Schedule async webhook POST to claudeControl.
+      6. Schedule async webhook POST to the configured webhook_url, if any.
 
     Returns a dict with the resulting alert_id, notice IDs, and webhook
     schedule status. Caller logs the trip; this function is the

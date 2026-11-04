@@ -26,6 +26,9 @@ Config (JSON, mode 600), default ~/.config/junto-runner/config.json:
   "num_predict": 8192,                   (optional reply-token cap, reasoning included)
   "workers": 3,                          (optional; runs at once, default 1; see RunGate)
   "exclusive_model_gb": 24,              (optional; bigger models run alone, default 24)
+  "ollama_app": "junto",                 (optional; X-Infer-App sent to a sage-router, default junto)
+  "ollama_task": "delegate",             (optional; X-Infer-Task, default delegate)
+  "ollama_token_file": "~/.config/sage-router/junto.token",  (optional; bearer token for the router)
   "scopes": {
     "mail:support": {"credential_files": ["/path/.support-imap-app-password.secret"]},
     "files:notes":  {"file_roots": ["/home/me/notes"]}
@@ -87,6 +90,15 @@ def load_config(path):
     cfg.setdefault("scopes", {})
     cfg.setdefault("workers", 1)
     cfg.setdefault("exclusive_model_gb", 24)
+    # "ollama" may be plain Ollama or the sage-router in front of it. The router routes
+    # tokenless calls as app=anonymous at capped priority; these headers attribute them,
+    # and a token (once the router allowlists the task) gives them real scheduling.
+    hdrs = {"X-Infer-App": cfg.get("ollama_app") or "junto",
+            "X-Infer-Task": cfg.get("ollama_task") or "delegate"}
+    if cfg.get("ollama_token_file"):
+        with open(os.path.expanduser(cfg["ollama_token_file"])) as fh:
+            hdrs["Authorization"] = "Bearer " + fh.read().strip()
+    cfg["_ollama_headers"] = hdrs
     with open(os.path.expanduser(cfg["key_file"])) as fh:
         cfg["_key"] = fh.read().strip()
     return cfg
@@ -139,10 +151,41 @@ def _post(url, body, headers=None, timeout=60):
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read() or b"{}")
     except urllib.error.HTTPError as e:
+        meta = {"_http": e.code, "_retry_after": e.headers.get("Retry-After")}
         try:
-            return json.loads(e.read() or b"{}") | {"_http": e.code}
+            return json.loads(e.read() or b"{}") | meta
         except ValueError:
-            return {"error": f"HTTP {e.code}", "_http": e.code}
+            return {"error": f"HTTP {e.code}"} | meta
+
+
+OLLAMA_BUSY_TRIES = 5        # 503 no_capacity from the router: wait and retry
+OLLAMA_BUSY_WAIT_MAX = 120   # seconds; cap on a single Retry-After
+
+
+def _ollama(cfg, path, body, timeout=600):
+    """POST to Ollama / the sage-router with attribution headers. A 503 (router
+    no_capacity, models busy) is a retry-after, not a failure: wait Retry-After
+    (default 30s, capped) and try again, up to OLLAMA_BUSY_TRIES."""
+    url = cfg["ollama"].rstrip("/") + path
+    for attempt in range(1, OLLAMA_BUSY_TRIES + 1):
+        resp = _post(url, body, cfg.get("_ollama_headers"), timeout=timeout)
+        if resp.get("_http") != 503 or attempt == OLLAMA_BUSY_TRIES:
+            return resp
+        try:
+            wait = min(float(resp.get("_retry_after") or 30), OLLAMA_BUSY_WAIT_MAX)
+        except ValueError:
+            wait = 30
+        log.info("ollama busy (503 %s); retry %d/%d in %.0fs", resp.get("error"), attempt,
+                 OLLAMA_BUSY_TRIES - 1, wait)
+        time.sleep(wait)
+    return resp
+
+
+def _ollama_tags(cfg):
+    url = _require_http(cfg["ollama"].rstrip("/") + "/api/tags")
+    req = urllib.request.Request(url, headers=cfg.get("_ollama_headers") or {})
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        return json.loads(resp.read() or b"{}")
 
 
 def _get(url, timeout=10):
@@ -593,11 +636,10 @@ def _model_limits(cfg, model):
     """(trained_context, size_bytes) for an Ollama model, cached; (None, None) if unknown."""
     if model not in _model_info:
         trained = size = None
-        base = cfg["ollama"].rstrip("/")
         try:
-            info = _post(base + "/api/show", {"model": model}, timeout=10).get("model_info") or {}
+            info = _ollama(cfg, "/api/show", {"model": model}, timeout=10).get("model_info") or {}
             trained = next((int(v) for k, v in info.items() if k.endswith(".context_length")), None)
-            size = next((m.get("size") for m in _get(base + "/api/tags").get("models", [])
+            size = next((m.get("size") for m in _ollama_tags(cfg).get("models", [])
                          if m.get("name") == model), None)
         except Exception as e:
             log.warning("model info for %s unavailable: %s", model, e)
@@ -669,7 +711,7 @@ def classify(cfg, task, item):
     attempts = 0
     while attempts < 2:
         attempts += 1
-        resp = _post(cfg["ollama"].rstrip("/") + "/api/chat", {
+        resp = _ollama(cfg, "/api/chat", {
             "model": model, "messages": messages, "stream": False,
             "format": _strip_ext(schema), "think": think, "options": _options(cfg, task),
             "keep_alive": "30m",
@@ -720,7 +762,7 @@ def classify_with_tools(cfg, task, item, toolbox):
     ]
     calls = []
     while True:
-        resp = _post(cfg["ollama"].rstrip("/") + "/api/chat", {
+        resp = _ollama(cfg, "/api/chat", {
             "model": task.get("model") or "qwen3:14b", "messages": messages, "stream": False, "tools": tools,
             "think": False, "options": _options(cfg, task), "keep_alive": "30m"}, timeout=600)
         if resp.get("error"):
@@ -750,7 +792,7 @@ def _structured(cfg, task, messages):
     schema = task["output_schema"]
     last_err = None
     for _ in range(2):
-        resp = _post(cfg["ollama"].rstrip("/") + "/api/chat", {
+        resp = _ollama(cfg, "/api/chat", {
             "model": task.get("model") or "qwen3:14b", "messages": messages, "stream": False,
             "format": _strip_ext(schema), "think": False, "options": _options(cfg, task), "keep_alive": "30m"},
             timeout=600)
@@ -859,7 +901,7 @@ def process(cfg, server, claim, gate):
 def ollama_models(cfg):
     """Installed models -> on-disk size in bytes (empty if Ollama is unreachable)."""
     try:
-        tags = _get(cfg["ollama"].rstrip("/") + "/api/tags").get("models", [])
+        tags = _ollama_tags(cfg).get("models", [])
     except Exception:
         return {}
     return {m["name"]: m.get("size") or 0 for m in tags}

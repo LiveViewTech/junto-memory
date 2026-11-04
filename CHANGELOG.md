@@ -6,6 +6,64 @@ version via `memory_health` (`server_version`).
 
 ## [Unreleased]
 
+## [1.43.3] - 2026-11-04
+
+### Fixed
+- **`memory_query` no longer reports a rerank cut or a failed scan as "new territory".** With rerank on, short keyword or tag queries score near zero on every candidate. The tool used to answer "No matching memories found", which led the 11-04 librarian pass to report that no transcript-extract docs existed when 265 did. The empty response now carries `rerank_dropped: N` and says the result is not evidence of absence. A collection scan that raised an exception used to be swallowed silently. It is now logged and returned as `scan_errors` (on empty and non-empty results). Both fields are additive and appear only when non-zero.
+
+## [1.43.2] - 2026-11-03
+
+### Fixed
+- **Redaction gaps.** Two shapes were stored in plaintext: `user @ host:PORT : secret` connection handles (new `conn_secret` kind; the port is required, so `agent@project: …` never matches) and assignment keys ending in `PASS` (`DB_X_PASS=`, `MYSQL_PASS=`, `pass:`). A bare upper-case `PASS:` stays untouched because it is a review/test verdict. A sweep of 7,279 stored messages found 4 real credentials in these shapes and no new false positives after the PASS exclusion.
+
+## [1.43.1] - 2026-11-03
+
+An off switch for transcript extraction, which is now **off by default**.
+
+### Added
+- **query_config `transcript_extract`** (bool, default **off**; server-wide or per project via `memory_admin query_set_config`). When off, `memory_record_learning` rejects writes tagged `transcript-extract` with `code: transcript_extract_disabled`.
+- **`memory_health` → `features`**: `{"transcript_extract": bool}` (server default). This is an additive field.
+- `contrib/transcript-extract` reads that field before any model call and exits if extraction is off. A per-project rejection skips the rest of that project. An unreachable server makes the run exit 2.
+
+### Upgrade note
+- A server that already runs the extractor must turn the flag on after upgrading: `memory_admin(action="query_set_config", key="transcript_extract", value=true)`. Otherwise the next run does nothing.
+
+## [1.43.0] - 2026-11-02
+
+Person notifications (`memory_notify`), more redaction detectors, and inference-router support for the model-backed features. Everything model-backed stays off unless configured. Shelf-life decay still ships OFF.
+
+### Added
+- **`memory_notify`** (`interface:human-notify-v0`), tool count 64 → 65. Junto can send a message to a person. Actions: `send` / `test` (redacted, capped at 3,000 chars, 20 per person per day, the same subject from the same sender deduped within 1h); `register` / `humans` (each person registers their own Gmail/Slack; changing someone else's needs a human or admin); `status`; `claim` / `report` (the runner protocol). New collection `notifications` (90-day TTL).
+- **`contrib/notify-runner/`**: per-person delivery runner (cron or Task Scheduler, every minute) that sends through Claude Code's connectors with `claude -p`. Keeps one long-lived session per runner.
+- **Redaction detectors**: `cli_secret` (the value after `--token` / `--password` / `--api-key` …; `$VAR` and short values are left alone) and `encoded_token` (`eyJ` + 60 or more base64 chars).
+- **`redaction_events`**: one row per write that had something removed (kind, field, key name, length, never the value). TTL 365 days.
+- **`scripts/memento_metrics.py`**: nightly snapshot plus report for the 1.42.0 features.
+- **Claim gate / facets behind an inference router** (`design:sage-inference-router-v0`). New optional env vars: `JUNTO_CLAIM_GATE_API_KEY` (Bearer to the primary URL), `JUNTO_CLAIM_GATE_FALLBACK_URL` (one retry on connect error / 502 / 503), `JUNTO_CLAIM_GATE_REASONING` (judge reasoning_effort), `JUNTO_FACETS_TASK`. Calls carry `X-Infer-Task`.
+- **Runner**: the `X-Infer-App` / `X-Infer-Task` headers, an optional `ollama_token_file`, and retries on 503 `no_capacity` (honours Retry-After, at most 120s, up to 5 tries).
+
+### Changed
+- **Shelf-life decay v2**: in `memory_query`, decay is now only a tiebreak within a relevance band. The band uses raw relevance, and a row past its half-life sinks to the bottom of its band. `/recall` is unchanged. The flag stays **off**.
+- The nightly facets backfill uses the server's `JUNTO_CLAIM_GATE_EXTRACT_MODEL`, and defers when its model isn't loaded and no GPU has room (it reads router `/v1/status`; if that fails, it runs anyway).
+- Transcript extractor: v2 prompt (skips what the session already saved; never writes retracted claims, point-in-time state or personal details); it now runs on Windows; it finds `claude` when run from cron.
+
+### Fixed
+- Notify runner: omits None args in `memory_notify` calls; a missing CLI is reported as a failed delivery instead of a crash.
+- Docstrings that still named phi4 as the judge and claudeControl as the alert consumer.
+
+## [1.42.0] - 2026-10-30
+
+Four memory-quality features (the Memento comparison build order). Two of them change what agents see by default: secret redaction on write, and rejected docs dropping out of search. Shelf-life decay ships OFF.
+
+### Added
+- **Secret redaction on write** (`interface:secret-redaction-v0`). `memory_store`, `memory_record_learning`, `memory_define_spec`, the backlog writers, `memory_register_function`, `memory_end_session` and `memory_send_message` replace credentials with `[REDACTED:<kind>]` before anything is persisted. Covered: PEM keys, vendor tokens (Anthropic, OpenAI, AWS, GitHub, Slack, Google, Stripe), junto `smk_` keys, JWTs, URL passwords, Bearer values, and `password=`/`token:`-style assignments whose value looks like a credential. Responses gain `redacted` + `redacted_warning` only when something was removed. Writes are never rejected. The existing corpus is not rewritten.
+- **Verification state + `memory_verify`** (`interface:verification-state-v0`). Docs can be marked `verified` / `rejected` / `unreviewed` (the default, no backfill), with an audit row in `verification_events`. Human, admin/owner and librarian sessions may verify; nobody but a human can verify their own doc. `memory_query` rows, `memory_get_by_id` and `/recall` snippets carry `verification`. Rejected docs leave search and recall (`include_inactive` shows them flagged). Verified docs lead their relevance band, and get +0.05 on the /recall sort. Tool count 63 → 64.
+- **Shelf-life decay** (`interface:ranking-decay-v0`), behind the new `shelf_life_decay` query-config flag (default **off**). Half-lives: volatile learnings 21 days, unverified durable 90 days. Verified durable learnings and docs without facets never decay. Floor 0.2. Reported relevance/score stay raw; decayed rows carry `decay`.
+- **`contrib/transcript-extract/`** (`design:transcript-extraction-v0`). Nightly, opt-in extraction of decision/explanation/resolution records from Claude Code transcripts into unreviewed learnings with provenance. Not scheduled by default.
+
+### Fixed
+- `memory_project update_agent` no longer writes `tier=named` when no tier is passed. Before, any role/purpose edit demoted an admin agent and removed it from the project's admins list. An invalid tier on update now errors.
+- `persist_agent_aliases` accepts an alias equal to a **retired** agent's name, which is the retire-then-alias identity fold.
+
 ## [1.41.3] - 2026-10-28
 
 A lean public tree: personal/home operations material is no longer shipped. Server behaviour is unchanged except one default (delegation runner hosts, below).

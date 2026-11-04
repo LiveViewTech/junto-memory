@@ -11,21 +11,23 @@ Pins the interface:claim-extraction-v0 v1.0.2 implementation:
 
 import json
 
+import httpx
 import pytest
 
 from shared_memory import claim_gate
-
 
 # ---------------------------------------------------------------------------
 # fakes
 # ---------------------------------------------------------------------------
 
 class _FakeResponse:
-    def __init__(self, content):
+    def __init__(self, content, status_code=200):
         self._content = content
+        self.status_code = status_code
 
     def raise_for_status(self):
-        pass
+        if self.status_code >= 400:
+            raise RuntimeError(f"HTTP {self.status_code}")
 
     def json(self):
         return {"choices": [{"message": {"content": self._content}}]}
@@ -38,9 +40,12 @@ class _FakeClient:
         self.completions = list(completions)
         self.requests = []
 
-    async def post(self, url, json=None):
-        self.requests.append({"url": url, "json": json})
-        return _FakeResponse(self.completions.pop(0))
+    async def post(self, url, json=None, headers=None):
+        self.requests.append({"url": url, "json": json, "headers": headers or {}})
+        nxt = self.completions.pop(0)
+        if isinstance(nxt, BaseException):
+            raise nxt
+        return nxt if isinstance(nxt, _FakeResponse) else _FakeResponse(nxt)
 
 
 class _FakeClaimsCol:
@@ -367,3 +372,58 @@ async def test_extract_model_defaults_to_gate_model(monkeypatch):
     body = client.requests[0]["json"]
     assert body["model"] == "phi4:14b"
     assert "reasoning_effort" not in body
+
+
+# ---------------------------------------------------------------------------
+# sage-router (design:sage-inference-router-v0): auth, task header, A1 fallback
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def router_env(monkeypatch):
+    monkeypatch.setenv("JUNTO_CLAIM_GATE_URL", "http://router:11500/v1")
+    monkeypatch.setenv("JUNTO_CLAIM_GATE_API_KEY", "tok")
+    monkeypatch.setenv("JUNTO_CLAIM_GATE_FALLBACK_URL", "http://ollama:11434/v1")
+
+
+async def test_router_gets_bearer_and_task_header(router_env):
+    client = _FakeClient(["CONSISTENT"])
+    await claim_gate.classify_pair(client, "a", "x", "b", "y")
+    req = client.requests[0]
+    assert req["url"] == "http://router:11500/v1/chat/completions"
+    assert req["headers"] == {"X-Infer-Task": "judge", "Authorization": "Bearer tok"}
+
+
+@pytest.mark.parametrize("first", [_FakeResponse("", 503), _FakeResponse("", 502),
+                                   httpx.ConnectError("refused")])
+async def test_fallback_on_503_502_connect_same_model_no_auth(router_env, first):
+    client = _FakeClient([first, "CONTRADICTS"])
+    assert await claim_gate.classify_pair(client, "a", "x", "b", "y") == "CONTRADICTS"
+    primary, fb = client.requests
+    assert fb["url"] == "http://ollama:11434/v1/chat/completions"
+    assert fb["json"]["model"] == primary["json"]["model"]
+    assert "Authorization" not in fb["headers"]
+
+
+async def test_no_fallback_on_429_or_400(router_env):
+    for status in (429, 400):
+        client = _FakeClient([_FakeResponse("", status)])
+        with pytest.raises(RuntimeError):
+            await claim_gate.classify_pair(client, "a", "x", "b", "y")
+        assert len(client.requests) == 1
+
+
+async def test_no_fallback_configured_raises_on_503(monkeypatch):
+    monkeypatch.delenv("JUNTO_CLAIM_GATE_FALLBACK_URL", raising=False)
+    client = _FakeClient([_FakeResponse("", 503)])
+    with pytest.raises(RuntimeError):
+        await claim_gate.classify_pair(client, "a", "x", "b", "y")
+
+
+async def test_judge_reasoning_env_applies_to_classify_only(monkeypatch):
+    monkeypatch.setenv("JUNTO_CLAIM_GATE_REASONING", "none")
+    monkeypatch.delenv("JUNTO_CLAIM_GATE_EXTRACT_REASONING", raising=False)
+    client = _FakeClient(["CONSISTENT", "a claim"])
+    await claim_gate.classify_pair(client, "a", "x", "b", "y")
+    await claim_gate.extract_claim(client, "t", "body")
+    assert client.requests[0]["json"]["reasoning_effort"] == "none"
+    assert "reasoning_effort" not in client.requests[1]["json"]

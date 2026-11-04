@@ -108,3 +108,31 @@ def test_work_reports_failed_run(monkeypatch):
     server = _OneRunServer()
     runner.work(_cfg({}), server, runner.RunGate(), once=True)
     assert server.calls == ["claim", "fail"]
+
+
+def test_ollama_retries_503_then_succeeds(monkeypatch):
+    calls = []
+
+    def fake_post(url, body, headers=None, timeout=60):
+        calls.append(headers)
+        if len(calls) < 3:
+            return {"error": "no_capacity", "_http": 503, "_retry_after": "7"}
+        return {"message": {"content": "{}"}}
+
+    slept = []
+    monkeypatch.setattr(runner, "_post", fake_post)
+    monkeypatch.setattr(runner.time, "sleep", slept.append)
+    cfg = {"ollama": "http://127.0.0.1:9", "_ollama_headers": {"X-Infer-App": "junto"}}
+    assert runner._ollama(cfg, "/api/chat", {})["message"] == {"content": "{}"}
+    assert slept == [7.0, 7.0]
+    assert calls[0] == {"X-Infer-App": "junto"}
+
+
+def test_ollama_gives_up_after_busy_tries(monkeypatch):
+    monkeypatch.setattr(runner, "_post", lambda *a, **k: {"error": "no_capacity", "_http": 503,
+                                                           "_retry_after": "999"})
+    slept = []
+    monkeypatch.setattr(runner.time, "sleep", slept.append)
+    resp = runner._ollama({"ollama": "http://127.0.0.1:9"}, "/api/chat", {})
+    assert resp["_http"] == 503
+    assert slept == [runner.OLLAMA_BUSY_WAIT_MAX] * (runner.OLLAMA_BUSY_TRIES - 1)
